@@ -2,7 +2,9 @@
 # - 本配置文件用于描述运行时参数，避免把环境差异硬编码在 Python 代码中。
 # - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
 
+# tools 是工具注册表配置；Python 侧 ToolRegistry.with_defaults() 也保持同样的字段语义。
 tools:
+  # web_search 读取公开互联网，属于中风险只读工具；生产必须接 approved provider。
   - name: web_search
     description: Search the public web through an approved provider.
     risk_level: medium
@@ -12,6 +14,7 @@ tools:
     timeout_seconds: 10
     idempotency_required: false
     permission_scope: internet.read
+  # web_page_reader 读取指定网页，风险来自网页内容可能包含 prompt injection。
   - name: web_page_reader
     description: Read and summarize a specific URL.
     risk_level: medium
@@ -21,6 +24,7 @@ tools:
     timeout_seconds: 10
     idempotency_required: false
     permission_scope: internet.read
+  # weather_query 是只读天气查询工具，本地 demo 不调用真实外部天气 API。
   - name: weather_query
     description: Query weather for a location.
     risk_level: low
@@ -30,6 +34,7 @@ tools:
     timeout_seconds: 5
     idempotency_required: false
     permission_scope: weather.read
+  # time_query 只读取本地时间，不产生网络请求，也不需要自动重试。
   - name: time_query
     description: Return current date/time information.
     risk_level: low
@@ -39,6 +44,7 @@ tools:
     timeout_seconds: 2
     idempotency_required: false
     permission_scope: local.time
+  # calculator 只执行受限算术表达式，避免模型心算出错。
   - name: calculator
     description: Evaluate safe arithmetic expressions.
     risk_level: low
@@ -48,6 +54,7 @@ tools:
     timeout_seconds: 2
     idempotency_required: false
     permission_scope: local.compute
+  # unit_converter 是低风险本地换算工具。
   - name: unit_converter
     description: Convert supported units.
     risk_level: low
@@ -57,6 +64,7 @@ tools:
     timeout_seconds: 2
     idempotency_required: false
     permission_scope: local.compute
+  # file_parser 读取上传文件，必须保证文件来自授权上传范围。
   - name: file_parser
     description: Parse approved uploaded files.
     risk_level: medium
@@ -66,6 +74,7 @@ tools:
     timeout_seconds: 15
     idempotency_required: false
     permission_scope: files.read
+  # knowledge_search 读取内部知识库，只允许 tenant 范围内资料。
   - name: knowledge_search
     description: Search internal knowledge indexes.
     risk_level: low
@@ -75,6 +84,7 @@ tools:
     timeout_seconds: 10
     idempotency_required: false
     permission_scope: knowledge.read
+  # news_search 查询近期新闻，事实时效性强，回答必须避免编造未核实报道。
   - name: news_search
     description: Search recent news through approved providers.
     risk_level: medium
@@ -84,6 +94,7 @@ tools:
     timeout_seconds: 10
     idempotency_required: false
     permission_scope: internet.read
+  # translation 是文本变换能力，可由模型或翻译服务承接。
   - name: translation
     description: Translate text between supported languages.
     risk_level: low
@@ -93,6 +104,7 @@ tools:
     timeout_seconds: 10
     idempotency_required: false
     permission_scope: llm.transform
+  # summarizer 是低风险兜底工具，无法识别具体工具时可用于摘要。
   - name: summarizer
     description: Summarize provided text.
     risk_level: low
@@ -102,4 +114,3 @@ tools:
     timeout_seconds: 10
     idempotency_required: false
     permission_scope: llm.transform
-

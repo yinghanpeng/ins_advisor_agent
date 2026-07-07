@@ -15,16 +15,22 @@ from agent_core.sales_intelligence.segmenter import InterviewSegment
 
 
 def extract_structured_insight(segment: InterviewSegment, metadata: dict | None = None) -> SalesInsightCard:
+    """把一个访谈分段抽取成 SalesInsightCard，并立即做合规审查。"""
+    # metadata 承载采访对象、渠道、客户画像等外部信息；为空时用空字典兜底。
     metadata = metadata or {}
-    # 重点逻辑：当前是确定性抽取，字段结构与未来 LLM JSON 输出保持一致。
+    # 当前是确定性抽取，字段结构与未来 LLM JSON 输出保持一致，方便以后替换成模型抽取。
     card = SalesInsightCard(
+        # source_id/chunk_id 保证这张洞察卡片可以回溯到原始访谈分段。
         source_id=segment.source_id,
         chunk_id=segment.chunk_id,
+        # 受访者角色、年限、渠道、业务阶段来自外部 metadata。
         interviewee_role=metadata.get("interviewee_role", "unknown"),
         sales_experience_years=metadata.get("sales_experience_years"),
         channel=metadata.get("channel"),
         business_stage=metadata.get("business_stage", "unknown"),
+        # scene 来自分段器的场景识别结果。
         scene=segment.scene,
+        # customer_type 和 customer_kyc 影响后续检索和个性化回答。
         customer_type=metadata.get("customer_type", "unknown"),
         customer_kyc=CustomerKYC(
             age=metadata.get("age"),
@@ -33,16 +39,24 @@ def extract_structured_insight(segment: InterviewSegment, metadata: dict | None 
             asset_preference=metadata.get("asset_preference"),
             decision_style=metadata.get("decision_style"),
         ),
+        # 本地 demo 用固定文案表达抽取占位，生产应由 LLM 按 JSON Schema 生成。
         sales_pain_solved="从访谈片段中抽取的销售痛点，需要人工复核",
         root_cause="从业者缺少场景化提问和低压推进结构",
+        # effective_strategy 暂取分段前 220 字，避免过长原文直接进入卡片。
         effective_strategy=segment.text[:220],
+        # usable_script 是安全话术占位，生产必须经过合规审查再 approved_for_generation。
         usable_script="先认可客户处境，再追问资金用途和决策边界。",
+        # wrong_way 明确禁用直接承诺收益或强推产品。
         wrong_way="直接承诺收益或强推具体产品。",
+        # why_it_works 说明策略背后的沟通机制。
         why_it_works="先建立共情，再把话题落到客户自己的资金安排。",
+        # next_question 给出低压追问，便于从破冰进入 KYC。
         next_question="这笔钱未来三到五年更可能承担什么责任？",
+        # tags 标记这张卡是自动抽取，需要人工复核。
         tags=[segment.scene, "auto_extracted"],
+        # 自动抽取结果默认需要 review，不允许直接进入生产生成。
         compliance_notes="auto extracted, requires review before production generation",
         approved_for_generation=False,
     )
-    # 重点逻辑：抽取完成后立刻进入合规审查，不让未审查卡片进入索引。
+    # 抽取完成后立刻进入合规审查，不让未审查卡片进入索引。
     return review_card(card)

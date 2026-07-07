@@ -3,30 +3,46 @@
 # - 依赖、pytest 路径和代码风格配置都在这里维护。
 
 [project]
+# 项目包名，pip install -e . 时使用。
 name = "ins-advisor-agent"
+# 当前本地框架版本；后续发布包或镜像时应同步更新。
 version = "0.1.0"
+# 项目描述用于包元数据和文档说明。
 description = "Production Agent Framework with Insurance Advisor skill and Sales Intelligence Layer"
+# 使用 Python 3.11+，因为项目使用现代类型语法和 Pydantic v2。
 requires-python = ">=3.11"
+# dependencies 是核心运行依赖；main.py、本地 workflow 和测试都会用到。
 dependencies = [
+  # Pydantic v2 用于 AgentState、工具 schema、workflow contract 等结构化模型。
   "pydantic>=2.7",
+  # PyYAML 用于读取/导出 YAML 配置和 Dify workflow。
   "PyYAML>=6.0",
+  # LangGraph 是生产图执行引擎；未安装时 builder.py 会降级到 LocalGraph。
   "langgraph>=0.2",
+  # LangSmith 是可选观测增强；缺 API key 时不会阻断本地运行。
   "langsmith>=0.4",
 ]
 
 [project.optional-dependencies]
+# api 分组只在需要启动 FastAPI 服务时安装。
 api = [
+  # FastAPI 提供 /agent/run 等 HTTP 接口。
   "fastapi>=0.111",
+  # uvicorn 是 FastAPI 本地/生产 ASGI 运行器。
   "uvicorn>=0.30",
 ]
+# dev 分组用于本地测试和持续集成。
 dev = [
+  # pytest 运行 tests/ 下的单元测试和集成测试。
   "pytest>=7.4",
 ]
 
 [tool.pytest.ini_options]
+# pythonpath 指向 src，保证测试直接 import agent_core。
 pythonpath = ["src"]
+# testpaths 限定 pytest 只扫描 tests 目录，避免误收集脚本。
 testpaths = ["tests"]
 
 [tool.ruff]
+# line-length 统一代码格式宽度，避免长注释/Field description 被过早折行。
 line-length = 100
-
