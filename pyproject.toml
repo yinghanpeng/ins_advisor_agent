@@ -1,0 +1,32 @@
+# 文件说明：
+# - 本文件是 Python 项目元数据和工具配置入口。
+# - 依赖、pytest 路径和代码风格配置都在这里维护。
+
+[project]
+name = "ins-advisor-agent"
+version = "0.1.0"
+description = "Production Agent Framework with Insurance Advisor skill and Sales Intelligence Layer"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.7",
+  "PyYAML>=6.0",
+  "langgraph>=0.2",
+  "langsmith>=0.4",
+]
+
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.111",
+  "uvicorn>=0.30",
+]
+dev = [
+  "pytest>=7.4",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+

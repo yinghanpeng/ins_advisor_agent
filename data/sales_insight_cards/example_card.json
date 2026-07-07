@@ -1,0 +1,35 @@
+{
+  "source_id": "sample_interview_001",
+  "chunk_id": "chunk_001",
+  "interviewee_role": "资深保险顾问",
+  "sales_experience_years": 8,
+  "channel": "高净值客户转介绍",
+  "business_stage": "new_customer",
+  "scene": "饭局破冰",
+  "customer_type": "企业主",
+  "customer_kyc": {
+    "age": "45岁左右",
+    "family": "两个孩子",
+    "occupation": "制造业企业主",
+    "asset_preference": "偏好银行理财",
+    "decision_style": "谨慎，重视现金流"
+  },
+  "sales_pain_solved": "不知道如何从闲聊自然切入长期资金规划",
+  "root_cause": "从业者过早讲产品，客户还没有建立资金分层意识",
+  "effective_strategy": "先围绕经营现金流和家庭责任共情，再用资金分层把话题转到长期稳定安排。",
+  "usable_script": "最近很多老板不是没有赚钱能力，而是更在意哪些钱不能被经营波动打乱。",
+  "wrong_way": "一上来讲保险收益、港保优势或资产隔离。",
+  "why_it_works": "低压共情能降低防御感，资金分层让客户先讨论用途而不是产品。",
+  "next_question": "这笔钱更偏企业备用，还是家庭长期不能动的钱？",
+  "customer_response": "客户愿意聊资金用途",
+  "follow_up_action": "准备一张资金分层图，约15分钟只聊资金用途。",
+  "tags": ["破冰", "企业主", "资金分层", "低压沟通"],
+  "risk_level": "low",
+  "compliance_notes": "不得承诺收益；不得使用避债避税表达。",
+  "suitable_for_rag": true,
+  "suitable_for_eval": true,
+  "approved_for_generation": true,
+  "created_at": "2026-07-02T00:00:00+00:00",
+  "updated_at": "2026-07-02T00:00:00+00:00"
+}
+

@@ -1,0 +1,36 @@
+# 状态机设计
+
+项目使用显式状态机，而不是让大模型自由决定流程。
+
+```mermaid
+stateDiagram-v2
+    [*] --> CLASSIFY_INTENT
+    CLASSIFY_INTENT --> ROUTE_CAPABILITY
+    ROUTE_CAPABILITY --> GENERAL_TOOL_ROUTING: 通用能力
+    ROUTE_CAPABILITY --> DOMAIN_WORKFLOW_ROUTING: 业务技能
+    GENERAL_TOOL_ROUTING --> GENERAL_TOOL_CALL
+    GENERAL_TOOL_CALL --> VERIFY_TOOL_RESULT
+    VERIFY_TOOL_RESULT --> GENERAL_RESPONSE_GENERATION
+    DOMAIN_WORKFLOW_ROUTING --> SALES_INTELLIGENCE_ROUTING: 保险顾问
+    SALES_INTELLIGENCE_ROUTING --> SALES_INSIGHT_RETRIEVAL
+    SALES_INSIGHT_RETRIEVAL --> BUILD_CONTEXT
+    BUILD_CONTEXT --> GENERATE_RESPONSE
+    GENERATE_RESPONSE --> COMPLIANCE_REVIEW
+    COMPLIANCE_REVIEW --> FINAL: 通过
+    COMPLIANCE_REVIEW --> HUMAN_APPROVAL: 高风险
+    GENERAL_RESPONSE_GENERATION --> FINAL
+    VERIFY_TOOL_RESULT --> RECOVERY: 失败
+    RECOVERY --> FINAL: 降级成功
+    RECOVERY --> ERROR: 无法恢复
+    FINAL --> [*]
+    ERROR --> [*]
+```
+
+## 当前实现
+
+- 状态枚举：`src/agent_core/graph/state.py`
+- 节点函数：`src/agent_core/graph/nodes.py`
+- 图构建：`src/agent_core/graph/builder.py`
+
+每次 `move_to()` 都会记录结构化状态迁移，并进入本地日志。
+

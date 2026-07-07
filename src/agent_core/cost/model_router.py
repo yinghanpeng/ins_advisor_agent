@@ -1,0 +1,15 @@
+"""Model routing policy."""
+
+# 文件说明：
+# - 本文件属于成本控制层，负责 token budget、预算决策或模型路由。
+# - 预算压力下应压缩上下文、减少工具调用或降级输出。
+from __future__ import annotations
+
+
+def choose_model(task_complexity: str, budget_pressure: bool = False) -> str:
+    if budget_pressure:
+        return "small-fast-model"
+    if task_complexity == "high":
+        return "reasoning-model"
+    return "default-chat-model"
+

@@ -1,0 +1,30 @@
+# 文件说明：
+# - 本配置文件描述 insurance_advisor 这个业务 Skill 的元数据、入口 workflow、路由和合规边界。
+# - Agent Core 会把通用能力和业务 Skill 分开，避免保险业务逻辑污染通用框架。
+# - 新增其他业务 Skill 时，可以参考这个文件的字段结构。
+
+name: insurance_advisor
+version: 0.1.0
+description: 面向保险/金融从业者的高价值客户沟通教练 Skill。
+entry_workflow: break_ice_assistant_workflow
+uses:
+  - sales_intelligence
+  - guardrails
+  - news_search
+  - context_builder
+routes:
+  break_ice_help:
+    workflow: break_ice_assistant_workflow
+  kyc_question_help:
+    workflow: kyc_question_workflow
+  objection_handling:
+    workflow: objection_handling_workflow
+  proposal_closing:
+    workflow: proposal_closing_workflow
+compliance:
+  forbid:
+    - guaranteed_returns
+    - tax_or_debt_evasion
+    - fear_marketing
+    - fabricated_case_stories
+    - product_disparagement

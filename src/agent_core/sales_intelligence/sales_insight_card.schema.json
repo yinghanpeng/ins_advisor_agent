@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalesInsightCard",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_id",
+    "chunk_id",
+    "interviewee_role",
+    "scene",
+    "customer_type",
+    "sales_pain_solved",
+    "root_cause",
+    "effective_strategy",
+    "usable_script",
+    "wrong_way",
+    "why_it_works",
+    "next_question",
+    "tags",
+    "risk_level",
+    "compliance_notes",
+    "suitable_for_rag",
+    "suitable_for_eval",
+    "approved_for_generation",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "source_id": { "type": "string" },
+    "chunk_id": { "type": "string" },
+    "interviewee_role": { "type": "string" },
+    "sales_experience_years": { "type": ["number", "null"] },
+    "channel": { "type": ["string", "null"] },
+    "business_stage": {
+      "type": "string",
+      "enum": ["new_customer", "old_customer_maintenance", "add_on", "referral", "proposal", "closing", "unknown"]
+    },
+    "scene": { "type": "string" },
+    "customer_type": { "type": "string" },
+    "customer_kyc": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "age": { "type": ["string", "null"] },
+        "family": { "type": ["string", "null"] },
+        "occupation": { "type": ["string", "null"] },
+        "asset_preference": { "type": ["string", "null"] },
+        "decision_style": { "type": ["string", "null"] }
+      }
+    },
+    "sales_pain_solved": { "type": "string" },
+    "root_cause": { "type": "string" },
+    "effective_strategy": { "type": "string" },
+    "usable_script": { "type": "string" },
+    "wrong_way": { "type": "string" },
+    "why_it_works": { "type": "string" },
+    "next_question": { "type": "string" },
+    "customer_response": { "type": ["string", "null"] },
+    "follow_up_action": { "type": ["string", "null"] },
+    "tags": { "type": "array", "items": { "type": "string" } },
+    "risk_level": { "type": "string", "enum": ["low", "medium", "high"] },
+    "compliance_notes": { "type": "string" },
+    "suitable_for_rag": { "type": "boolean" },
+    "suitable_for_eval": { "type": "boolean" },
+    "approved_for_generation": { "type": "boolean" },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  }
+}
+
