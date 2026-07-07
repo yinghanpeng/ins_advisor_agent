@@ -85,7 +85,7 @@ def test_all_pydantic_fields_have_business_descriptions() -> None:
 
 
 def test_no_template_style_generated_comments_remain() -> None:
-    """禁止重新引入“方法说明/类说明”这类模板化注释。"""
+    """禁止重新引入模板化坏注释。"""
     # forbidden 故意拆字符串，避免测试文件自身被搜索命中。
     forbidden = ["方法" + "说明：", "类" + "说明：", "职责说明；" + "具体输入输出"]
     # offenders 收集包含模板化注释的文件路径。
