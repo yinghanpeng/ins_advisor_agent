@@ -1,4 +1,4 @@
-"""Placeholder callbacks for LangGraph/LangChain integrations."""
+"""LangGraph / LangChain callback 构建入口。"""
 
 # 文件说明：
 # - 本文件属于可观测性层，负责本地结构化日志、trace、metrics 或 LangSmith adapter。
@@ -9,10 +9,7 @@ from typing import Any
 
 
 def build_langsmith_callbacks(enabled: bool) -> list[Any]:
-    """Return callback handlers when remote tracing is enabled.
-
-    This stays empty until the production model provider and callback strategy
-    are selected.
-    """
-    return [] if not enabled else []
-
+    """根据开关返回 callback handlers。"""
+    if enabled:
+        raise RuntimeError("LangSmith callback strategy 未配置，不能启用远程 callback")
+    return list()

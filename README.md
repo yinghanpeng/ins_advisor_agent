@@ -94,6 +94,24 @@ python3 -m pytest
 python3 evals/run_evals.py
 ```
 
+启动生产依赖并执行数据库迁移：
+
+```bash
+cp .env.example .env
+docker compose up -d postgres redis
+set -a; source .env; set +a
+make db-upgrade
+```
+
+生产模型与外部工具需要在 `.env` 中配置：
+
+- `LLM_BASE_URL` / `LLM_API_KEY` / `DEFAULT_CHAT_MODEL`
+- `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL`
+- `RERANKER_BASE_URL` / `RERANKER_API_KEY` / `RERANKER_MODEL`
+- `WEATHER_API_URL`、`WEB_SEARCH_API_URL`、`NEWS_SEARCH_API_URL`、`FILE_PARSER_API_URL` 等工具 provider
+
+未配置 provider 的模型节点或外部工具会明确报错并进入恢复/审批链路，不会返回本地伪结果。
+
 安装 FastAPI 后启动 API：
 
 ```bash
@@ -123,7 +141,13 @@ uvicorn agent_core.api.server:app --reload
 
 如果你看不懂项目、无从下手，先看：[docs/start-here.md](docs/start-here.md)
 
+业务记忆系统设计见：[docs/memory-system.md](docs/memory-system.md)
+
+PostgreSQL 生产落地 DDL 见：[docs/database-schema.sql](docs/database-schema.sql)
+
 完整对话链路说明见：[docs/conversation-flows.md](docs/conversation-flows.md)
+
+请求进入 Agent 后的完整流程图见：[docs/request-lifecycle-flowchart.md](docs/request-lifecycle-flowchart.md)
 
 生产级检查表逐项对照见：[docs/production-readiness-checklist.md](docs/production-readiness-checklist.md)
 
@@ -150,6 +174,7 @@ uvicorn agent_core.api.server:app --reload
 
 - [docs/sales-intelligence-layer.md](docs/sales-intelligence-layer.md)
 - [docs/interview-processing.md](docs/interview-processing.md)
+- [docs/sales-corpus-usage.md](docs/sales-corpus-usage.md)
 
 ## Dify 集成方式
 

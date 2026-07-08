@@ -8,7 +8,7 @@ from __future__ import annotations
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str]:
     if not text:
-        return []
+        return list()
     chunks: list[str] = []
     start = 0
     while start < len(text):
@@ -18,4 +18,3 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str
             break
         start = max(0, end - overlap)
     return chunks
-

@@ -16,23 +16,21 @@ from agent_core.rag.query_rewrite import rewrite_sales_queries
 from agent_core.rag.retriever import HybridRetriever
 from agent_core.rag.schemas import DocumentMetadata, MetadataFilter, RetrievalDocument, RetrievalQuery
 from agent_core.sales_intelligence.indexer import SalesInsightIndexer
-from agent_core.sales_intelligence.schemas import SalesInsightCard, sample_card
+from agent_core.sales_intelligence.schemas import DialoguePattern, SalesInsightCard
 
 
 class SalesIntelligenceRetriever:
     """销售智能检索器，只检索已审核销售卡片，绝不直接返回原始访谈。"""
 
     def __init__(self, cards_dir: str | Path = "data/sales_insight_cards") -> None:
-        """初始化销售洞察卡片目录；没有真实数据时会使用安全样例卡片。"""
+        """初始化销售洞察卡片目录。"""
         # cards_dir 是结构化销售洞察卡片目录，生产可挂载对象存储或数据库导出目录。
         self.cards_dir = Path(cards_dir)
 
     def _load_cards(self) -> list[SalesInsightCard]:
-        """加载所有销售洞察卡片；本地空目录时返回 sample_card 保证 demo 可运行。"""
+        """加载所有销售洞察卡片。"""
         # SalesInsightIndexer 负责从 cards_dir 读取 JSON 卡片并转成 SalesInsightCard。
-        cards = SalesInsightIndexer(self.cards_dir).load_all()
-        # 没有真实卡片时返回 sample_card，保证 main.py 和测试开箱可运行。
-        return cards or [sample_card()]
+        return SalesInsightIndexer(self.cards_dir).load_all()
 
     def retrieve(self, query: str, top_k: int = 5) -> list[SalesInsightCard]:
         """检索与用户问题相关的销售洞察，并过滤不适合生成的卡片。"""
@@ -102,3 +100,33 @@ class SalesIntelligenceRetriever:
         ]
         # 返回已审核、已过滤、按相关性排序后的销售洞察卡片。
         return selected
+
+
+def filter_generation_ready_patterns(patterns: list[DialoguePattern]) -> list[DialoguePattern]:
+    """筛出允许进入最终生成的销售对话模式。"""
+    return [
+        pattern
+        for pattern in patterns
+        if pattern.approved_for_generation and pattern.risk_level != "high"
+    ]
+
+
+def build_dialogue_pattern_digest(patterns: list[DialoguePattern]) -> list[dict]:
+    """把已审核模式压缩成生成可用摘要，不暴露原始语料消息。"""
+    return [
+        {
+            "id": pattern.id,
+            "pattern_type": pattern.pattern_type,
+            "scene_type": pattern.scene_type,
+            "target_persona": pattern.target_persona,
+            "trigger_module": pattern.trigger_module,
+            "situation_summary": pattern.situation_summary,
+            "customer_signal": pattern.customer_signal,
+            "recommended_move": pattern.recommended_move,
+            "bad_move": pattern.bad_move,
+            "example_wording": pattern.example_wording,
+            "outcome_label": pattern.outcome_label,
+            "confidence": pattern.confidence,
+        }
+        for pattern in filter_generation_ready_patterns(patterns)
+    ]

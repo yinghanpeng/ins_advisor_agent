@@ -1,0 +1,57 @@
+models:
+  default_chat:
+    provider: openai_compatible
+    model: ${DEFAULT_CHAT_MODEL}
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    timeout_ms: 15000
+    max_retries: 2
+
+  fast_reasoning:
+    provider: openai_compatible
+    model: ${FAST_REASONING_MODEL}
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    timeout_ms: 3000
+    max_retries: 1
+
+  memory_recall_decision:
+    provider: openai_compatible
+    model: ${MEMORY_RECALL_DECISION_MODEL}
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    timeout_ms: 1200
+    max_retries: 1
+
+  query_understanding:
+    provider: openai_compatible
+    model: ${QUERY_UNDERSTANDING_MODEL}
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    timeout_ms: 3000
+    max_retries: 1
+
+  guardrail:
+    provider: openai_compatible
+    model: ${GUARDRAIL_MODEL}
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    timeout_ms: 2000
+    max_retries: 1
+
+  embedding:
+    provider: openai_compatible
+    model: ${EMBEDDING_MODEL}
+    base_url: ${EMBEDDING_BASE_URL}
+    api_key: ${EMBEDDING_API_KEY}
+    dimensions: ${EMBEDDING_DIMENSIONS}
+    timeout_ms: 5000
+    max_retries: 2
+
+  reranker:
+    provider: openai_compatible_or_http
+    model: ${RERANKER_MODEL}
+    base_url: ${RERANKER_BASE_URL}
+    api_key: ${RERANKER_API_KEY}
+    timeout_ms: 3000
+    max_retries: 1

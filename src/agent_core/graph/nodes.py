@@ -18,10 +18,38 @@ from agent_core.graph.state import AgentNode, AgentState
 from agent_core.guardrails.input import InputGuardrail
 from agent_core.guardrails.output import OutputGuardrail
 from agent_core.guardrails.tool_guardrails import ToolGuardrail
+from agent_core.memory.business_schemas import (
+    AdvisorProfileFact,
+    AgentSessionState,
+    AnalysisRun,
+    CustomerProfileFact,
+    GeneratedOutput,
+    KYCQuestion,
+    MemoryEvent,
+    OpportunityCase,
+)
+from agent_core.memory.business_store import BusinessMemoryStore
+from agent_core.memory.compact_context import build_compact_context
 from agent_core.memory.manager import MemoryLayer, MemoryManager
+from agent_core.memory.recall import (
+    MemoryRecallDecision,
+    business_memory_to_documents,
+    hybrid_recall_memory,
+    plan_long_term_memory_recall,
+    preference_memory_to_documents,
+)
+from agent_core.memory.write_policy import (
+    MemoryWriteProposal,
+    filter_allowed_facts,
+    validate_memory_write_proposal,
+)
 from agent_core.rag.query_rewrite import rewrite_sales_queries
 from agent_core.recovery.fallback import fallback_answer
-from agent_core.sales_intelligence.retriever import SalesIntelligenceRetriever
+from agent_core.sales_intelligence.retriever import (
+    SalesIntelligenceRetriever,
+    build_dialogue_pattern_digest,
+)
+from agent_core.sales_intelligence.schemas import DialoguePattern
 from agent_core.tools.executor import execute_tool_call
 from agent_core.tools.router import ToolRouter
 from agent_core.tools.schemas import ToolCall, ToolResult
@@ -39,7 +67,7 @@ def _text_has_any(text: str, keywords: list[str]) -> bool:
     """判断文本是否命中任一关键词；本地版本用规则，生产可替换模型分类器。"""
     # 将用户输入统一转小写，英文关键词匹配时不受大小写影响。
     lower = text.lower()
-    # 任一关键词命中即返回 True，用于本地 deterministic demo 的意图识别和风险识别。
+    # 任一关键词命中即返回 True，用于规则层的快速意图识别和风险识别。
     return any(keyword.lower() in lower for keyword in keywords)
 
 
@@ -114,7 +142,7 @@ def input_guardrail(state: AgentState) -> AgentState:
 
 
 def restore_memory(state: AgentState, memory_manager: MemoryManager | None = None) -> AgentState:
-    """读取 session/task/preference 三层记忆，并写入本轮 memory_context。"""
+    """读取短期/任务记忆，并按需召回长期偏好记忆。"""
     # 进入 RESTORE_MEMORY 节点，状态迁移会被审计和回放。
     _enter(state, AgentNode.RESTORE_MEMORY, "enter_restore_memory")
     # 记录记忆恢复开始事件。
@@ -127,19 +155,529 @@ def restore_memory(state: AgentState, memory_manager: MemoryManager | None = Non
         session_memory = memory_manager.read(MemoryLayer.SESSION, state.tenant_id, state.session_id)
         # 读取任务记忆：保存当前任务状态，例如上一步是否已经准备好最终答案。
         task_memory = memory_manager.read(MemoryLayer.TASK, state.tenant_id, state.session_id)
-        # 偏好记忆优先按 user_id 读取；匿名用户退回 session_id，避免完全失去个性化上下文。
-        preference_subject = state.user_id or state.session_id
-        # 读取长期偏好记忆：例如用户偏好的输出风格、稳定画像或历史选择。
-        preference_memory = memory_manager.read(MemoryLayer.PREFERENCE, state.tenant_id, preference_subject)
-        # 将三层记忆统一写入 memory_context，后续 normalize/build_context/knowledge_fusion 都从这里取。
+
+        # 长期偏好不是每轮都召回。先由 recall planner 判断当前请求是否需要长期记忆。
+        decision = plan_long_term_memory_recall(
+            input_text=state.input_text,
+            workflow_name=state.workflow_name,
+            intent=state.intent,
+            domain_skill=state.domain_skill,
+            risk_level=state.risk_level,
+            session_memory=dict(session_memory),
+            metadata=state.metadata,
+        )
+        state.memory_recall_decision = decision.model_dump()
+
+        preference_summary: dict[str, Any] = {}
+        recall_items: list[dict[str, Any]] = []
+        if decision.should_recall and "preference" in decision.recall_layers:
+            # 偏好记忆优先按 user_id 读取；匿名用户退回 session_id，避免完全失去个性化上下文。
+            preference_subject = state.user_id or state.session_id
+            # 只有决策需要时才读 PREFERENCE，避免计算、天气等请求被长期偏好污染。
+            preference_memory = memory_manager.read(MemoryLayer.PREFERENCE, state.tenant_id, preference_subject)
+            documents = preference_memory_to_documents(
+                tenant_id=state.tenant_id,
+                subject_id=preference_subject,
+                preference_memory=dict(preference_memory),
+            )
+            recall_result = hybrid_recall_memory(
+                decision=decision,
+                documents=documents,
+                tenant_id=state.tenant_id,
+            )
+            preference_summary = recall_result.compact_summary.get("preference", {})
+            recall_items = [item.model_dump() for item in recall_result.items]
+            state.memory_recall_results.extend(recall_items)
+
+        # 将短期、任务和按需召回结果统一写入 memory_context；长期偏好只保留 TopK 摘要。
         state.memory_context = {
             "session": dict(session_memory),
             "task": dict(task_memory),
-            "preference": dict(preference_memory),
+            "preference": preference_summary,
+            "long_term_recall": {
+                "decision": state.memory_recall_decision,
+                "items": recall_items,
+            },
         }
     # trace 中带上 memory_context 摘要，方便确认记忆层是否真的读到了数据。
     state.add_trace_event("node_finished", node_name="restore_memory", memory_context=state.memory_context)
     # 返回 state 进入消息标准化。
+    return state
+
+
+def load_business_memory(state: AgentState, business_store: BusinessMemoryStore | None = None) -> AgentState:
+    """读取工作流状态，并按需召回长期业务事实。"""
+    _enter(state, AgentNode.LOAD_BUSINESS_MEMORY, "enter_load_business_memory")
+    state.add_trace_event("node_started", node_name="load_business_memory")
+    ids = _business_identity(state)
+    if business_store is None:
+        state.memory_context.setdefault("business", {"mode": "business_store_not_configured", **ids})
+        state.add_trace_event("business_memory_skipped", reason="business_store_not_configured", ids=ids)
+        return state
+
+    case = business_store.get_active_opportunity_case(state.tenant_id, ids["advisor_id"], ids["customer_id"])
+    if case is None:
+        case = OpportunityCase(
+            tenant_id=state.tenant_id,
+            advisor_id=ids["advisor_id"],
+            customer_id=ids["customer_id"],
+            workflow_version=state.metadata.get("workflow_version", "local-v1"),
+        )
+        business_store.upsert_opportunity_case(case)
+
+    asked_focuses = business_store.get_asked_focuses(state.tenant_id, case.id)
+    latest_session = business_store.get_latest_session_state(state.tenant_id, ids["conversation_id"])
+
+    state.metadata.update({"advisor_id": ids["advisor_id"], "customer_id": ids["customer_id"], "opportunity_case_id": case.id})
+    state.asked_focuses = asked_focuses or state.asked_focuses
+    if latest_session is not None:
+        state.kyc_question_round_count = max(state.kyc_question_round_count, latest_session.kyc_question_round_count)
+
+    decision = plan_long_term_memory_recall(
+        input_text=state.input_text,
+        workflow_name=state.workflow_name,
+        intent=state.intent,
+        domain_skill=state.domain_skill,
+        risk_level=state.risk_level,
+        session_memory=state.memory_context.get("session", {}),
+        metadata=state.metadata,
+    )
+    state.memory_recall_decision = decision.model_dump()
+
+    recalled_items: list[dict[str, Any]] = []
+    if decision.should_recall:
+        customer_facts = (
+            business_store.get_current_customer_facts(state.tenant_id, ids["customer_id"])
+            if "customer_profile" in decision.recall_layers
+            else []
+        )
+        advisor_facts = (
+            business_store.get_current_advisor_facts(state.tenant_id, ids["advisor_id"])
+            if "advisor_profile" in decision.recall_layers
+            else []
+        )
+        events = (
+            business_store.get_recent_events(state.tenant_id, opportunity_case_id=case.id, limit=20)
+            if "memory_event" in decision.recall_layers
+            else []
+        )
+        documents = business_memory_to_documents(
+            tenant_id=state.tenant_id,
+            customer_facts=customer_facts,
+            advisor_facts=advisor_facts,
+            opportunity_case=case if "case_state" in decision.recall_layers else None,
+            events=events,
+        )
+        recall_result = hybrid_recall_memory(decision=decision, documents=documents, tenant_id=state.tenant_id)
+        recalled_items = [item.model_dump() for item in recall_result.items]
+        state.memory_recall_results.extend(recalled_items)
+        _apply_business_recall_to_state(state, recall_result.compact_summary)
+
+    state.memory_context["business"] = {
+        "recall_decision": state.memory_recall_decision,
+        "recalled_item_count": len(recalled_items),
+        "opportunity_case_id": case.id,
+        "asked_focuses": state.asked_focuses,
+    }
+    state.add_trace_event(
+        "node_finished",
+        node_name="load_business_memory",
+        business_memory_summary=state.memory_context["business"],
+    )
+    return state
+
+
+def analyze_kyc_and_route(state: AgentState) -> AgentState:
+    """用确定性规则产出 Dify KYC 分析节点的 18 个字段。"""
+    _enter(state, AgentNode.ANALYZE_KYC_AND_ROUTE, "enter_analyze_kyc_and_route")
+    text = state.input_text
+    profile_state = dict(state.profile_state or state.profile or {})
+    practitioner_state = dict(state.practitioner_state or state.practitioner or {})
+
+    _extract_kyc_profile_signals(text, profile_state, practitioner_state)
+    missing_fields = _missing_kyc_fields(profile_state, state.asked_focuses)
+    completeness_score = _kyc_completeness_score(profile_state)
+    opportunity_score = _opportunity_score(profile_state, completeness_score)
+    round_count = max(state.kyc_question_round_count, len(state.asked_focuses))
+    explicit_stop = _text_has_any(
+        text,
+        ["目前就这些", "就这些信息", "先给策略", "直接给策略", "初版策略", "不要再问", "别问了"],
+    )
+
+    if round_count >= 4 or explicit_stop:
+        information_status = "matched"
+        route_reason = "已达到 KYC 补问上限或用户明确要求基于现有信息输出策略。"
+    elif not profile_state and _text_has_any(text, ["不知道", "不清楚", "没有信息"]):
+        information_status = "unmatched"
+        route_reason = "用户没有提供可用客户事实，进入低压维护。"
+    elif missing_fields and completeness_score < 65:
+        information_status = "insufficient"
+        route_reason = "关键 KYC 字段仍不足，需要继续低压补问。"
+    else:
+        information_status = "matched"
+        route_reason = "当前信息足以生成初版沟通策略。"
+
+    state.profile_state = profile_state
+    state.practitioner_state = practitioner_state
+    state.information_status = information_status
+    state.subject_type = "channel" if "渠道" in text else "customer"
+    state.target_persona = _target_persona(profile_state)
+    state.advisor_stage = practitioner_state.get("career_stage", "unknown")
+    state.missing_fields = missing_fields
+    state.match_evidence = _build_match_evidence(text, profile_state)
+    state.route_reason = route_reason
+    state.kyc_completeness_score = completeness_score
+    state.opportunity_score = opportunity_score
+    state.external_grade = _external_grade(opportunity_score)
+    state.trigger_module = _trigger_module(profile_state)
+    state.current_stage = "collect_kyc" if information_status == "insufficient" else "deep_conversation"
+    state.objective_material_need = "公开新闻或行业素材" if _text_has_any(text, ["新闻", "热点", "利率", "政策"]) else ""
+    state.support_note = _support_note(information_status, completeness_score)
+    state.kyc_question_round_count = round_count
+    state.add_trace_event(
+        "kyc_analyzed",
+        information_status=state.information_status,
+        missing_fields=state.missing_fields,
+        scores={"kyc": state.kyc_completeness_score, "opportunity": state.opportunity_score},
+    )
+    return state
+
+
+def propose_memory_writes(state: AgentState) -> AgentState:
+    """把本轮明确事实、分析结果和待问焦点整理成写入提案。"""
+    _enter(state, AgentNode.MEMORY_WRITE_PROPOSAL, "enter_memory_write_proposal")
+    ids = _business_identity(state)
+    case_id = state.metadata.get("opportunity_case_id") or ids["opportunity_case_id"]
+    evidence = state.match_evidence or state.input_text
+    facts: list[AdvisorProfileFact | CustomerProfileFact] = []
+    for key, value in state.profile_state.items():
+        if value in (None, "", [], {}):
+            continue
+        certainty = "uncertain" if key in {"uncertain_signals", "concerns"} else "confirmed"
+        facts.append(
+            CustomerProfileFact(
+                tenant_id=state.tenant_id,
+                customer_id=ids["customer_id"],
+                fact_key=key,
+                fact_value=value,
+                certainty=certainty,
+                confidence=0.7 if certainty == "uncertain" else 0.9,
+                source_type="user_message",
+                source_conversation_id=ids["conversation_id"],
+                evidence_text=evidence,
+            )
+        )
+    for key, value in state.practitioner_state.items():
+        if value in (None, "", [], {}):
+            continue
+        facts.append(
+            AdvisorProfileFact(
+                tenant_id=state.tenant_id,
+                advisor_id=ids["advisor_id"],
+                fact_key=key,
+                fact_value=value,
+                confidence=0.85,
+                source_type="user_message",
+                source_conversation_id=ids["conversation_id"],
+                evidence_text=evidence,
+            )
+        )
+
+    next_focuses = [field for field in state.missing_fields if field not in state.asked_focuses][:1]
+    questions = [
+        KYCQuestion(
+            tenant_id=state.tenant_id,
+            opportunity_case_id=case_id,
+            conversation_id=ids["conversation_id"],
+            round_no=min(state.kyc_question_round_count + 1, 4),
+            focus_key=focus,
+            question_text=_question_for_focus(focus),
+        )
+        for focus in next_focuses
+        if state.information_status == "insufficient"
+    ]
+
+    session_state = AgentSessionState(
+        tenant_id=state.tenant_id,
+        conversation_id=ids["conversation_id"],
+        opportunity_case_id=case_id,
+        profile_state=state.profile_state,
+        practitioner_state=state.practitioner_state,
+        information_status=state.information_status,  # type: ignore[arg-type]
+        subject_type=state.subject_type,  # type: ignore[arg-type]
+        target_persona=state.target_persona,  # type: ignore[arg-type]
+        advisor_stage=state.advisor_stage,  # type: ignore[arg-type]
+        trigger_module=state.trigger_module,  # type: ignore[arg-type]
+        current_stage=state.current_stage,  # type: ignore[arg-type]
+        missing_fields=state.missing_fields,
+        asked_focuses=state.asked_focuses,
+        kyc_question_round_count=state.kyc_question_round_count,
+        kyc_completeness_score=state.kyc_completeness_score,
+        opportunity_score=state.opportunity_score,
+        external_grade=state.external_grade,  # type: ignore[arg-type]
+        objective_material_need=state.objective_material_need,
+        support_note=state.support_note,
+    )
+    analysis_run = AnalysisRun(
+        tenant_id=state.tenant_id,
+        conversation_id=ids["conversation_id"],
+        opportunity_case_id=case_id,
+        input_snapshot={"input_text": state.input_text, "asked_focuses": state.asked_focuses},
+        output_json=_dify_kyc_output_snapshot(state),
+        information_status=state.information_status,  # type: ignore[arg-type]
+        target_persona=state.target_persona,  # type: ignore[arg-type]
+        trigger_module=state.trigger_module,  # type: ignore[arg-type]
+        current_stage=state.current_stage,  # type: ignore[arg-type]
+        kyc_completeness_score=state.kyc_completeness_score,
+        opportunity_score=state.opportunity_score,
+        external_grade=state.external_grade,  # type: ignore[arg-type]
+        match_evidence=state.match_evidence,
+        route_reason=state.route_reason,
+    )
+    events = [
+        MemoryEvent(
+            tenant_id=state.tenant_id,
+            conversation_id=ids["conversation_id"],
+            opportunity_case_id=case_id,
+            customer_id=ids["customer_id"],
+            advisor_id=ids["advisor_id"],
+            event_type="trigger_event",
+            event_payload={"information_status": state.information_status},
+            evidence_text=evidence,
+        )
+    ]
+    proposal = MemoryWriteProposal(
+        facts_to_upsert=facts,
+        events_to_insert=events,
+        questions_to_record=questions,
+        session_state_to_insert=session_state,
+        analysis_run_to_insert=analysis_run,
+        do_not_store=[],
+    )
+    state.memory_write_proposal = proposal.model_dump()
+    state.add_trace_event(
+        "memory_write_proposed",
+        fact_count=len(facts),
+        question_focuses=[question.focus_key for question in questions],
+    )
+    return state
+
+
+def validate_memory_writes(state: AgentState) -> AgentState:
+    """校验记忆写入提案，阻止无证据事实、PII 和生成建议误写。"""
+    _enter(state, AgentNode.VALIDATE_MEMORY_WRITE, "enter_validate_memory_write")
+    proposal = MemoryWriteProposal.model_validate(state.memory_write_proposal)
+    validation = validate_memory_write_proposal(proposal)
+    state.memory_write_validation = validation.model_dump()
+    if not validation.is_valid:
+        state.errors.extend(validation.errors)
+    state.add_trace_event("memory_write_validated", validation=state.memory_write_validation)
+    return state
+
+
+def persist_memory_snapshot(state: AgentState, business_store: BusinessMemoryStore | None = None) -> AgentState:
+    """把通过校验的业务记忆写入 store；没有 store 时只记录跳过原因。"""
+    _enter(state, AgentNode.PERSIST_MEMORY_SNAPSHOT, "enter_persist_memory_snapshot")
+    if business_store is None:
+        state.add_trace_event("business_memory_persist_skipped", reason="business_store_not_configured")
+        return state
+    proposal = MemoryWriteProposal.model_validate(state.memory_write_proposal)
+    validation = validate_memory_write_proposal(proposal)
+    for fact in filter_allowed_facts(proposal, validation):
+        if isinstance(fact, CustomerProfileFact):
+            business_store.upsert_customer_fact(fact)
+        else:
+            business_store.upsert_advisor_fact(fact)
+    for event in proposal.events_to_insert:
+        business_store.insert_memory_event(event)
+    for question in proposal.questions_to_record:
+        business_store.insert_kyc_question(question)
+    if proposal.session_state_to_insert is not None:
+        business_store.insert_session_state(proposal.session_state_to_insert)
+    if proposal.analysis_run_to_insert is not None:
+        business_store.insert_analysis_run(proposal.analysis_run_to_insert)
+
+    ids = _business_identity(state)
+    case_id = state.metadata.get("opportunity_case_id") or ids["opportunity_case_id"]
+    business_store.upsert_opportunity_case(
+        OpportunityCase(
+            id=case_id,
+            tenant_id=state.tenant_id,
+            advisor_id=ids["advisor_id"],
+            customer_id=ids["customer_id"],
+            subject_type=state.subject_type,  # type: ignore[arg-type]
+            target_persona=state.target_persona,  # type: ignore[arg-type]
+            trigger_module=state.trigger_module,  # type: ignore[arg-type]
+            current_stage=state.current_stage,  # type: ignore[arg-type]
+            latest_kyc_completeness_score=state.kyc_completeness_score,
+            latest_opportunity_score=state.opportunity_score,
+            latest_external_grade=state.external_grade,  # type: ignore[arg-type]
+            latest_missing_fields=state.missing_fields,
+            latest_support_note=state.support_note,
+            next_best_action="generate_strategy" if state.information_status == "matched" else "ask_kyc_question",
+            workflow_version=state.metadata.get("workflow_version", "local-v1"),
+        )
+    )
+    state.add_trace_event(
+        "business_memory_persisted",
+        allowed_fact_ids=validation.allowed_fact_ids,
+        blocked_fact_ids=validation.blocked_fact_ids,
+    )
+    return state
+
+
+def build_compact_context_node(state: AgentState, business_store: BusinessMemoryStore | None = None) -> AgentState:
+    """构建策略生成节点优先使用的 compact_context。"""
+    _enter(state, AgentNode.BUILD_COMPACT_CONTEXT, "enter_build_compact_context")
+    ids = _business_identity(state)
+    case: OpportunityCase | None = None
+    confirmed: list[CustomerProfileFact] = []
+    uncertain: list[CustomerProfileFact] = []
+    advisor_facts: list[AdvisorProfileFact] = []
+    asked_focuses = state.asked_focuses
+    if business_store is not None:
+        # case 和 KYCQuestion 属于当前工作流状态，可以读取；长期画像事实已经在 load_business_memory 按需召回。
+        case = business_store.get_active_opportunity_case(state.tenant_id, ids["advisor_id"], ids["customer_id"])
+        if case is not None:
+            asked_focuses = business_store.get_asked_focuses(state.tenant_id, case.id) or asked_focuses
+    if state.profile_state:
+        confirmed = _profile_state_to_customer_facts(state, ids["customer_id"], certainty="confirmed")
+        uncertain = _profile_state_to_customer_facts(state, ids["customer_id"], certainty="uncertain")
+    if state.practitioner_state:
+        advisor_facts = _practitioner_state_to_advisor_facts(state, ids["advisor_id"])
+
+    state.compact_context = build_compact_context(
+        confirmed_customer_facts=confirmed,
+        uncertain_customer_facts=uncertain,
+        advisor_facts=advisor_facts,
+        opportunity_case=case,
+        kyc_completeness_score=state.kyc_completeness_score,
+        opportunity_score=state.opportunity_score,
+        external_grade=state.external_grade,
+        asked_focuses=asked_focuses,
+        missing_fields=state.missing_fields,
+        support_note=state.support_note,
+        retrieved_dialogue_patterns=state.retrieved_dialogue_patterns,
+        news_digest=state.metadata.get("news_digest", ""),
+    )
+    state.add_trace_event(
+        "compact_context_built",
+        context_keys=list(state.compact_context.keys()),
+        confirmed_keys=list(state.compact_context["customer_profile"]["confirmed"].keys()),
+    )
+    return state
+
+
+def status_router(state: AgentState) -> AgentState:
+    """按 information_status 选择 KYC 补问、策略生成或低压维护路径。"""
+    _enter(state, AgentNode.STATUS_ROUTER, "enter_status_router")
+    if state.information_status == "insufficient" and state.kyc_question_round_count < 4:
+        state.move_to(AgentNode.GENERATE_KYC_QUESTIONS, reason="kyc_information_insufficient")
+    elif state.information_status == "unmatched":
+        state.move_to(AgentNode.GENERATE_STRATEGY, reason="kyc_unmatched_low_pressure")
+    else:
+        state.information_status = "matched"
+        state.move_to(AgentNode.RETRIEVE_DIALOGUE_PATTERNS, reason="kyc_ready_for_strategy")
+    return state
+
+
+def generate_kyc_questions(state: AgentState) -> AgentState:
+    """基于缺失字段和已问焦点生成下一条低压 KYC 补问。"""
+    _enter(state, AgentNode.GENERATE_KYC_QUESTIONS, "enter_generate_kyc_questions")
+    next_focus = next((field for field in state.missing_fields if field not in state.asked_focuses), None)
+    if next_focus is None:
+        state.information_status = "matched"
+        state.answer = "已有信息足够先生成初版策略，我不再重复追问。"
+    else:
+        state.kyc_question_round_count = min(state.kyc_question_round_count + 1, 4)
+        state.asked_focuses.append(next_focus)
+        state.answer = _question_for_focus(next_focus)
+    state.add_trace_event(
+        "kyc_question_generated",
+        asked_focuses=state.asked_focuses,
+        round_count=state.kyc_question_round_count,
+    )
+    return state
+
+
+def retrieve_dialogue_patterns_node(state: AgentState) -> AgentState:
+    """整理已审核销售对话模式。"""
+    _enter(state, AgentNode.RETRIEVE_DIALOGUE_PATTERNS, "enter_retrieve_dialogue_patterns")
+    raw_patterns = state.metadata.get("dialogue_patterns", [])
+    patterns = [
+        item if isinstance(item, DialoguePattern) else DialoguePattern.model_validate(item)
+        for item in raw_patterns
+    ]
+    state.retrieved_dialogue_patterns = build_dialogue_pattern_digest(patterns)
+    state.add_trace_event(
+        "dialogue_patterns_retrieved",
+        pattern_ids=[pattern["id"] for pattern in state.retrieved_dialogue_patterns],
+    )
+    return state
+
+
+def retrieve_external_context_if_needed_node(state: AgentState) -> AgentState:
+    """必要时检查外部素材摘要是否已由真实工具写入。"""
+    _enter(state, AgentNode.RETRIEVE_EXTERNAL_CONTEXT_IF_NEEDED, "enter_retrieve_external_context_if_needed")
+    if state.objective_material_need and "news_digest" not in state.metadata:
+        state.errors.append("external_context_required_but_missing")
+    state.add_trace_event(
+        "external_context_checked",
+        objective_material_need=state.objective_material_need,
+        has_news_digest=bool(state.metadata.get("news_digest")),
+    )
+    return state
+
+
+def generate_strategy_node(state: AgentState) -> AgentState:
+    """基于 compact_context 生成策略；生产可替换为 LLM 调用。"""
+    _enter(state, AgentNode.GENERATE_STRATEGY, "enter_generate_strategy")
+    if not state.compact_context:
+        state.answer = "当前缺少 compact_context，无法安全生成策略。"
+        state.errors.append("compact_context_missing")
+    else:
+        state.answer = _answer_from_compact_context(state)
+    state.add_trace_event("strategy_generated", output_summary=(state.answer or "")[:120])
+    return state
+
+
+def post_response_logger_node(state: AgentState, business_store: BusinessMemoryStore | None = None) -> AgentState:
+    """记录最终生成输出与使用的销售模式，形成策略到结果的审计链。"""
+    previous_state = state.current_state
+    _enter(state, AgentNode.POST_RESPONSE_LOGGER, "enter_post_response_logger")
+    if not state.answer:
+        state.add_trace_event("generated_output_skipped", reason="answer_empty")
+        return state
+    ids = _business_identity(state)
+    used_pattern_ids = [item.get("id") for item in state.retrieved_dialogue_patterns if item.get("id")]
+    output = GeneratedOutput(
+        tenant_id=state.tenant_id,
+        conversation_id=ids["conversation_id"],
+        opportunity_case_id=state.metadata.get("opportunity_case_id") or ids["opportunity_case_id"],
+        output_type=(
+            "kyc_question"
+            if previous_state == AgentNode.GENERATE_KYC_QUESTIONS or state.information_status == "insufficient"
+            else "strategy"
+        ),
+        model_name=state.model_name or "configured-runtime",
+        workflow_version=state.metadata.get("workflow_version", "local-v1"),
+        input_context=state.compact_context,
+        output_text=state.answer,
+        safety_flags=[
+            result.get("action", "")
+            for result in state.guardrail_results
+            if isinstance(result, dict) and result.get("action") != "pass"
+        ],
+        used_case_pattern_ids=used_pattern_ids,
+    )
+    if business_store is not None:
+        business_store.insert_generated_output(output)
+    state.add_trace_event(
+        "generated_output_logged",
+        output_type=output.output_type,
+        used_case_pattern_ids=used_pattern_ids,
+        persisted=business_store is not None,
+    )
     return state
 
 
@@ -361,6 +899,8 @@ def context_need_planning(state: AgentState) -> AgentState:
     state.context_needs = {
         # Memory 默认需要，因为多轮对话和指代消解都依赖短期记忆。
         "memory": True,
+        # long_term_memory 只表示 preference/profile/case 这类跨会话长期记忆是否被召回。
+        "long_term_memory": bool(state.memory_recall_decision.get("should_recall", False)),
         # Domain Skill 默认需要 RAG/销售洞察检索，通用工具问题则不走业务知识库。
         "rag": state.capability_route == "domain",
         # Tool 需求来自上面的 needs_tool 判断。
@@ -682,15 +1222,26 @@ def model_routing(state: AgentState) -> AgentState:
 
 
 def generate_response(state: AgentState) -> AgentState:
-    """基于压缩上下文、工具结果或销售洞察生成回答；当前为本地 deterministic 实现。"""
-    # 进入 GENERATE_RESPONSE 节点；这里是本地可测试生成逻辑，生产可替换为 LLM 调用。
+    """基于压缩上下文、工具结果或销售洞察生成回答。"""
+    # 进入 GENERATE_RESPONSE 节点；生产部署可将该节点接到配置化 LLM generation client。
     _enter(state, AgentNode.GENERATE_RESPONSE, "enter_generate_response")
     # 如果前面风控或恢复节点已经写入 answer，这里不覆盖，避免丢失阻断/降级说明。
     if state.answer:
         state.add_trace_event("node_finished", node_name="generate_response", output_summary=state.answer[:120])
         return state
+    # KYC 教练链路优先使用 compact_context，避免策略生成继续依赖散落变量。
+    if state.compact_context:
+        state.answer = _answer_from_compact_context(state)
+    # 信息不足但还没生成补问时，直接用缺失字段生成一条低压问题。
+    elif (
+        state.workflow_name == "insurance_kyc_coach_workflow"
+        and state.domain_skill == "insurance_advisor"
+        and state.information_status == "insufficient"
+    ):
+        next_focus = next((field for field in state.missing_fields if field not in state.asked_focuses), None)
+        state.answer = _question_for_focus(next_focus) if next_focus else "已有信息可以先输出初版策略。"
     # 保险顾问路径使用销售洞察和合规原则生成低压沟通建议。
-    if state.domain_skill == "insurance_advisor":
+    elif state.domain_skill == "insurance_advisor":
         state.answer = (
             "当前建议先做低压沟通：先确认客户真实处境，再用资金分层引导长期稳定安排。"
             "可从客户行业、家庭责任、资金用途和风险偏好切入，避免直接推产品。"
@@ -825,6 +1376,34 @@ def _next_actions(state: AgentState) -> list[str]:
     return ["继续补充背景信息"]
 
 
+def _answer_from_compact_context(state: AgentState) -> str:
+    """基于 compact_context 生成保险 KYC 教练回答，不引用原始客户对话。"""
+    context = state.compact_context
+    confirmed = context.get("customer_profile", {}).get("confirmed", {})
+    uncertain = context.get("customer_profile", {}).get("uncertain", {})
+    patterns = context.get("retrieved_patterns", [])
+    support_note = context.get("support_note") or "你已经拿到了一部分有价值信息，可以先稳住节奏。"
+    if state.information_status == "unmatched":
+        return f"{support_note}\n\n当前客户信息太少，建议先做低压维护，不急着切产品：先表达关心，再约一个轻量话题继续了解。"
+    if state.information_status == "insufficient":
+        next_focus = next((field for field in state.missing_fields if field not in state.asked_focuses), None)
+        return _question_for_focus(next_focus) if next_focus else "已有信息可以先输出初版策略。"
+
+    known_parts = "、".join(f"{key}={value}" for key, value in confirmed.items()) or "已有客户背景"
+    uncertain_note = ""
+    if uncertain:
+        uncertain_note = "\n不确定线索只当作假设处理，沟通时需要先让客户确认。"
+    recommended_move = patterns[0].get("recommended_move") if patterns else "先复述已知事实，再补问一个最影响策略的问题。"
+    example_wording = patterns[0].get("example_wording") if patterns else "我先不急着聊方案，想先确认这笔钱更偏长期安排还是备用周转？"
+    return (
+        f"{support_note}\n\n"
+        f"当前可基于这些明确事实做初版策略：{known_parts}。{uncertain_note}\n"
+        f"建议动作：{recommended_move}\n"
+        f"可用话术：{example_wording}\n"
+        "合规边界：不要承诺收益，不引用真实客户成交故事，不把推测当事实。"
+    )
+
+
 def update_short_term_memory(state: AgentState, memory_manager: MemoryManager | None = None) -> AgentState:
     """把本轮用户问题、回答、槽位和实体写回 session/task memory。"""
     # 进入 SHORT_TERM_MEMORY_UPDATE 节点，开始持久化本轮会话状态。
@@ -909,6 +1488,238 @@ def trace_finalize(state: AgentState) -> AgentState:
     state.move_to(AgentNode.FINAL, reason="trace_finalized")
     # 返回最终 AgentState。
     return state
+
+
+def _business_identity(state: AgentState) -> dict[str, str]:
+    """从 metadata/session 中解析业务记忆主体 ID。"""
+    advisor_id = str(state.metadata.get("advisor_id") or state.user_id or "local_advisor")
+    customer_id = str(state.metadata.get("customer_id") or state.session_id or "local_customer")
+    conversation_id = str(state.metadata.get("conversation_id") or state.session_id or "local_conversation")
+    opportunity_case_id = str(state.metadata.get("opportunity_case_id") or f"case_{advisor_id}_{customer_id}")
+    return {
+        "advisor_id": advisor_id,
+        "customer_id": customer_id,
+        "conversation_id": conversation_id,
+        "opportunity_case_id": opportunity_case_id,
+    }
+
+
+def _extract_kyc_profile_signals(text: str, profile_state: dict[str, Any], practitioner_state: dict[str, Any]) -> None:
+    """从用户输入中抽取本地可测的 KYC 信号。"""
+    if "企业主" in text or "老板" in text:
+        profile_state.setdefault("occupation", "企业主")
+        profile_state.setdefault("company_type", "经营主体")
+    if "高管" in text:
+        profile_state.setdefault("position_level", "高管")
+    if "孩子" in text:
+        profile_state.setdefault("children", "有子女")
+        profile_state.setdefault("family_status", "有家庭责任")
+    if "银行理财" in text or "稳健" in text:
+        profile_state.setdefault("financial_preference", "偏稳健，关注银行理财或稳定现金流")
+    if "现金流" in text:
+        profile_state.setdefault("cashflow_status", "关注现金流稳定")
+    if "海外" in text or "港" in text:
+        profile_state.setdefault("cross_border_need", "存在跨境或多币种关注")
+    if "新手" in text or "刚做" in text:
+        practitioner_state.setdefault("career_stage", "newbie")
+        practitioner_state.setdefault("confidence_barrier", "担心问得太直接")
+    if "转介绍" in text:
+        practitioner_state.setdefault("resource_circle", "转介绍")
+
+
+def _missing_kyc_fields(profile_state: dict[str, Any], asked_focuses: list[str]) -> list[str]:
+    """根据当前客户画像和已问焦点计算下一批缺失字段。"""
+    required = [
+        "occupation",
+        "family_status",
+        "financial_preference",
+        "available_long_term_funds",
+        "family_decision_maker",
+    ]
+    return [field for field in required if field not in profile_state and field not in asked_focuses]
+
+
+def _kyc_completeness_score(profile_state: dict[str, Any]) -> int:
+    """按已知 KYC 字段数量给出可追溯的本地完整度分。"""
+    tracked = {
+        "occupation",
+        "family_status",
+        "children",
+        "financial_preference",
+        "available_long_term_funds",
+        "family_decision_maker",
+        "cashflow_status",
+        "cross_border_need",
+    }
+    known = len([key for key in tracked if key in profile_state and profile_state[key] not in (None, "", [], {})])
+    return min(100, known * 14)
+
+
+def _opportunity_score(profile_state: dict[str, Any], completeness_score: int) -> int:
+    """用客户触发信号和完整度生成机会推进分。"""
+    score = completeness_score
+    for key in ["cashflow_status", "family_status", "financial_preference", "cross_border_need"]:
+        if key in profile_state:
+            score += 8
+    return min(100, score)
+
+
+def _target_persona(profile_state: dict[str, Any]) -> str:
+    """把客户画像映射成内部客群标签。"""
+    if profile_state.get("occupation") == "企业主" or profile_state.get("company_type"):
+        return "enterprise_owner"
+    if profile_state.get("position_level") == "高管":
+        return "executive"
+    if profile_state.get("family_status") or profile_state.get("children"):
+        return "family_planner"
+    return "unknown"
+
+
+def _trigger_module(profile_state: dict[str, Any]) -> str:
+    """根据客户事实选择销售切入模块。"""
+    if profile_state.get("cashflow_status"):
+        return "cashflow_pressure"
+    if profile_state.get("cross_border_need"):
+        return "overseas_multi_currency"
+    if profile_state.get("family_status") or profile_state.get("children"):
+        return "family_responsibility"
+    if profile_state.get("financial_preference"):
+        return "interest_rate_stability"
+    return "unknown"
+
+
+def _external_grade(opportunity_score: int) -> str:
+    """把机会分转换成展示等级。"""
+    if opportunity_score >= 80:
+        return "A"
+    if opportunity_score >= 60:
+        return "B"
+    if opportunity_score >= 35:
+        return "C"
+    return "D"
+
+
+def _support_note(information_status: str, completeness_score: int) -> str:
+    """生成给从业者看的鼓励摘要，不写入客户事实。"""
+    if information_status == "insufficient":
+        return "你已经拿到部分线索，下一步只补问一个关键点就好，不需要一次问完。"
+    if completeness_score >= 60:
+        return "当前信息已经能支撑初版沟通策略，重点是低压确认，不要急着讲产品。"
+    return "信息不多也可以先维护关系，先让客户愿意继续聊。"
+
+
+def _build_match_evidence(text: str, profile_state: dict[str, Any]) -> str:
+    """构造只包含明确事实的证据摘要。"""
+    facts = [f"{key}={value}" for key, value in profile_state.items() if value not in (None, "", [], {})]
+    if facts:
+        return "；".join(facts)
+    return text[:160]
+
+
+def _question_for_focus(focus: str | None) -> str:
+    """把缺失字段转成一条低压 KYC 补问。"""
+    questions = {
+        "occupation": "他现在主要的职业或收入来源是什么？大概说方向就好。",
+        "family_status": "他目前家庭责任这块有什么需要顾及的吗，比如配偶、孩子或父母？",
+        "financial_preference": "他平时更偏好哪类资金安排，比如银行理财、定存、基金或企业周转？",
+        "available_long_term_funds": "如果只聊长期不用的钱，大概有没有一笔可以独立规划的资金？不用说精确数字。",
+        "family_decision_maker": "这类长期安排通常是谁一起做决定，是他本人、配偶，还是家庭一起商量？",
+    }
+    return questions.get(focus or "", "再补充一个最关键的客户背景就好：他现在最在意资金安全、流动性还是家庭责任？")
+
+
+def _facts_to_profile_state(facts: list[CustomerProfileFact]) -> dict[str, Any]:
+    """把当前客户事实转换成本轮 profile_state。"""
+    return {
+        fact.fact_key: fact.normalized_value if fact.normalized_value is not None else fact.fact_value
+        for fact in facts
+        if fact.is_current
+    }
+
+
+def _apply_business_recall_to_state(state: AgentState, compact_summary: dict[str, Any]) -> None:
+    """把按需召回的业务记忆摘要合并到本轮工作状态。"""
+    customer_profile = compact_summary.get("customer_profile", {})
+    confirmed = customer_profile.get("confirmed", {})
+    uncertain = customer_profile.get("uncertain", {})
+    if confirmed:
+        state.profile_state.update(confirmed)
+    if uncertain:
+        state.profile_state.setdefault("uncertain_signals", {}).update(uncertain)
+    advisor_profile = compact_summary.get("advisor_profile", {})
+    if advisor_profile:
+        state.practitioner_state.update(advisor_profile)
+
+
+def _profile_state_to_customer_facts(
+    state: AgentState,
+    customer_id: str,
+    *,
+    certainty: str,
+) -> list[CustomerProfileFact]:
+    """把本轮 profile_state 临时转换成 compact_context 可消费的客户事实。"""
+    source_items = state.profile_state.items()
+    if certainty == "confirmed":
+        source_items = [(key, value) for key, value in source_items if key != "uncertain_signals"]
+    else:
+        uncertain_signals = state.profile_state.get("uncertain_signals", {})
+        if isinstance(uncertain_signals, dict):
+            source_items = uncertain_signals.items()
+        else:
+            source_items = [("uncertain_signals", uncertain_signals)]
+    return [
+        CustomerProfileFact(
+            tenant_id=state.tenant_id,
+            customer_id=customer_id,
+            fact_key=key,
+            fact_value=value,
+            certainty=certainty,  # type: ignore[arg-type]
+            source_type="analysis",
+            evidence_text=state.match_evidence or state.input_text or "本轮 KYC 分析快照",
+        )
+        for key, value in state.profile_state.items()
+        if value not in (None, "", [], {})
+    ]
+
+
+def _practitioner_state_to_advisor_facts(state: AgentState, advisor_id: str) -> list[AdvisorProfileFact]:
+    """把本轮 practitioner_state 临时转换成 compact_context 可消费的从业者事实。"""
+    return [
+        AdvisorProfileFact(
+            tenant_id=state.tenant_id,
+            advisor_id=advisor_id,
+            fact_key=key,
+            fact_value=value,
+            source_type="analysis",
+            evidence_text=state.match_evidence or state.input_text or "本轮 KYC 分析快照",
+        )
+        for key, value in state.practitioner_state.items()
+        if value not in (None, "", [], {})
+    ]
+
+
+def _dify_kyc_output_snapshot(state: AgentState) -> dict[str, Any]:
+    """返回 Dify KYC 分析节点 18 个顶层字段的快照。"""
+    return {
+        "information_status": state.information_status,
+        "subject_type": state.subject_type,
+        "target_persona": state.target_persona,
+        "profile_state": state.profile_state,
+        "practitioner_state": state.practitioner_state,
+        "advisor_stage": state.advisor_stage,
+        "missing_fields": state.missing_fields,
+        "match_evidence": state.match_evidence,
+        "route_reason": state.route_reason,
+        "kyc_completeness_score": state.kyc_completeness_score,
+        "opportunity_score": state.opportunity_score,
+        "external_grade": state.external_grade,
+        "trigger_module": state.trigger_module,
+        "current_stage": state.current_stage,
+        "objective_material_need": state.objective_material_need,
+        "support_note": state.support_note,
+        "kyc_question_round_count": state.kyc_question_round_count,
+        "asked_focuses": state.asked_focuses,
+    }
 
 
 def _summarize_mapping(value: dict[str, Any]) -> dict[str, Any]:

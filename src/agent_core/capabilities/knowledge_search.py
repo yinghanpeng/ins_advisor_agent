@@ -1,11 +1,23 @@
-"""Knowledge search adapter placeholder."""
+"""内部知识库搜索 provider wrapper。"""
 
 # 文件说明：
 # - 本文件属于通用能力层，封装天气、搜索、计算、文件解析等可复用能力。
 # - 需要外部服务的能力以 adapter 形式保留，便于生产替换 provider。
 from __future__ import annotations
 
+import os
+
+import httpx
+
 
 def run(arguments: dict) -> dict:
-    """返回内部知识库检索占位结果；生产环境应接入带租户隔离的索引。"""
-    return {"query": arguments.get("query", ""), "matches": [], "mode": "mock"}
+    """调用配置的知识库检索服务。"""
+    provider_url = os.getenv("KNOWLEDGE_SEARCH_API_URL")
+    if not provider_url:
+        raise RuntimeError("KNOWLEDGE_SEARCH_API_URL 未配置，知识库搜索工具不能执行")
+    response = httpx.post(provider_url, json=arguments, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("知识库搜索服务返回的 JSON 顶层不是对象")
+    return data

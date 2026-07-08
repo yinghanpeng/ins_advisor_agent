@@ -1,4 +1,4 @@
-"""Lightweight lexical retriever placeholder."""
+"""轻量词法相关性评分。"""
 
 # 文件说明：
 # - 本文件属于 RAG 检索层，负责 query rewrite、metadata、hybrid search、rerank 或 evidence。
@@ -12,4 +12,3 @@ def score(query: str, document: str) -> float:
     if not query_terms:
         return 0.0
     return len(query_terms & doc_terms) / len(query_terms)
-

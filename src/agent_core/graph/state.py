@@ -50,6 +50,9 @@ class AgentNode(StrEnum):
     # 短期记忆恢复状态：按 tenant/session/user 读取会话、任务和偏好记忆。
     RESTORE_MEMORY = "RESTORE_MEMORY"
 
+    # 业务记忆读取状态：读取客户事实、从业者事实、机会 case 和已问 KYC 焦点。
+    LOAD_BUSINESS_MEMORY = "LOAD_BUSINESS_MEMORY"
+
     # 消息标准化状态：把原始输入和历史上下文合并为统一 message 结构。
     NORMALIZE_MESSAGES = "NORMALIZE_MESSAGES"
 
@@ -106,6 +109,39 @@ class AgentNode(StrEnum):
 
     # 状态更新状态：把用户补充的信息写入 session、profile、task memory 等运行时状态。
     UPDATE_STATE = "UPDATE_STATE"
+
+    # KYC 分析与路由状态：产出 Dify KYC 分析节点的 18 个结构化字段。
+    ANALYZE_KYC_AND_ROUTE = "ANALYZE_KYC_AND_ROUTE"
+
+    # 记忆写入提案状态：把本轮明确事实、事件、问题和快照整理成写入计划。
+    MEMORY_WRITE_PROPOSAL = "MEMORY_WRITE_PROPOSAL"
+
+    # 记忆写入校验状态：检查证据、PII、生成建议误写等问题。
+    VALIDATE_MEMORY_WRITE = "VALIDATE_MEMORY_WRITE"
+
+    # 业务记忆快照持久化状态：把通过校验的事实、事件、分析和快照写入 store。
+    PERSIST_MEMORY_SNAPSHOT = "PERSIST_MEMORY_SNAPSHOT"
+
+    # 业务紧凑上下文构建状态：生成策略节点统一使用 compact_context。
+    BUILD_COMPACT_CONTEXT = "BUILD_COMPACT_CONTEXT"
+
+    # KYC 状态路由状态：按 information_status 选择补问、策略、低压维护或降级路径。
+    STATUS_ROUTER = "STATUS_ROUTER"
+
+    # KYC 补问生成状态：按缺失字段和已问焦点生成下一轮低压问题。
+    GENERATE_KYC_QUESTIONS = "GENERATE_KYC_QUESTIONS"
+
+    # 销售对话模式检索状态：只检索已审核、非高风险的 DialoguePattern。
+    RETRIEVE_DIALOGUE_PATTERNS = "RETRIEVE_DIALOGUE_PATTERNS"
+
+    # 外部上下文检索状态：必要时补充热点新闻或公开资料摘要。
+    RETRIEVE_EXTERNAL_CONTEXT_IF_NEEDED = "RETRIEVE_EXTERNAL_CONTEXT_IF_NEEDED"
+
+    # 策略生成状态：基于 compact_context 生成 KYC 策略、话术或维护消息。
+    GENERATE_STRATEGY = "GENERATE_STRATEGY"
+
+    # 响应后记录状态：把生成输出、使用的模式和 trace 摘要写回记忆系统。
+    POST_RESPONSE_LOGGER = "POST_RESPONSE_LOGGER"
 
     # 任务规划状态：把复杂请求拆解成可执行步骤。
     PLAN_TASK = "PLAN_TASK"
@@ -325,6 +361,107 @@ class AgentState(BaseModel):
         ),
     )
 
+    profile_state: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Dify KYC 分析节点输出的客户画像结构。"
+            "它是本轮工作记忆快照，不等同于长期客户事实表；长期事实应写入 CustomerProfileFact。"
+        ),
+    )
+
+    practitioner_state: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Dify KYC 分析节点输出的从业者画像结构。"
+            "它是本轮工作记忆快照，不等同于长期从业者事实表；长期事实应写入 AdvisorProfileFact。"
+        ),
+    )
+
+    information_status: str = Field(
+        default="insufficient",
+        description="KYC 信息状态。insufficient 进入补问；matched 进入策略；unmatched 进入低压维护。",
+    )
+
+    subject_type: str = Field(
+        default="unclear",
+        description="当前沟通对象类型，例如 customer、channel、unclear。",
+    )
+
+    target_persona: str = Field(
+        default="unknown",
+        description="内部客群标签，例如 enterprise_owner、executive、family_planner、channel。",
+    )
+
+    advisor_stage: str = Field(
+        default="unknown",
+        description="从业者阶段，例如 newbie、transitioning、part_time、experienced。",
+    )
+
+    missing_fields: list[str] = Field(
+        default_factory=list,
+        description="当前仍缺失的关键 KYC 字段，用于生成低压补问。",
+    )
+
+    match_evidence: str = Field(
+        default="",
+        description="KYC 分析使用的明确事实证据。只能写用户或资料中可回溯的事实，不写推测。",
+    )
+
+    route_reason: str = Field(
+        default="",
+        description="当前 information_status 的路由原因，用于审计为什么补问、生成策略或低压维护。",
+    )
+
+    kyc_completeness_score: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="KYC 完整度分。只保存结果，不在 compact_context 中输出内部评分公式。",
+    )
+
+    opportunity_score: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="机会推进分。必须能追溯到 AnalysisRun，不应作为不可解释魔法数字流转。",
+    )
+
+    external_grade: str = Field(
+        default="D",
+        description="对从业者展示的外部等级，例如 A/B/C/D。",
+    )
+
+    trigger_module: str = Field(
+        default="unknown",
+        description="当前最适合的销售切入模块，例如 cashflow_pressure、family_responsibility。",
+    )
+
+    current_stage: str = Field(
+        default="collect_kyc",
+        description="当前沟通阶段，例如 collect_kyc、deep_conversation、cultivate、low_pressure_end。",
+    )
+
+    objective_material_need: str = Field(
+        default="",
+        description="本轮策略生成是否需要外部客观素材，例如热点新闻、利率变化或行业公开信息。",
+    )
+
+    support_note: str = Field(
+        default="",
+        description="面向从业者的鼓励摘要，用来降低新手焦虑，不作为客户事实写入长期画像。",
+    )
+
+    kyc_question_round_count: int = Field(
+        default=0,
+        ge=0,
+        description="KYC 补问轮次。统一最多 4 轮，第 5 轮后禁止继续停在 insufficient。",
+    )
+
+    asked_focuses: list[str] = Field(
+        default_factory=list,
+        description="已经问过的 KYC 焦点。生产应来自 KYCQuestion 表或 store，而不是字符串拼接。",
+    )
+
     slot_values: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -413,12 +550,58 @@ class AgentState(BaseModel):
         ),
     )
 
+    memory_recall_decision: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "长期记忆按需召回决策。记录本轮是否需要召回 preference、客户画像、"
+            "从业者画像或 case 记忆，以及触发或跳过的原因。"
+        ),
+    )
+
+    memory_recall_results: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "经过 hybrid search 和 rerank 后进入上下文候选的长期记忆摘要。"
+            "它只保存 TopK 结果，不保存完整长期记忆库。"
+        ),
+    )
+
     sales_insight_digest: dict[str, Any] | None = Field(
         default=None,
         description=(
             "销售实战智能层压缩后的摘要。"
             "不应直接把原始采访长文塞给生成模型，而应先压缩成适用场景、经验摘要、"
             "可用话术、禁用表达、下一步建议和来源。"
+        ),
+    )
+
+    compact_context: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "KYC 策略生成节点优先使用的紧凑上下文。"
+            "它合并 confirmed/uncertain 客户事实、从业者事实、case 状态、已问焦点、"
+            "缺失字段、已审核销售模式和新闻摘要，并过滤 PII 与原始对话全文。"
+        ),
+    )
+
+    memory_write_proposal: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "本轮业务记忆写入提案。它只描述准备写入的事实、事件、问题、快照和分析运行，"
+            "真正落库前必须经过 validate_memory_writes。"
+        ),
+    )
+
+    memory_write_validation: dict[str, Any] = Field(
+        default_factory=dict,
+        description="本轮记忆写入提案的校验结果，记录允许写入和被阻断的事实 ID。",
+    )
+
+    retrieved_dialogue_patterns: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "检索到的销售对话模式摘要。只能包含 approved_for_generation=True 且非 high 风险的模式，"
+            "不得包含原始 CorpusMessage 全文。"
         ),
     )
 
@@ -494,8 +677,8 @@ class AgentState(BaseModel):
     assembled_prompt: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "最终发送给模型或本地 deterministic generator 的 prompt 结构。"
-            "本地实现不调用真实 LLM，但仍保留 system、context、user 等边界。"
+            "最终发送给配置化模型的 prompt 结构。"
+            "其中必须保留 system、context、user、source boundary 等边界，便于审计和 replay。"
         ),
     )
 

@@ -15,6 +15,5 @@ general_capabilities:
     - news_search
     - translation
     - summarizer
-  default_mode: safe_mock
+  default_mode: provider_required
   network_tools_require_provider: true
-

@@ -16,9 +16,9 @@ class RetrievalQuery(BaseModel):
     # text 是真正送入检索器的 query，可以来自用户原文，也可以来自 query rewrite。
     text: str = Field(..., description="实际用于检索的 query 文本，可能是用户原文，也可能是 query rewrite 结果。")
     # purpose 说明这条 query 的生成目的，便于多 query 召回后分析哪类 query 起作用。
-    purpose: Literal["original", "sales_pain", "customer_type", "scene", "strategy"] = Field(
+    purpose: Literal["original", "sales_pain", "customer_type", "scene", "strategy", "memory", "profile"] = Field(
         default="original",
-        description="该 query 的检索目的，用于区分原始问题、销售痛点、客户类型、场景或策略检索。",
+        description="该 query 的检索目的，用于区分原始问题、销售痛点、客户类型、场景、策略、记忆或画像检索。",
     )
     # weight 控制这条 query 在融合排序中的影响力。
     weight: float = Field(

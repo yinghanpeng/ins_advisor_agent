@@ -142,7 +142,7 @@ def run_one_message(engine: WorkflowEngine, message: str, index: int | None = No
 
 def run_demo(messages: Iterable[str] = DEMO_MESSAGES) -> None:
     """运行默认 demo，让用户不用任何参数也能看到项目如何工作。"""
-    # 提示当前是本地 deterministic 演示，不会调用真实 LLM 或外部网络。
+    # 提示当前是规则演示入口；生产运行需要配置真实模型、数据库和外部工具 provider。
     print("保险顾问生产级 Agent Framework 本地演示")
     print("当前演示不调用外部模型、不联网，适合先理解项目流转。")
     # 创建一个 WorkflowEngine，所有示例共享同一个 MemoryManager。

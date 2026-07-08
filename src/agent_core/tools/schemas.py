@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 
 RiskLevel = Literal["low", "medium", "high"]
 PermissionLevel = Literal["public", "tenant", "privileged", "admin"]
+SideEffectLevel = Literal["none", "read_only", "write", "external_action", "financial"]
+AuditLevel = Literal["none", "basic", "full"]
 
 
 class ToolPermissionSpec(BaseModel):
@@ -44,6 +46,8 @@ class ToolSpec(BaseModel):
 
     # name 是工具稳定 ID；ToolRouter、ToolExecutor、trace 和 eval 都靠它串联。
     name: str = Field(..., description="工具稳定名称。路由、权限校验、trace 和 eval 都通过该名称引用工具。")
+    # version 用于工具 schema 演进；同名工具升级参数或输出结构时必须更新版本。
+    version: str = Field(default="1.0.0", description="工具版本。用于审计、灰度和工具 schema 兼容判断。")
     # description 给路由器和人类读者说明工具适用场景。
     description: str = Field(..., description="工具业务用途说明，帮助路由器判断何时允许调用该工具。")
     # input_schema 约束工具入参，生产执行前应按该 JSON Schema 校验。
@@ -71,6 +75,11 @@ class ToolSpec(BaseModel):
         default=False,
         description="工具是否会产生外部副作用，例如发消息、写数据库、扣费或提交表单。",
     )
+    # side_effect_level 比 bool 更细，便于区分只读、写入、外部动作和金融动作。
+    side_effect_level: SideEffectLevel = Field(
+        default="read_only",
+        description="工具副作用等级。none/read_only 可自动执行；write/external_action/financial 通常需要审批。",
+    )
     # requires_approval 是工具级人审开关，适合所有高风险写操作。
     requires_approval: bool = Field(
         default=False,
@@ -85,6 +94,28 @@ class ToolSpec(BaseModel):
     timeout_seconds: int = Field(
         default=10,
         description="工具单次调用的超时时间，单位秒。用于防止 workflow 被外部调用阻塞。",
+    )
+    # timeout_ms 是生产配置主字段；timeout_seconds 保留兼容旧配置。
+    timeout_ms: int = Field(
+        default=10000,
+        description="工具单次调用超时时间，单位毫秒。生产执行器优先使用该字段。",
+    )
+    # retry_policy 描述最大重试次数和退避策略，避免所有工具共用同一个重试行为。
+    retry_policy: dict[str, Any] = Field(
+        default_factory=lambda: {"max_attempts": 1, "backoff_ms": 200},
+        description="工具重试策略，例如 max_attempts、backoff_ms。非幂等工具应只允许 1 次尝试。",
+    )
+    # rate_limit 为后续 Redis 限流预留，防止单租户或单用户打爆外部工具。
+    rate_limit: dict[str, Any] = Field(
+        default_factory=dict,
+        description="工具限流配置，例如每分钟最大调用数、租户维度或用户维度限制。",
+    )
+    # owner 记录工具负责人，生产告警或审计时可以快速定位责任团队。
+    owner: str = Field(default="agent_platform", description="工具负责人或团队，用于审计、告警和问题追踪。")
+    # audit_level 决定工具调用和结果记录的详细程度。
+    audit_level: AuditLevel = Field(
+        default="basic",
+        description="工具审计级别。full 表示需要记录更完整的参数摘要、结果摘要和审批链路。",
     )
     # idempotency_required 用于写操作，要求调用方提供幂等键防止重复提交。
     idempotency_required: bool = Field(

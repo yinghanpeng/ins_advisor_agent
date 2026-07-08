@@ -1,0 +1,6 @@
+memory:
+  enabled: true
+  model_decision_enabled: true
+  decision_timeout_ms: 1200
+  default_ttl_days:
+  max_recall_items: 8

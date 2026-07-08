@@ -9,6 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from agent_core.utils.ids import new_id
 from agent_core.utils.time import utc_now_iso
 
 
@@ -25,6 +26,19 @@ BusinessStage = Literal[
 
 # 销售洞察卡片的风险等级；high 内容默认不能直接进入最终生成。
 RiskLevel = Literal["low", "medium", "high"]
+
+# 销售对话模式类型；真实语料必须先抽成这些模式，不能直接作为普通 RAG chunk 进入生成。
+PatternType = Literal[
+    "opening",
+    "kyc_question",
+    "objection_handling",
+    "transition",
+    "close_next_step",
+    "low_pressure_nurture",
+    "risk_reframing",
+    "product_bridge",
+    "next_best_action",
+]
 
 
 class CustomerKYC(BaseModel):
@@ -232,43 +246,80 @@ class SalesInsightDigest(BaseModel):
     )
 
 
-def sample_card() -> SalesInsightCard:
-    """返回一张已合规审批的示例销售洞察卡片，供本地检索、测试和演示使用。"""
-    # 示例卡片覆盖“企业主 + 两个孩子 + 银行理财偏好 + 破冰”的典型 demo 场景。
-    return SalesInsightCard(
-        # 来源和 chunk ID 用于测试 citation 和检索结果溯源。
-        source_id="sample_interview_001",
-        chunk_id="chunk_001",
-        # 受访者角色和年限说明这条经验来自资深顾问。
-        interviewee_role="资深保险顾问",
-        sales_experience_years=8,
-        # 渠道和阶段用于销售洞察检索的 metadata 匹配。
-        channel="高净值客户转介绍",
-        business_stage="new_customer",
-        # scene/customer_type/tags 会让破冰类请求更容易命中这张卡。
-        scene="饭局破冰",
-        customer_type="企业主",
-        # customer_kyc 刻意和 main.py 的第一条 demo 输入保持一致。
-        customer_kyc=CustomerKYC(
-            age="45岁左右",
-            family="两个孩子",
-            occupation="制造业企业主",
-            asset_preference="偏好银行理财",
-            decision_style="谨慎，重视现金流",
-        ),
-        # 以下字段构成最终回答的策略、话术、反例和下一步追问。
-        sales_pain_solved="不知道如何从闲聊自然切入长期资金规划",
-        root_cause="从业者过早讲产品，客户还没有建立资金分层意识",
-        effective_strategy="先围绕经营现金流和家庭责任共情，再用资金分层把话题转到长期稳定安排。",
-        usable_script="最近很多老板不是没有赚钱能力，而是更在意哪些钱不能被经营波动打乱。",
-        wrong_way="一上来讲保险收益、港保优势或资产隔离。",
-        why_it_works="低压共情能降低防御感，资金分层让客户先讨论用途而不是产品。",
-        next_question="这笔钱更偏企业备用，还是家庭长期不能动的钱？",
-        customer_response="客户愿意聊资金用途",
-        follow_up_action="准备一张资金分层图，约15分钟只聊资金用途。",
-        # tags 参与检索；risk/compliance/approved 控制这张卡是否可进入生成。
-        tags=["破冰", "企业主", "资金分层", "低压沟通"],
-        risk_level="low",
-        compliance_notes="不得承诺收益；不得使用避债避税表达。",
-        approved_for_generation=True,
+class CorpusBatch(BaseModel):
+    """一次销售语料导入批次。"""
+
+    id: str = Field(default_factory=lambda: new_id("corpus_batch"), description="语料批次唯一 ID。")
+    tenant_id: str = Field(..., description="语料批次所属租户 ID。")
+    batch_name: str = Field(..., description="批次名称，例如 2026Q2 高客访谈导入。")
+    source_type: str = Field(..., description="语料来源类型，例如 interview、wechat_export、call_transcript。")
+    upload_by: str = Field(default="", description="上传人或导入任务 ID。")
+    raw_file_uri: str = Field(default="", description="原始文件 URI，只用于归档和审计，不进入生成 Prompt。")
+    total_conversations: int = Field(default=0, ge=0, description="该批次包含的对话数量。")
+    pii_status: Literal["raw", "redacted", "reviewed"] = Field(
+        default="raw",
+        description="PII 处理状态：原始、已脱敏或已人工复核。",
     )
+    created_at: str = Field(default_factory=utc_now_iso, description="语料批次创建时间。")
+
+
+class CorpusCase(BaseModel):
+    """一个从真实语料中整理出的销售案例资产。"""
+
+    id: str = Field(default_factory=lambda: new_id("corpus_case"), description="语料 case 唯一 ID。")
+    tenant_id: str = Field(..., description="语料 case 所属租户 ID。")
+    batch_id: str = Field(..., description="语料 case 所属导入批次 ID。")
+    case_title: str = Field(..., description="case 标题，用于内部检索和人工复核。")
+    scene_type: str = Field(default="", description="沟通场景类型，例如 KYC 补问、异议处理、低压维护。")
+    target_persona: str = Field(default="unknown", description="该案例涉及的内部客群标签。")
+    trigger_module: str = Field(default="unknown", description="该案例主要体现的销售切入模块。")
+    advisor_stage: str = Field(default="unknown", description="案例中从业者阶段。")
+    customer_stage: str = Field(default="unknown", description="案例中客户所处阶段或反应阶段。")
+    relationship_strength: str = Field(default="", description="顾问与客户关系强度摘要。")
+    final_outcome: str = Field(default="", description="案例最终结果标签或摘要。")
+    quality_score: int = Field(default=0, ge=0, le=100, description="该案例作为训练/评测资产的质量分。")
+    raw_conversation_uri: str = Field(default="", description="原始对话归档 URI，不进入最终 Prompt。")
+    redacted_conversation_uri: str = Field(default="", description="脱敏对话归档 URI，可用于抽取和评测。")
+    created_at: str = Field(default_factory=utc_now_iso, description="语料 case 创建时间。")
+
+
+class CorpusMessage(BaseModel):
+    """脱敏后的语料消息，只能作为抽取和评测来源。"""
+
+    id: str = Field(default_factory=lambda: new_id("corpus_message"), description="语料消息唯一 ID。")
+    tenant_id: str = Field(..., description="语料消息所属租户 ID。")
+    corpus_case_id: str = Field(..., description="语料消息所属 case ID。")
+    seq_no: int = Field(..., ge=1, description="消息在语料 case 中的顺序号。")
+    speaker_role: Literal["advisor", "customer", "observer", "system"] = Field(..., description="消息说话方角色。")
+    content_redacted: str = Field(..., description="脱敏后的消息内容，仅用于抽取模式或构造 eval，不直接进入生成。")
+    message_type: str = Field(default="", description="消息类型，例如 question、answer、objection、closing。")
+    detected_intent: str = Field(default="", description="从该消息中识别出的意图。")
+    sentiment: str = Field(default="", description="该消息的情绪或态度标签。")
+    created_at: str = Field(default_factory=utc_now_iso, description="语料消息创建时间。")
+
+
+class DialoguePattern(BaseModel):
+    """从真实对话中抽取、脱敏、审查后的销售动作模式。"""
+
+    id: str = Field(default_factory=lambda: new_id("dialogue_pattern"), description="销售对话模式唯一 ID。")
+    tenant_id: str = Field(..., description="模式所属租户 ID。")
+    pattern_type: PatternType = Field(..., description="模式类型，例如 opening、kyc_question、objection_handling。")
+    scene_type: str = Field(default="", description="模式适用的沟通场景。")
+    target_persona: str = Field(default="unknown", description="模式适用的内部客群标签。")
+    trigger_module: str = Field(default="unknown", description="模式适用的销售切入模块。")
+    advisor_stage: str = Field(default="unknown", description="模式适合的从业者阶段。")
+    situation_summary: str = Field(..., description="抽象后的情境摘要，不包含真实客户身份或完整故事。")
+    customer_signal: str = Field(default="", description="客户在该场景下表现出的典型信号。")
+    recommended_move: str = Field(..., description="建议的销售动作，必须是可迁移模式而非单个客户事实。")
+    bad_move: str = Field(default="", description="该场景下不建议采取的动作。")
+    example_wording: str = Field(default="", description="可参考的话术样本，必须已脱敏并通过合规审查。")
+    outcome_label: str = Field(default="", description="该模式对应的结果标签，例如 replied、meeting_booked。")
+    confidence: float = Field(default=0.8, ge=0, le=1, description="模式抽取或人工确认的置信度。")
+    source_corpus_case_ids: list[str] = Field(default_factory=list, description="该模式来源的语料 case ID 列表。")
+    approved_for_generation: bool = Field(
+        default=False,
+        description="该模式是否已允许进入最终生成。默认 False，避免未审真实语料被直接引用。",
+    )
+    risk_level: RiskLevel = Field(default="medium", description="模式风险等级；high 默认不能进入最终生成。")
+    compliance_notes: str = Field(default="", description="模式审查备注，例如禁止承诺收益或杜绝避税避债表达。")
+    created_at: str = Field(default_factory=utc_now_iso, description="模式创建时间。")

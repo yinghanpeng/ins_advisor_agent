@@ -28,7 +28,7 @@ class InsuranceAdvisorWorkflow:
         cards = self.retriever.retrieve(user_input)
         # 将卡片转换成 dict 后交给 ContextBuilder 生成可用于回答的摘要。
         digest = self.context_builder.build_sales_digest([card.model_dump() for card in cards])
-        # 本地 deterministic answer 用低压破冰方式示范，不直接推产品或承诺收益。
+        # 低压模板输出不直接推产品或承诺收益；真实生成应走主 Agent 的模型节点。
         answer = (
             "当前适合先做破冰和资金用途确认。"
             "可以先从客户的经营/家庭责任聊起，再轻轻问："

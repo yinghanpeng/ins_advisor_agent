@@ -1,0 +1,5 @@
+database:
+  database_url: ${DATABASE_URL}
+  redis_url: ${REDIS_URL}
+  pool_size: 5
+  echo_sql: false

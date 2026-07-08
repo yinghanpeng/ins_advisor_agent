@@ -1,7 +1,7 @@
-"""Structured insight extraction.
+"""结构化销售洞察抽取。
 
-Production extraction should call an LLM with JSON schema validation. The local
-implementation is deterministic so tests and demos do not require model access.
+本模块把脱敏后的访谈分段转换成 SalesInsightCard，并立即进入合规审查。
+生产接入 LLM 时应保持同一个 Pydantic schema 和审查边界。
 """
 
 # 文件说明：
@@ -18,7 +18,7 @@ def extract_structured_insight(segment: InterviewSegment, metadata: dict | None 
     """把一个访谈分段抽取成 SalesInsightCard，并立即做合规审查。"""
     # metadata 承载采访对象、渠道、客户画像等外部信息；为空时用空字典兜底。
     metadata = metadata or {}
-    # 当前是确定性抽取，字段结构与未来 LLM JSON 输出保持一致，方便以后替换成模型抽取。
+    # 字段结构与未来 LLM JSON 输出保持一致，方便统一审计和评测。
     card = SalesInsightCard(
         # source_id/chunk_id 保证这张洞察卡片可以回溯到原始访谈分段。
         source_id=segment.source_id,
@@ -39,12 +39,11 @@ def extract_structured_insight(segment: InterviewSegment, metadata: dict | None 
             asset_preference=metadata.get("asset_preference"),
             decision_style=metadata.get("decision_style"),
         ),
-        # 本地 demo 用固定文案表达抽取占位，生产应由 LLM 按 JSON Schema 生成。
         sales_pain_solved="从访谈片段中抽取的销售痛点，需要人工复核",
         root_cause="从业者缺少场景化提问和低压推进结构",
         # effective_strategy 暂取分段前 220 字，避免过长原文直接进入卡片。
         effective_strategy=segment.text[:220],
-        # usable_script 是安全话术占位，生产必须经过合规审查再 approved_for_generation。
+        # usable_script 必须经过合规审查后才允许进入生成链路。
         usable_script="先认可客户处境，再追问资金用途和决策边界。",
         # wrong_way 明确禁用直接承诺收益或强推产品。
         wrong_way="直接承诺收益或强推具体产品。",

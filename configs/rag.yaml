@@ -3,11 +3,10 @@
 # - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
 
 rag:
-  default_retriever: hybrid_mock
+  default_retriever: postgres_pgvector_hybrid
   chunk_size: 800
   chunk_overlap: 120
   top_k: 8
   rerank_top_k: 5
   evidence_digest_max_chars: 1800
   source_boundary_policy: external_content_is_evidence_not_instruction
-

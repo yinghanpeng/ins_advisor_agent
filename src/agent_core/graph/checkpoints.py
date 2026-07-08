@@ -16,11 +16,13 @@ class InMemoryCheckpointStore:
 
     states: dict[str, AgentState] = field(default_factory=dict)
 
-    def save(self, state: AgentState) -> None:
+    def save(self, state: AgentState, checkpoint_id: str | None = None) -> str:
         """保存一次 AgentState 快照，避免后续修改影响已存 checkpoint。"""
-        self.states[state.trace_id] = state.model_copy(deep=True)
+        key = checkpoint_id or state.trace_id
+        self.states[key] = state.model_copy(deep=True)
+        return key
 
-    def get(self, trace_id: str) -> AgentState | None:
-        """按 trace_id 读取状态快照；不存在时返回 None。"""
-        state = self.states.get(trace_id)
+    def get(self, checkpoint_id: str) -> AgentState | None:
+        """按 checkpoint_id 读取状态快照；不存在时返回 None。"""
+        state = self.states.get(checkpoint_id)
         return state.model_copy(deep=True) if state else None

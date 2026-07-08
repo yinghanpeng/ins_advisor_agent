@@ -1,0 +1,8 @@
+retrieval:
+  top_k: 8
+  score_threshold: 0.05
+  vector_weight: 0.45
+  lexical_weight: 0.25
+  metadata_weight: 0.15
+  recency_weight: 0.10
+  confidence_weight: 0.05

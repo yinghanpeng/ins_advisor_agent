@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from collections.abc import Callable
 from typing import Any
 
@@ -24,7 +25,11 @@ from agent_core.capabilities import (
     web_page_reader,
     web_search,
 )
-from agent_core.tools.schemas import ToolCall, ToolResult
+from agent_core.guardrails.tool_guardrails import ToolGuardrail
+from agent_core.tools.registry import ToolRegistry
+from agent_core.tools.sanitizer import sanitize_tool_output
+from agent_core.tools.schemas import ToolCall, ToolResult, ToolSpec
+from agent_core.tools.verifier import ToolResultVerifier
 
 
 # 工具执行白名单：ToolCall.name 只能映射到这里列出的本地 capability adapter。
@@ -55,7 +60,10 @@ CAPABILITY_RUNNERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 }
 
 
-def execute_tool_call(call: ToolCall) -> ToolResult:
+DEFAULT_TOOL_REGISTRY = ToolRegistry.with_defaults()
+
+
+def execute_tool_call(call: ToolCall, spec: ToolSpec | None = None) -> ToolResult:
     """执行一个白名单工具调用，并返回结构化 ToolResult。
 
     设计约束：
@@ -63,11 +71,32 @@ def execute_tool_call(call: ToolCall) -> ToolResult:
     2. 所有工具都必须先注册到 CAPABILITY_RUNNERS；
     3. 异常被包装为 ToolResult(status="error")，交给 recovery/verification 节点处理。
     """
-    # 记录工具开始时间，用于返回 latency_ms，方便观测工具耗时。
     started_at = time.perf_counter()
-    # 只从白名单里取 runner；如果工具名不在白名单，就不会执行任何动态代码。
+    spec = spec or DEFAULT_TOOL_REGISTRY.get(call.name)
+    if spec is None:
+        return ToolResult(
+            name=call.name,
+            status="error",
+            error=f"tool spec not registered: {call.name}",
+            latency_ms=0,
+        )
+    guardrail_result = ToolGuardrail().review(spec)
+    if guardrail_result.get("triggered"):
+        return ToolResult(
+            name=call.name,
+            status="blocked",
+            error=guardrail_result.get("reason", "tool permission denied"),
+            latency_ms=0,
+        )
+    if spec.side_effect_level in {"write", "external_action", "financial"} or spec.requires_approval:
+        return ToolResult(
+            name=call.name,
+            status="blocked",
+            error="tool requires human approval before execution",
+            latency_ms=0,
+        )
+
     runner = CAPABILITY_RUNNERS.get(call.name)
-    # 找不到 runner 说明工具规划产生了未注册工具，直接返回结构化 error。
     if runner is None:
         return ToolResult(
             name=call.name,
@@ -75,22 +104,53 @@ def execute_tool_call(call: ToolCall) -> ToolResult:
             error=f"tool runner not registered: {call.name}",
             latency_ms=0,
         )
-    # 工具内部可能失败，所以统一包在 try/except 中，避免异常炸穿整个 Agent 主链路。
-    try:
-        # capability adapter 只接收 arguments 字典，不接收完整 AgentState，降低越权读取状态的风险。
-        output = runner(call.arguments)
-        # 成功时返回标准 ToolResult，后续 verify/grounding/response_package 都消费这个结构。
-        return ToolResult(
-            name=call.name,
-            status="success",
-            output=output,
-            latency_ms=int((time.perf_counter() - started_at) * 1000),
-        )
-    # 任意工具异常都降级为 ToolResult(status="error")，由 verify_tool_result 决定恢复策略。
-    except Exception as exc:
-        return ToolResult(
-            name=call.name,
-            status="error",
-            error=str(exc),
-            latency_ms=int((time.perf_counter() - started_at) * 1000),
-        )
+
+    max_attempts = int(spec.retry_policy.get("max_attempts", 1))
+    max_attempts = max(1, max_attempts if spec.retryable else 1)
+    backoff_ms = int(spec.retry_policy.get("backoff_ms", 200))
+    last_error: str | None = None
+    verifier = ToolResultVerifier()
+
+    for attempt in range(max_attempts):
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(runner, call.arguments)
+                raw_output = future.result(timeout=spec.timeout_ms / 1000)
+            if not isinstance(raw_output, dict):
+                raw_output = {"value": raw_output}
+            sanitized = sanitize_tool_output(call.name, raw_output)
+            verification = verifier.verify(spec, sanitized.output)
+            if not verification.ok:
+                return ToolResult(
+                    name=call.name,
+                    status="error",
+                    output={"safety_flags": sanitized.safety_flags},
+                    error="; ".join(verification.errors),
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    retry_count=attempt,
+                )
+            return ToolResult(
+                name=call.name,
+                status="success",
+                output={
+                    **sanitized.output,
+                    "_safety_flags": sanitized.safety_flags,
+                    "_removed_fragments": sanitized.removed_fragments,
+                },
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                retry_count=attempt,
+            )
+        except TimeoutError:
+            last_error = f"tool timeout after {spec.timeout_ms}ms"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < max_attempts - 1:
+            time.sleep(backoff_ms / 1000)
+
+    return ToolResult(
+        name=call.name,
+        status="error",
+        error=last_error or "tool execution failed",
+        latency_ms=int((time.perf_counter() - started_at) * 1000),
+        retry_count=max_attempts - 1,
+    )

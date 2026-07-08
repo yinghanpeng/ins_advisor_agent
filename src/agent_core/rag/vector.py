@@ -1,7 +1,7 @@
-"""Deterministic local vector retriever adapter.
+"""词元重叠向量近似工具。
 
-This is not a production embedding model. It provides a stable local interface
-for hybrid search tests and can be replaced by a real vector database adapter.
+生产在线召回应使用 `agent_core.rag.production.ProductionRagRetriever` 和 pgvector；
+这里保留给规则评测和轻量本地检索工具使用。
 """
 
 # 文件说明：
@@ -18,7 +18,7 @@ def _tokens(text: str) -> set[str]:
 
 
 def token_jaccard(query: str, document: str) -> float:
-    """Return a small deterministic semantic-ish score based on token overlap."""
+    """基于词元交集计算轻量相关性分数。"""
     left = _tokens(query)
     right = _tokens(document)
     if not left or not right:

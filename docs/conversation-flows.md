@@ -2,6 +2,8 @@
 
 本文档给出几条完整对话链路，帮助你把“用户说一句话”到“程序返回答案”的过程串起来。
 
+如果你想看完整状态机流程图，包括默认主链路、工具分支、领域 Skill 分支、长期记忆按需召回和 KYC 教练专用链路，请先看：[request-lifecycle-flowchart.md](request-lifecycle-flowchart.md)。
+
 ## 链路 1：保险顾问破冰问题
 
 用户输入：
@@ -185,4 +187,3 @@ ingest_raw_interview
 - 高风险话术不能 `approved_for_generation=true`；
 - 每张卡片保留 `source_id` 和 `chunk_id`，方便追溯来源；
 - 可从高频销售问题生成 eval case。
-

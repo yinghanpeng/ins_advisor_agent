@@ -6,6 +6,25 @@ import pytest
 from agent_core.evals.feedback import HumanFeedback
 from agent_core.graph.state import AgentNode, AgentState
 from agent_core.guardrails.human_approval import ApprovalDecision, ApprovalRequest
+from agent_core.memory.business_schemas import (
+    Advisor,
+    AdvisorProfileFact,
+    AgentSessionState,
+    AnalysisRun,
+    CaseOutcome,
+    Conversation,
+    ConversationMessage,
+    Customer,
+    CustomerProfileFact,
+    DifyKYCAnalysisOutput,
+    GeneratedOutput,
+    KYCQuestion,
+    MemoryEvent,
+    OpportunityCase,
+    Tenant,
+)
+from agent_core.memory.write_policy import MemoryWriteProposal, MemoryWriteValidationResult
+from agent_core.memory.recall import MemoryRecallDecision, MemoryRecallItem, MemoryRecallResult
 from agent_core.rag.schemas import (
     DocumentMetadata,
     MetadataFilter,
@@ -15,7 +34,15 @@ from agent_core.rag.schemas import (
 )
 from agent_core.recovery.fallback import RecoveryPlan
 from agent_core.sales_intelligence.ingestion import RawInterview
-from agent_core.sales_intelligence.schemas import CustomerKYC, SalesInsightCard, SalesInsightDigest
+from agent_core.sales_intelligence.schemas import (
+    CorpusBatch,
+    CorpusCase,
+    CorpusMessage,
+    CustomerKYC,
+    DialoguePattern,
+    SalesInsightCard,
+    SalesInsightDigest,
+)
 from agent_core.sales_intelligence.segmenter import InterviewSegment
 from agent_core.tools.schemas import ToolCall, ToolPermissionSpec, ToolResult, ToolSpec
 from agent_core.workflow.contracts import (
@@ -57,6 +84,31 @@ PYDANTIC_MODELS = [
     CustomerKYC,
     SalesInsightCard,
     SalesInsightDigest,
+    CorpusBatch,
+    CorpusCase,
+    CorpusMessage,
+    DialoguePattern,
+    # 业务记忆 schema 模型约束租户、顾问、客户、事实、case、会话、分析、输出和结果闭环。
+    Tenant,
+    Advisor,
+    Customer,
+    AdvisorProfileFact,
+    CustomerProfileFact,
+    OpportunityCase,
+    Conversation,
+    ConversationMessage,
+    AgentSessionState,
+    KYCQuestion,
+    DifyKYCAnalysisOutput,
+    AnalysisRun,
+    GeneratedOutput,
+    MemoryEvent,
+    CaseOutcome,
+    MemoryWriteProposal,
+    MemoryWriteValidationResult,
+    MemoryRecallDecision,
+    MemoryRecallItem,
+    MemoryRecallResult,
     # 访谈导入和分段模型约束销售语料资产化入口。
     RawInterview,
     InterviewSegment,
