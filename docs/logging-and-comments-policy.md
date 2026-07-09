@@ -53,5 +53,5 @@
 
 - 将 `StructuredLogger` 输出接入 JSON log 文件、OpenTelemetry 或云日志。
 - 给每个 tool adapter 增加 latency 和 error 统计。
-- 将 LangGraph callback 与 LangSmith run tree 对齐。
+- 将 `AgentGraph` 节点事件与 LangSmith run tree 对齐。
 

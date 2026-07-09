@@ -1,4 +1,4 @@
-"""LangGraph / LangChain callback 构建入口。"""
+"""LangSmith / LangChain callback 构建入口。"""
 
 # 文件说明：
 # - 本文件属于可观测性层，负责本地结构化日志、trace、metrics 或 LangSmith adapter。

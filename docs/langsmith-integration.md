@@ -19,7 +19,7 @@ LangSmith 是可观测性和评估增强层，不是主业务强依赖。
 
 ## 应记录的内容
 
-- 每个 LangGraph node 的输入摘要和输出摘要；
+- 每个 `AgentGraph` 节点的输入摘要和输出摘要；
 - 工具调用；
 - RAG query、chunk、score、rerank score；
 - Guardrail 结果；

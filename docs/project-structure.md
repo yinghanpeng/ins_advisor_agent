@@ -157,16 +157,17 @@ Dify 在本项目中不是生产流量主入口，而是 Prompt 管理、Workflo
 | `src/agent_core/api/server.py` | FastAPI app 创建入口；未安装 FastAPI 时 `app=None` 并在启动时给出明确错误。 |
 | `src/agent_core/api/middleware.py` | Gateway middleware 辅助函数，当前包含 trace id 注入逻辑。 |
 
-### graph：LangGraph 状态机层
+### graph：显式状态机层（线性执行器）
 
 | 文件 | 作用 |
 | --- | --- |
 | `src/agent_core/graph/__init__.py` | graph package 标识。 |
 | `src/agent_core/graph/state.py` | 定义 `AgentNode` 状态枚举和 `AgentState` 全局状态对象。 |
 | `src/agent_core/graph/nodes.py` | 状态机节点函数，包括意图识别、业务路由、Sales Intelligence 检索、上下文构建、生成、合规审查。 |
-| `src/agent_core/graph/edges.py` | 状态转移策略函数，描述路由后的下一状态。 |
-| `src/agent_core/graph/builder.py` | LangGraph 构建器；LangGraph 不可用时返回本地 `LocalGraph`。 |
+| `src/agent_core/graph/builder.py` | `AgentGraph` 线性执行器；`invoke()` 在公共前置后按 `workflow_name` 分叉到 `_run_universal` / `_run_kyc`。 |
+| `src/agent_core/graph/intent_classifier.py` | 意图分类：模型优先（`classify_intent_via_model`）+ 关键词规则兜底。 |
 | `src/agent_core/graph/checkpoints.py` | 内存 checkpoint store，用于本地开发和测试。 |
+| `src/agent_core/graph/edges.py` | 遗留的状态转移策略函数（旧显式状态图产物），当前线性执行器已内联分支，暂未引用。 |
 
 ### workflow：Workflow 执行层
 
@@ -271,7 +272,7 @@ Dify 在本项目中不是生产流量主入口，而是 Prompt 管理、Workflo
 | `src/agent_core/observability/trace.py` | 内存 trace recorder，用于本地调试和测试。 |
 | `src/agent_core/observability/metrics.py` | 简单 metrics counter。 |
 | `src/agent_core/observability/langsmith_client.py` | LangSmith adapter，支持环境变量开关和 graceful degradation。 |
-| `src/agent_core/observability/langsmith_callbacks.py` | LangSmith callback 构建占位，后续接 LangChain/LangGraph callback。 |
+| `src/agent_core/observability/langsmith_callbacks.py` | LangSmith callback 构建占位，后续接 LangChain callback。 |
 
 ### evals：评估模块
 
@@ -385,7 +386,7 @@ JSON 文件说明位置：
 ```text
 AgentRunRequest
 → WorkflowEngine
-→ LangGraph / LocalGraph
+→ AgentGraph.invoke → _run_universal
 → CLASSIFY_INTENT
 → ROUTE_CAPABILITY
 → DOMAIN_WORKFLOW_ROUTING

@@ -2,12 +2,12 @@
 
 本文档整理“一个请求进入 Agent 后，程序内部完整怎么流转”。
 
-当前项目存在两条执行入口：
+当前所有请求都从同一个入口进入：`WorkflowEngine.run()` → `AgentGraph.invoke()`（见 `src/agent_core/graph/builder.py`）。`AgentGraph` 采用线性顺序写法，在 `initialize_context` + `input_guardrail` 之后按 `workflow_name` 分叉成两条内部链路：
 
-1. 默认通用 Agent 主链路：`workflow_name != insurance_kyc_coach_workflow`；
-2. 保险 KYC 教练专用链路：`workflow_name == insurance_kyc_coach_workflow`。
+1. 默认通用 Agent 主链路（`_run_universal`）：`workflow_name != insurance_kyc_coach_workflow`；
+2. 保险 KYC 教练专用链路（`_run_kyc`）：`workflow_name == insurance_kyc_coach_workflow`。
 
-两条链路共享 `WorkflowEngine.run()`、`AgentState`、结构化日志、状态迁移和最终 `AgentRunResponse`。
+两条链路共享 `WorkflowEngine.run()`、`AgentGraph`、`AgentState`、结构化日志、状态迁移和最终 `AgentRunResponse`。
 
 ## 0. 竖向主链路总览
 
@@ -29,15 +29,21 @@ WorkflowEngine.run()
   - 写入 input_text / workflow_name / domain_skill / metadata
   - 记录 agent_run_started 日志
   ↓
-Workflow 选择
+AgentGraph.invoke()
+  - initialize_context（初始化 trace/预算/消息）
+  - input_guardrail（输入安全检查，命中即安全终止返回 ERROR）
+  ↓
+按 workflow_name 分叉
   ├── workflow_name != insurance_kyc_coach_workflow
   │     ↓
-  │   默认通用 Agent 主链路
+  │   _run_universal：默认通用 Agent 主链路
   │
   └── workflow_name == insurance_kyc_coach_workflow
         ↓
-      保险 KYC 教练专用链路
+      _run_kyc：保险 KYC 教练专用链路
 ```
+
+> 说明：`initialize_context` 和 `input_guardrail` 是两条链路的公共前置步骤，只执行一次；下面 0.1 / 0.2 为便于逐步阅读仍各自从这两步写起。
 
 ### 0.1 默认通用 Agent 主链路
 
@@ -314,19 +320,17 @@ WorkflowEngine.run 收尾
   ↓
 AgentRunRequest(workflow_name="insurance_kyc_coach_workflow")
   ↓
-WorkflowEngine.run()
+WorkflowEngine.run() → AgentGraph.invoke()
   ↓
-_run_insurance_kyc_coach()
-  ↓
-1. Agent Context 初始化
+1. Agent Context 初始化（公共前置）
    - initialize_context
   ↓
-2. 输入安全检查
+2. 输入安全检查（公共前置）
    - input_guardrail
   ↓
 是否被阻断？
   ├── 是 → ERROR → 返回
-  └── 否
+  └── 否（进入 AgentGraph._run_kyc）
         ↓
 3. 业务记忆读取 / 工作流状态恢复
    - load_business_memory
@@ -366,45 +370,46 @@ _run_insurance_kyc_coach()
    - 写入 AnalysisRun
    - 更新 OpportunityCase
   ↓
-8. Build Compact Context
-   - build_compact_context_node
-   - confirmed / uncertain 分区
-   - 过滤 PII
-   - 合并 case_state
-   - 合并 missing_fields / asked_focuses / support_note
-  ↓
-9. Status Router
+8. Status Router
    - status_router
+   - 按 information_status 决定进入哪条分支
   ↓
 information_status 路由
   ├── insufficient 且轮次 < 4
   │     ↓
-  │   10A. Generate KYC Questions
+  │   9A. Generate KYC Questions
   │       - generate_kyc_questions
   │       - 只问一个未问过的 focus
   │       - 生成 answer
   │
   ├── matched
   │     ↓
-  │   10B. Retrieve Dialogue Patterns
+  │   9B. Retrieve Dialogue Patterns
   │       - retrieve_dialogue_patterns_node
   │       - 只返回 approved_for_generation=true
   │       - 过滤 high risk
   │       - 不返回原始 CorpusMessage
   │     ↓
-  │   11B. Retrieve External Context If Needed
+  │   10B. Retrieve External Context If Needed
   │       - retrieve_external_context_if_needed_node
   │       - 本地不联网，不编造新闻
   │       - 预留 news_digest
   │     ↓
-  │   12B. Rebuild Compact Context
-  │       - 把 retrieved_dialogue_patterns / news_digest 合并进去
+  │   11B. Build Compact Context
+  │       - build_compact_context_node
+  │       - confirmed / uncertain 分区、过滤 PII
+  │       - 合并 case_state / missing_fields / asked_focuses
+  │       - 合并 retrieved_dialogue_patterns / news_digest
+  │       - 注意：compact_context 只在生成策略前构建一次，不重复构建
   │     ↓
-  │   13B. Generate Strategy
+  │   12B. Generate Strategy
   │       - generate_strategy_node
   │       - 基于 compact_context 生成策略
   │
   └── unmatched / 其他
+        ↓
+      9C. Build Compact Context
+      - build_compact_context_node
         ↓
       10C. Generate Low-pressure Strategy
       - generate_strategy_node
@@ -444,16 +449,13 @@ flowchart TD
     B --> C["WorkflowEngine.run(request)"]
     C --> D["创建 AgentState<br/>trace_id/session_id/user_id/tenant_id/input_text/workflow_name/domain_skill/metadata"]
     D --> E["StructuredLogger.event('agent_run_started')"]
-    E --> F{"workflow_name ==<br/>insurance_kyc_coach_workflow ?"}
-    F -- "否：默认主链路" --> G["self.graph.invoke(state)<br/>LangGraph 可用时走 StateGraph<br/>否则走 LocalGraph"]
-    F -- "是：KYC 专用链路" --> H["_run_insurance_kyc_coach(state)"]
-    G --> I["得到 AgentState result"]
+    E --> AG["AgentGraph.invoke(state)<br/>initialize_context + input_guardrail 公共前置"]
+    AG --> F{"workflow_name ==<br/>insurance_kyc_coach_workflow ?"}
+    F -- "否：默认主链路" --> G["_run_universal(state)"]
+    F -- "是：KYC 专用链路" --> H["_run_kyc(state)"]
+    G --> I["返回 AgentState result"]
     H --> I
-    I --> J{"result 是 dict ?"}
-    J -- "是" --> K["AgentState(**result)<br/>兼容 LangGraph 返回 dict"]
-    J -- "否" --> L["保持 AgentState"]
-    K --> M["写 state_transitions 到结构化日志"]
-    L --> M
+    I --> M["写 state_transitions 到结构化日志"]
     M --> N["写 trace_events 到结构化日志<br/>event 字段转成 trace_event_name"]
     N --> O["StructuredLogger.event('agent_run_finished')"]
     O --> P["封装 AgentRunResponse<br/>answer/intent/domain_skill/guardrails/retrieved_context/trace_events/state_transitions/tool_calls/tool_results/query_understanding/context_needs/response_package/grounding_result/cost"]
@@ -462,11 +464,11 @@ flowchart TD
 
 ## 2. 默认通用 Agent 主链路
 
-这条链路由 `src/agent_core/graph/builder.py` 编排。LangGraph 不可用时，`LocalGraph.invoke()` 按同样顺序执行。
+这条链路由 `src/agent_core/graph/builder.py` 的 `AgentGraph._run_universal()` 按线性顺序编排。
 
 ```mermaid
 flowchart TD
-    A["LocalGraph.invoke(state)<br/>或 LangGraph StateGraph"] --> B["1 initialize_context<br/>初始化 trace、预算、用户消息"]
+    A["AgentGraph._run_universal(state)"] --> B["1 initialize_context<br/>初始化 trace、预算、用户消息"]
     B --> C["2 input_guardrail<br/>输入安全检查"]
     C --> D{"是否被输入风控阻断 ?"}
     D -- "是" --> E["ERROR<br/>写 answer='已按安全策略阻断'<br/>停止读取记忆/检索/工具"]
@@ -629,30 +631,29 @@ flowchart TD
 
 ## 7. 保险 KYC 教练专用链路
 
-当请求显式传入 `workflow_name="insurance_kyc_coach_workflow"`，`WorkflowEngine` 不走默认图，而是执行 `_run_insurance_kyc_coach()`。
+当请求显式传入 `workflow_name="insurance_kyc_coach_workflow"`，`AgentGraph.invoke()` 在公共前置（`initialize_context` + `input_guardrail`）之后分叉进入 `AgentGraph._run_kyc()`。
 
 ```mermaid
 flowchart TD
-    A["WorkflowEngine._run_insurance_kyc_coach"] --> B["设置 workflow_name=insurance_kyc_coach_workflow<br/>domain_skill=insurance_advisor<br/>workflow_version=local-kyc-v1"]
-    B --> C["1 initialize_context"]
-    C --> D["2 input_guardrail"]
+    A["AgentGraph.invoke<br/>workflow_name=insurance_kyc_coach_workflow"] --> B["1 initialize_context（公共前置）<br/>KYC 默认字段：domain_skill=insurance_advisor / workflow_version"]
+    B --> D["2 input_guardrail（公共前置）"]
     D --> E{"输入风控是否终止 ?"}
     E -- "是" --> F["返回 ERROR"]
-    E -- "否" --> G["3 load_business_memory<br/>读取 active case / KYCQuestion / latest session<br/>按需召回业务长期记忆"]
+    E -- "否" --> G["_run_kyc: 3 load_business_memory<br/>读取 active case / KYCQuestion / latest session<br/>按需召回业务长期记忆"]
     G --> H["4 analyze_kyc_and_route<br/>产出 Dify KYC 18 字段"]
     H --> I["5 propose_memory_writes<br/>生成 MemoryWriteProposal"]
     I --> J["6 validate_memory_writes<br/>证据/PII/生成建议误写校验"]
     J --> K["7 persist_memory_snapshot<br/>写事实/事件/问题/session/analysis/case"]
-    K --> L["8 build_compact_context_node<br/>confirmed/uncertain/advisor/case/missing/asked/patterns/news"]
-    L --> M["9 status_router"]
+    K --> M["8 status_router<br/>按 information_status 分叉"]
     M --> N{"information_status == insufficient<br/>且 kyc_question_round_count < 4 ?"}
-    N -- "是" --> O["10A generate_kyc_questions<br/>只问一个未问过的 focus"]
+    N -- "是" --> O["9A generate_kyc_questions<br/>只问一个未问过的 focus"]
     N -- "否" --> P{"是否进入 matched 策略路径 ?"}
-    P -- "matched" --> Q["10B retrieve_dialogue_patterns_node<br/>只保留 approved 且非 high risk DialoguePattern"]
-    Q --> R["11B retrieve_external_context_if_needed_node<br/>本地不联网，保留 news_digest 接口"]
-    R --> S["12B build_compact_context_node<br/>把模式和新闻摘要重新合并"]
-    S --> T["13B generate_strategy_node<br/>基于 compact_context 生成策略"]
-    P -- "unmatched/其他" --> U["10C generate_strategy_node<br/>低压维护或保守策略"]
+    P -- "matched" --> Q["9B retrieve_dialogue_patterns_node<br/>只保留 approved 且非 high risk DialoguePattern"]
+    Q --> R["10B retrieve_external_context_if_needed_node<br/>本地不联网，保留 news_digest 接口"]
+    R --> S["11B build_compact_context_node<br/>合并 confirmed/uncertain/case/模式/新闻（仅构建一次）"]
+    S --> T["12B generate_strategy_node<br/>基于 compact_context 生成策略"]
+    P -- "unmatched/其他" --> U1["9C build_compact_context_node"]
+    U1 --> U["10C generate_strategy_node<br/>低压维护或保守策略"]
     O --> V["14 compliance_review"]
     T --> V
     U --> V
@@ -675,13 +676,12 @@ flowchart TD
 | 5 | `propose_memory_writes` | `MEMORY_WRITE_PROPOSAL` | 提出事实、事件、问题、session、analysis 写入计划。 | `memory_write_proposal` |
 | 6 | `validate_memory_writes` | `VALIDATE_MEMORY_WRITE` | 拦截无证据事实、PII、生成建议误写。 | `memory_write_validation`、`errors` |
 | 7 | `persist_memory_snapshot` | `PERSIST_MEMORY_SNAPSHOT` | 将通过校验的业务记忆写入 store。 | `BusinessMemoryStore`、`trace_events` |
-| 8 | `build_compact_context_node` | `BUILD_COMPACT_CONTEXT` | 构建策略生成唯一优先上下文。 | `compact_context` |
-| 9 | `status_router` | `STATUS_ROUTER` | 按 `information_status` 路由补问、策略或低压维护。 | `current_state` |
-| 10A | `generate_kyc_questions` | `GENERATE_KYC_QUESTIONS` | 根据缺失字段和已问焦点生成一条补问。 | `answer`、`asked_focuses`、`kyc_question_round_count` |
-| 10B | `retrieve_dialogue_patterns_node` | `RETRIEVE_DIALOGUE_PATTERNS` | 检索已审核、非高风险销售对话模式。 | `retrieved_dialogue_patterns` |
-| 11B | `retrieve_external_context_if_needed_node` | `RETRIEVE_EXTERNAL_CONTEXT_IF_NEEDED` | 需要外部素材时保留新闻摘要接口，本地不编造报道。 | `metadata.news_digest` |
-| 12B | `build_compact_context_node` | `BUILD_COMPACT_CONTEXT` | 将模式和外部摘要重新合并进 compact context。 | `compact_context` |
-| 13B/10C | `generate_strategy_node` | `GENERATE_STRATEGY` | 基于 compact_context 生成策略或低压维护话术。 | `answer` |
+| 8 | `status_router` | `STATUS_ROUTER` | 按 `information_status` 路由补问、策略或低压维护。 | `current_state` |
+| 9A | `generate_kyc_questions` | `GENERATE_KYC_QUESTIONS` | 根据缺失字段和已问焦点生成一条补问。 | `answer`、`asked_focuses`、`kyc_question_round_count` |
+| 9B | `retrieve_dialogue_patterns_node` | `RETRIEVE_DIALOGUE_PATTERNS` | 检索已审核、非高风险销售对话模式。 | `retrieved_dialogue_patterns` |
+| 10B | `retrieve_external_context_if_needed_node` | `RETRIEVE_EXTERNAL_CONTEXT_IF_NEEDED` | 需要外部素材时保留新闻摘要接口，本地不编造报道。 | `metadata.news_digest` |
+| 11B / 9C | `build_compact_context_node` | `BUILD_COMPACT_CONTEXT` | 生成策略前构建唯一优先上下文（confirmed/uncertain/case/模式/新闻），仅构建一次。 | `compact_context` |
+| 12B / 10C | `generate_strategy_node` | `GENERATE_STRATEGY` | 基于 compact_context 生成策略或低压维护话术。 | `answer` |
 | 14 | `compliance_review` | `COMPLIANCE_REVIEW` | 输出合规审查，必要时进入人工审批。 | `guardrail_results` |
 | 15 | `response_packaging` | `RESPONSE_PACKAGING` | 封装前端/API 响应。 | `response_package` |
 | 16 | `post_response_logger_node` | `POST_RESPONSE_LOGGER` | 记录 GeneratedOutput 和使用的模式 ID。 | `GeneratedOutput`、`trace_events` |

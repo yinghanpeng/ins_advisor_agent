@@ -1,7 +1,7 @@
 """项目本地运行入口。
 
-这个文件是给第一次打开项目的人准备的，不要求你先理解 FastAPI、Dify、
-LangGraph 或 LangSmith。直接执行：
+这个文件是给第一次打开项目的人准备的，不要求你先理解 FastAPI、Dify
+或 LangSmith。直接执行：
 
     python3 main.py
 

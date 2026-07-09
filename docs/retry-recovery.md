@@ -18,5 +18,5 @@
 
 ## 后续扩展
 
-把 `RecoveryPlan` 接入 LangGraph exception edge，并结合 checkpoint 做恢复。
+把 `RecoveryPlan` 接入 `AgentGraph` 各节点的异常处理路径，并结合 checkpoint 做恢复。
 

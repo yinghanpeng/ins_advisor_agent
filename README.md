@@ -11,7 +11,7 @@
 - 保险顾问只是第一个 `Domain Skill`；
 - 未来可扩展研究助手、文档分析助手、面试助手、销售助手、客服助手、数据分析助手；
 - 一线销售采访语料不是普通知识库文档，而是沉淀为 `Sales Intelligence Layer`；
-- Dify 作为 Control Plane，FastAPI + LangGraph + Agent Core 作为 Data Plane；
+- Dify 作为 Control Plane，FastAPI + 自研显式状态机（Agent Core）作为 Data Plane；
 - LangSmith 作为可观测性和评估增强层，本地结构化日志始终可用。
 
 ## 为什么不是简单 Prompt 工程
@@ -32,7 +32,7 @@
 - Python 3.11+
 - Pydantic v2：数据契约和 schema 校验
 - FastAPI：Agent Gateway adapter
-- LangGraph：状态机和 workflow runtime adapter
+- 自研显式状态机（`AgentGraph`）：主链路的线性 workflow runtime
 - LangSmith：可选 tracing / evaluation / experiment
 - Dify：可视化 Control Plane
 - 自定义 Agent Core：路由、工具、RAG、Memory、Context、Guardrails、Recovery、Cost、Domain Skill 管理
@@ -51,7 +51,7 @@ pip install -e ".[api]"
 flowchart LR
     User["用户 / 前端 / Dify"] --> Gateway["FastAPI Agent Gateway"]
     Gateway --> Core["Agent Core"]
-    Core --> Graph["LangGraph Runtime"]
+    Core --> Graph["AgentGraph Runtime<br/>显式状态机"]
     Core --> Tools["General Capability Layer"]
     Core --> Skills["Domain Skills"]
     Skills --> Insurance["Insurance Advisor Skill"]
@@ -123,7 +123,7 @@ uvicorn agent_core.api.server:app --reload
 
 - `configs/`：Agent、状态机、工具、RAG、Guardrails、LangSmith、成本预算等运行配置。
 - `src/agent_core/api/`：FastAPI Agent Gateway 适配层。
-- `src/agent_core/graph/`：LangGraph 状态机、节点、边、checkpoint。
+- `src/agent_core/graph/`：自研显式状态机（`AgentGraph`）、节点、意图分类、checkpoint。
 - `src/agent_core/workflow/`：workflow 输入输出契约和执行引擎。
 - `src/agent_core/tools/`：工具系统，包含工具 schema、注册表、权限、路由。
 - `src/agent_core/capabilities/`：通用能力层，例如时间、计算器、搜索、文件解析、翻译、总结等。

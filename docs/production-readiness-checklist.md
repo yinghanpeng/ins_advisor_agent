@@ -114,7 +114,7 @@
 - 代码：`src/agent_core/recovery/fallback.py`
 - 文档：`docs/retry-recovery.md`
 
-说明：当前包含 retry helper、fallback answer、`RecoveryPlan`。生产扩展路径是将 `RecoveryPlan` 接入每个 LangGraph node 的 exception edge 和 checkpoint resume。
+说明：当前包含 retry helper、fallback answer、`RecoveryPlan`。生产扩展路径是将 `RecoveryPlan` 接入每个 `AgentGraph` 节点的异常处理路径和 checkpoint resume。
 
 ## 12. Cost Budget
 

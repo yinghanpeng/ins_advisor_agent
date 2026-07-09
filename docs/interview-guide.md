@@ -2,7 +2,7 @@
 
 ## 一句话介绍
 
-这个项目把一个 Dify 保险销售沟通教练，升级为 FastAPI + LangGraph + LangSmith + Dify Control Plane + Agent Core + Sales Intelligence Layer 的生产级 Agent Framework。
+这个项目把一个 Dify 保险销售沟通教练，升级为 FastAPI + 自研显式状态机（Agent Core）+ LangSmith + Dify Control Plane + Sales Intelligence Layer 的生产级 Agent Framework。
 
 ## 为什么 Dify 不做主入口
 
@@ -18,9 +18,9 @@ Dify 适合 Prompt 管理和运营调试，但公网流量需要：
 
 这些职责更适合放在 FastAPI Agent Gateway 和 Agent Core。
 
-## 为什么用 LangGraph
+## 为什么用自研显式状态机（AgentGraph）
 
-复杂任务不能靠模型自由发挥。LangGraph 用显式状态机表达：
+复杂任务不能靠模型自由发挥。`AgentGraph`（`src/agent_core/graph/builder.py`）用线性顺序的显式状态机表达，把主链路拆成可追踪的节点函数：
 
 - 当前在哪个状态；
 - 下一步去哪；
@@ -59,7 +59,7 @@ LangSmith 用于：
 用户输入
 → FastAPI / main.py
 → WorkflowEngine
-→ LangGraph 状态机
+→ AgentGraph 显式状态机
 → Intent Router
 → Capability Router
 → Insurance Advisor Skill

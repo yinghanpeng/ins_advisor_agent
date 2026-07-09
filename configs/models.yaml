@@ -31,6 +31,16 @@ models:
     timeout_ms: 3000
     max_retries: 1
 
+  # 意图分类专用端点：classify_intent 优先使用它做结构化意图路由；
+  # 未配置（本地无 API Key）时会自动回退到关键词规则，不影响链路。
+  intent_classifier:
+    provider: openai_compatible
+    model: ${INTENT_CLASSIFIER_MODEL}
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    timeout_ms: 2000
+    max_retries: 1
+
   guardrail:
     provider: openai_compatible
     model: ${GUARDRAIL_MODEL}

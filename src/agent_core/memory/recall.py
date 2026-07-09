@@ -238,10 +238,18 @@ class MemoryRecallRuleEngine:
         # 用户显式引用历史：「按我之前说的」「继续上次那个客户」等 → 全层级召回。
         if any(term in text for term in self.explicit_history_terms):
             layers.extend(["preference", "customer_profile", "advisor_profile", "case_state", "memory_event"])
-        # 多轮指代：「他/这个客户」+ session 有 last_entity → 业务事实层。
-        if any(term in text for term in self.pronoun_terms) and any(
-            session_memory.get(key) for key in ["last_entity", "last_intent", "last_case_id"]
-        ):
+        # 多轮指代：「他/这个客户」等代词命中时，是否升级为长期业务事实召回。
+        #
+        # ① 触发锚点只用真实体锚点 last_entity / last_case_id，不再看 last_intent。
+        #    原因：last_intent 每轮都会被 update_short_term_memory 写入，从第 2 轮起几乎恒为真，
+        #    会让条件退化成「有代词 且 非首轮」，与"是否存在可被指代的实体"无关。
+        # ④ 区分 session 内指代与跨会话指代：
+        #    - 被指实体已在短期 recent_messages 覆盖 → 指代消解由 query_understanding 的短期逻辑完成，
+        #      无需再跑一次长期 hybrid 召回（省延迟/成本，避免冗余）；
+        #    - 锚点存在但已滑出短期窗口（长对话被截断 / 来自更早会话）→ 才升级为长期业务事实召回。
+        pronoun_hit = any(term in text for term in self.pronoun_terms)
+        entity_anchor = session_memory.get("last_entity") or session_memory.get("last_case_id")
+        if pronoun_hit and entity_anchor and not self._entity_in_short_term(entity_anchor, session_memory):
             layers.extend(["customer_profile", "case_state", "memory_event"])
         # 个性化关键词：「风格」「偏好」「客户画像」→ 偏好 + 画像层。
         if any(term in text for term in self.personalization_terms):
@@ -275,6 +283,31 @@ class MemoryRecallRuleEngine:
             reason="规则无法确定是否需要长期记忆，交给 memory_recall_decision 模型判断。",
             queries=[text],
         )
+
+    @staticmethod
+    def _entity_in_short_term(entity_anchor: Any, session_memory: dict[str, Any]) -> bool:
+        """判断被指代实体是否已在短期 recent_messages 里出现过。
+
+        命中说明当前 session 内已有该实体的上下文，指代消解交给短期记忆即可，
+        无需触发长期 hybrid 召回；未命中（实体已滑出短期窗口，或来自更早会话）才需要升级长期召回。
+
+        参数:
+            entity_anchor: session 中的 last_entity / last_case_id 锚点值。
+            session_memory: 短期 SESSION 记忆，含 recent_messages。
+
+        返回:
+            True 表示实体已在短期上下文覆盖；False 表示需要长期召回补齐。
+        """
+        # 锚点为空时无法判定覆盖，交由上游按"无锚点"处理。
+        anchor = str(entity_anchor).strip()
+        if not anchor:
+            return False
+        # 逐条扫描最近消息，只要有一条文本包含该实体，即认为短期上下文已覆盖。
+        for message in session_memory.get("recent_messages") or []:
+            content = message.get("content") if isinstance(message, dict) else None
+            if content and anchor in str(content):
+                return True
+        return False
 
 
 def plan_long_term_memory_recall(

@@ -6,7 +6,7 @@
 flowchart TD
     A["用户 / 前端 / Dify"] --> B["FastAPI Agent Gateway"]
     B --> C["Agent Core"]
-    C --> D["LangGraph Runtime"]
+    C --> D["AgentGraph Runtime<br/>显式状态机"]
     C --> E["General Capability Layer 通用能力层"]
     C --> F["Domain Skill Router 业务技能路由"]
     F --> G["Insurance Advisor Skill 保险顾问技能"]
@@ -20,7 +20,7 @@ flowchart TD
 ## 各层职责
 
 - `FastAPI Agent Gateway`：负责公网入口、请求校验、鉴权、限流、租户隔离、trace id 注入。
-- `LangGraph Runtime`：负责显式状态机、节点执行、状态流转和未来 checkpoint/recovery。
+- `AgentGraph Runtime`：自研显式状态机（`src/agent_core/graph/builder.py`），负责节点执行、线性状态流转和未来 checkpoint/recovery。
 - `Agent Core`：负责意图路由、工具系统、RAG、Memory、Context、Guardrails、Recovery、Cost Control。
 - `Domain Skill`：负责垂直业务逻辑，当前第一个 Skill 是保险顾问。
 - `Sales Intelligence Layer`：负责销售访谈语料加工、结构化卡片、检索、合规审查、评估生成。

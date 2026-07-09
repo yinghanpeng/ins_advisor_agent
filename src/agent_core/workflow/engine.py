@@ -42,8 +42,9 @@ class WorkflowEngine:
         self.approval_store = approval_store or InMemoryApprovalStore()
         # checkpoint store 保存审批前 AgentState，审批恢复必须从 checkpoint 继续，而不是重跑用户请求。
         self.checkpoint_store = checkpoint_store or InMemoryCheckpointStore()
-        # 构建 Agent 执行图；LangGraph 可用时返回 StateGraph，不可用时返回等价 LocalGraph。
-        self.graph = build_agent_graph(self.memory_manager)
+        # 构建 Agent 执行器（线性顺序写法）；通用链路与 KYC 教练链路按 workflow_name 分叉。
+        # business_store 注入 KYC 业务节点，memory_manager 注入记忆节点。
+        self.graph = build_agent_graph(self.memory_manager, self.business_store)
 
     def run(self, request: AgentRunRequest) -> AgentRunResponse:
         """执行一次 Agent 请求，并返回包含状态链路和 trace 的结构化响应。"""
@@ -71,12 +72,10 @@ class WorkflowEngine:
             session_id=state.session_id,
             workflow_name=state.workflow_name,
         )
-        # 默认走通用 Agent 图；显式指定 KYC 教练 workflow 时，执行业务记忆链路。
-        if request.workflow_name == "insurance_kyc_coach_workflow":
-            result = self._run_insurance_kyc_coach(state)
-        else:
-            result = self.graph.invoke(state)
-        # 兼容 LangGraph 返回 dict 的情况；统一恢复成 AgentState 后，响应封装逻辑就不用关心底层图实现。
+        # 通用链路和 KYC 教练链路现在统一由同一张状态图编排（在 input_guardrail 后按 workflow_name 分叉），
+        # 因此这里不再手写 KYC 专用序列，避免"图 + 手写链"双套编排导致的重复与不一致。
+        result = self.graph.invoke(state)
+        # invoke 返回 AgentState；这里做一次防御性兼容，万一传入 dict 也能恢复成 AgentState。
         if isinstance(result, dict):
             result = AgentState(**result)
         # 将 state_transitions 单独写日志；这类日志只描述状态从哪里跳到哪里，适合排查链路卡点。
@@ -162,43 +161,3 @@ class WorkflowEngine:
             grounding_result=state.grounding_result,
             cost=state.cost,
         )
-
-    def _run_insurance_kyc_coach(self, state: AgentState) -> AgentState:
-        """执行保险 KYC 教练业务记忆链路。
-
-        这条链路对齐 Dify 4 轮 KYC workflow，并通过显式节点把分析、写入提案、
-        模式检索、compact_context 和策略生成拆开，便于后续逐节点接入配置化模型。
-        """
-        state.workflow_name = "insurance_kyc_coach_workflow"
-        state.domain_skill = state.domain_skill or "insurance_advisor"
-        state.metadata.setdefault("workflow_version", "local-kyc-v1")
-
-        nodes.initialize_context(state)
-        nodes.input_guardrail(state)
-        if state.final_state:
-            return state
-
-        nodes.load_business_memory(state, self.business_store)
-        nodes.analyze_kyc_and_route(state)
-        nodes.propose_memory_writes(state)
-        nodes.validate_memory_writes(state)
-        nodes.persist_memory_snapshot(state, self.business_store)
-        nodes.build_compact_context_node(state, self.business_store)
-        nodes.status_router(state)
-
-        if state.current_state == nodes.AgentNode.GENERATE_KYC_QUESTIONS:
-            nodes.generate_kyc_questions(state)
-        elif state.current_state == nodes.AgentNode.RETRIEVE_DIALOGUE_PATTERNS:
-            nodes.retrieve_dialogue_patterns_node(state)
-            nodes.retrieve_external_context_if_needed_node(state)
-            nodes.build_compact_context_node(state, self.business_store)
-            nodes.generate_strategy_node(state)
-        else:
-            nodes.generate_strategy_node(state)
-
-        nodes.compliance_review(state)
-        if state.current_state != nodes.AgentNode.HUMAN_APPROVAL:
-            nodes.response_packaging(state)
-            nodes.post_response_logger_node(state, self.business_store)
-            nodes.trace_finalize(state)
-        return state

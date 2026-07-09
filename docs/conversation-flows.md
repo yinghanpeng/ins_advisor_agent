@@ -18,7 +18,7 @@
 main.py
 → WorkflowEngine.run()
 → AgentState 创建 trace_id / session_id / tenant_id
-→ LangGraph 或 LocalGraph.invoke()
+→ AgentGraph.invoke() → _run_universal
 → CLASSIFY_INTENT
 → ROUTE_CAPABILITY
 → DOMAIN_WORKFLOW_ROUTING

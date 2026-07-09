@@ -6,7 +6,7 @@
 1. 不把复杂流程藏在一个大 Prompt 里；
 2. 每一次状态变化都能被记录、审计和回放；
 3. 即使 LangSmith 不可用，本地结构化日志也能追踪完整执行链路；
-4. 为 LangGraph / 本地 workflow engine / Dify API 调用提供统一状态对象。
+4. 为 Agent 执行器（graph/builder.py 的 AgentGraph）/ Dify API 调用提供统一状态对象。
 
 核心概念：
 - AgentNode：Agent 允许进入的显式状态节点；
@@ -213,8 +213,8 @@ class AgentState(BaseModel):
     - 记录错误、重试和成本；
     - 记录状态转移和 trace 事件。
 
-    LangGraph 的每个 node 或本地 workflow engine 的每个 step，
-    都应该接收并返回 AgentState，避免把流程藏在不可追踪的大 Prompt 里。
+    Agent 执行器的每个节点（graph/nodes.py 中的节点函数）都应该接收并返回
+    AgentState，避免把流程藏在不可追踪的大 Prompt 里。
     """
 
     # Pydantic 默认保护 model_ 前缀；本项目需要 model_name 字段记录模型路由结果，所以关闭该限制。
@@ -813,7 +813,7 @@ class AgentState(BaseModel):
             metadata: 状态切换相关的额外信息，例如 intent、route、tool_name。
 
         Returns:
-            更新后的 AgentState，方便链式调用或 LangGraph node 返回。
+            更新后的 AgentState，方便节点函数链式调用并返回。
         """
         # 读取当前状态允许进入的下一批状态；None 表示本地演示模式不强制校验。
         allowed_next_states = self.allowed_transitions.get(self.current_state.value)

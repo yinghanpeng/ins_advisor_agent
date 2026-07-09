@@ -1,7 +1,8 @@
-"""Core node functions used by LangGraph or the local engine.
+"""Agent 主链路的核心节点函数。
 
 # 文件说明：
 # - 本文件属于显式状态机层，负责把顶级 Agent 主链路拆成可追踪节点。
+# - 这些节点由 graph/builder.py 的 AgentGraph 按线性顺序依次调用。
 # - 每个节点都接收并返回 AgentState，所有状态变化都必须通过 move_to()。
 """
 
@@ -14,6 +15,7 @@ from typing import Any
 from agent_core.context.builder import ContextBuilder
 from agent_core.context.compression import truncate_context
 from agent_core.cost.model_router import choose_model
+from agent_core.graph.intent_classifier import classify_intent_via_model
 from agent_core.graph.state import AgentNode, AgentState
 from agent_core.guardrails.input import InputGuardrail
 from agent_core.guardrails.output import OutputGuardrail
@@ -77,6 +79,13 @@ def initialize_context(state: AgentState) -> AgentState:
     _enter(state, AgentNode.INIT_CONTEXT, "request_received")
     # 记录节点开始事件，后续排查可知道 trace 从哪个节点开始。
     state.add_trace_event("node_started", node_name="initialize_context")
+    # KYC 教练链路的默认字段在这里集中设置：以前散落在 engine._run_insurance_kyc_coach，
+    # 现在 KYC 已并入统一状态图，入口初始化必须补齐 domain_skill 和 workflow_version。
+    if state.workflow_name == "insurance_kyc_coach_workflow":
+        # 未显式指定时默认走保险顾问 Skill。
+        state.domain_skill = state.domain_skill or "insurance_advisor"
+        # 记录本地 KYC workflow 版本，供 GeneratedOutput / OpportunityCase 审计。
+        state.metadata.setdefault("workflow_version", "local-kyc-v1")
     # 初始化本轮 token 预算；调用方可通过 metadata 覆盖默认预算。
     state.cost.setdefault("request_token_budget", state.metadata.get("request_token_budget", 12000))
     # 记录输入字符数，便于后续估算 prompt 压缩压力和成本。
@@ -106,17 +115,22 @@ def input_guardrail(state: AgentState) -> AgentState:
     _enter(state, AgentNode.INPUT_GUARDRAIL, "enter_input_guardrail")
     # 记录风控节点开始，方便排查请求是否在安全层被拦截。
     state.add_trace_event("node_started", node_name="input_guardrail")
-    # 调用输入风控器检查 Prompt Injection、越权指令和明显违规请求。
+    # 调用三层输入风控（硬闸 → LLM Judge 灰区 → PolicyCombiner），返回兼容 dict。
     result = InputGuardrail().review(state.input_text)
-    # 把风控结果写入 guardrail_results，最终响应和审计日志都会暴露这一结果。
+    # 把风控结果写入 guardrail_results，最终响应和审计日志都会暴露这一结果（含完整信号证据链）。
     state.guardrail_results.append(result)
-    # action=block 表示请求不能继续进入记忆、检索或工具层。
+    # decision_action 是四档精细动作（allow/mask/review/block）；action 是压缩后的 pass/block。
+    decision_action = result.get("decision_action", "allow")
+    # 把综合风险等级同步到 state.risk_level，供后续工具权限与输出策略复用。
+    state.risk_level = result.get("risk_level", state.risk_level)
+
+    # action=block 表示请求不能继续进入记忆、检索或工具层（含确定性 BLOCK 与需人工的 REVIEW）。
     if result["action"] == "block":
         # 将意图显式标记为 unsafe_request，避免后续误判为普通业务需求。
         state.intent = "unsafe_request"
         # 路由结果标记为 blocked，Context Need 会知道这是拒绝路径。
         state.capability_route = "blocked"
-        # 被输入风控阻断的请求统一视为高风险。
+        # 被输入风控阻断的请求统一按高风险处理。
         state.risk_level = "high"
         # 明确告诉后续链路：不需要 memory/RAG/tool/human/clarify，只需要 reject。
         state.context_needs = {
@@ -127,16 +141,33 @@ def input_guardrail(state: AgentState) -> AgentState:
             "reject": True,
             "clarify": False,
         }
-        # 给用户返回明确的安全阻断说明，避免静默失败。
-        state.answer = "该请求包含疑似越权或 Prompt Injection 内容，已按安全策略阻断。"
+        # 区分"确定性拦截"与"需人工复核"两种阻断原因，给用户不同说明。
+        # 注：REVIEW 目前在输入阶段按 fail-closed 直接终止；后续可在拓扑增加 HUMAN_APPROVAL 分支承接。
+        if decision_action == "review":
+            state.answer = "该请求存在无法自动判定的安全风险，已转人工复核，暂不继续处理。"
+        else:
+            state.answer = "该请求包含疑似越权或 Prompt Injection 内容，已按安全策略阻断。"
         # 记录专门的 guardrail_blocked 事件，便于从 trace 中快速过滤安全阻断 case。
-        state.add_trace_event("guardrail_blocked", guardrail_result=result)
+        state.add_trace_event("guardrail_blocked", decision_action=decision_action, guardrail_result=result)
         # 将状态推进到 ERROR；这里是安全终止，不再继续执行业务节点。
         state.move_to(AgentNode.ERROR, reason="input_guardrail_blocked", metadata=result)
         # 立即返回，防止恶意输入进入任何后续节点。
         return state
-    # 未阻断时记录风控通过结果，后续仍可在输出端再次审查。
-    state.add_trace_event("node_finished", node_name="input_guardrail", guardrail_result=result)
+
+    # MASK：命中 PII 等敏感信息但可继续；先用脱敏文本替换输入，再放行进入主链路。
+    if result.get("masked") and result.get("sanitized_text"):
+        # 用脱敏文本替换后续节点看到的 input_text，避免 PII 进入检索、记忆和模型。
+        state.input_text = result["sanitized_text"]
+        # 同步把已入 messages 的最后一条用户消息也替换成脱敏版本，防止审计日志二次泄露。
+        for message in reversed(state.messages):
+            if message.get("type") == "conversation" and message.get("role") == "user":
+                message["content"] = result["sanitized_text"]
+                break
+        # 记录脱敏事件，便于回放"哪些请求被脱敏、命中了什么类别"。
+        state.add_trace_event("guardrail_input_sanitized", decision_action=decision_action, guardrail_result=result)
+
+    # 未阻断时记录风控通过结果（可能是 allow 或 mask 后放行），后续仍可在输出端再次审查。
+    state.add_trace_event("node_finished", node_name="input_guardrail", decision_action=decision_action, guardrail_result=result)
     # 返回 state 进入记忆恢复节点。
     return state
 
@@ -156,15 +187,22 @@ def restore_memory(state: AgentState, memory_manager: MemoryManager | None = Non
         # 读取任务记忆：保存当前任务状态，例如上一步是否已经准备好最终答案。
         task_memory = memory_manager.read(MemoryLayer.TASK, state.tenant_id, state.session_id)
 
+        # restore_memory 在 classify_intent 之前执行，此刻 state.intent/domain_skill 恒为 None。
+        # 用关键词规则做一次"预判"，让召回的 skip/must 规则拿到有效 intent/domain（修复召回时机问题）；
+        # 预判结果只用于本次召回决策，不写回 state.intent，classify_intent 仍是权威来源。
+        preliminary_intent, _preliminary_route, preliminary_domain = _rule_intent_hint(state.input_text)
+        # missing_slots 真实来源是 slot_values（validate_slots 写入），而非 metadata；
+        # 这里从 slot_values 读取并并入召回 metadata，修复此前从 metadata 读恒为空的问题。
+        recall_metadata = {**state.metadata, "missing_slots": state.slot_values.get("missing_slots", [])}
         # 长期偏好不是每轮都召回。先由 recall planner 判断当前请求是否需要长期记忆。
         decision = plan_long_term_memory_recall(
             input_text=state.input_text,
             workflow_name=state.workflow_name,
-            intent=state.intent,
-            domain_skill=state.domain_skill,
+            intent=state.intent or preliminary_intent,
+            domain_skill=state.domain_skill or preliminary_domain,
             risk_level=state.risk_level,
             session_memory=dict(session_memory),
-            metadata=state.metadata,
+            metadata=recall_metadata,
         )
         state.memory_recall_decision = decision.model_dump()
 
@@ -233,14 +271,18 @@ def load_business_memory(state: AgentState, business_store: BusinessMemoryStore 
     if latest_session is not None:
         state.kyc_question_round_count = max(state.kyc_question_round_count, latest_session.kyc_question_round_count)
 
+    # KYC 链路不跑 classify_intent，intent 恒为 None；用关键词规则预判补上，domain 优先用已设值。
+    preliminary_intent, _preliminary_route, preliminary_domain = _rule_intent_hint(state.input_text)
+    # missing_slots 从 slot_values 读取正确来源，并入召回 metadata（修复从 metadata 读恒为空）。
+    recall_metadata = {**state.metadata, "missing_slots": state.slot_values.get("missing_slots", [])}
     decision = plan_long_term_memory_recall(
         input_text=state.input_text,
         workflow_name=state.workflow_name,
-        intent=state.intent,
-        domain_skill=state.domain_skill,
+        intent=state.intent or preliminary_intent,
+        domain_skill=state.domain_skill or preliminary_domain,
         risk_level=state.risk_level,
         session_memory=state.memory_context.get("session", {}),
-        metadata=state.metadata,
+        metadata=recall_metadata,
     )
     state.memory_recall_decision = decision.model_dump()
 
@@ -710,34 +752,42 @@ def normalize_messages(state: AgentState) -> AgentState:
 
 
 def classify_intent(state: AgentState) -> AgentState:
-    """识别用户意图，并决定进入通用能力层、业务 Skill，或继续普通对话。"""
+    """识别用户意图，并决定进入通用能力层、业务 Skill，或继续普通对话。
+
+    策略：模型优先、规则兜底。
+    - 配置了可用 intent_classifier 模型时用模型做结构化分类；
+    - 模型未配置 / 调用失败 / 置信度不足时回退关键词规则，保证本地和生产都稳定。
+    """
     # 进入 CLASSIFY_INTENT 节点；这里负责决定主链路大方向。
     _enter(state, AgentNode.CLASSIFY_INTENT, "enter_classify_intent")
     # 记录输入摘要，避免日志里写入过长用户文本。
     state.add_trace_event("node_started", node_name="classify_intent", input_summary=state.input_text[:120])
-    # 本地规则统一用小写文本匹配；生产可替换为模型分类器。
-    text = state.input_text.lower()
-    # 天气类请求走通用工具层，后续 ToolRouter 会选择 weather_query。
-    if _text_has_any(text, ["天气", "weather"]):
-        state.intent = "weather_query"
-        state.capability_route = "general"
-    # 计算类请求走通用工具层，后续会生成 calculator 工具调用。
-    elif _text_has_any(text, ["计算", "多少", "calculator"]) or any(op in text for op in ["+", "-", "*", "/"]):
-        state.intent = "calculator_query"
-        state.capability_route = "general"
-    # 新闻、搜索、融资、报道类请求走通用工具层，后续优先规划 web_search/news_search。
-    elif _text_has_any(text, ["新闻", "搜索", "查一下", "最近", "融资", "报道", "news", "search"]):
-        state.intent = "web_or_news_search"
-        state.capability_route = "general"
-    # 客户沟通、保险、破冰、异议等请求进入保险顾问 Domain Skill。
-    elif _text_has_any(text, ["客户", "保险", "破冰", "异议", "计划书", "成交", "kyc"]):
-        state.intent = "insurance_advisor_help"
-        state.capability_route = "domain"
-        state.domain_skill = "insurance_advisor"
-    # 兜底为普通对话，不强行触发工具或领域 RAG。
+    # 先尝试模型分类；不可用时返回 None。
+    decision = classify_intent_via_model(state.input_text)
+    if decision is not None:
+        # 采用模型结果：写入意图、能力路由和业务 Skill。
+        state.intent = decision.intent
+        state.capability_route = decision.capability_route
+        if decision.domain_skill:
+            state.domain_skill = decision.domain_skill
+        # 标注分类来源为 model，便于评估模型与规则的差异。
+        state.add_trace_event(
+            "intent_classified",
+            source="model",
+            intent=state.intent,
+            capability_route=state.capability_route,
+            confidence=decision.confidence,
+        )
     else:
-        state.intent = "general_chat"
-        state.capability_route = "general"
+        # 回退关键词规则，保证模型不可用时链路不中断。
+        _classify_intent_by_rules(state)
+        # 标注分类来源为 rules，便于观测模型兜底触发频率。
+        state.add_trace_event(
+            "intent_classified",
+            source="rules",
+            intent=state.intent,
+            capability_route=state.capability_route,
+        )
     # 记录分类结果，后续主链路分支和测试都会检查 intent/capability_route。
     state.add_trace_event(
         "node_finished",
@@ -749,6 +799,49 @@ def classify_intent(state: AgentState) -> AgentState:
     state.move_to(AgentNode.ROUTE_CAPABILITY, reason="intent_classified")
     # 返回 state 进入风险分级。
     return state
+
+
+def _rule_intent_hint(text: str) -> tuple[str, str, str | None]:
+    """关键词规则意图预判（纯函数，不修改 AgentState）。
+
+    返回 (intent, capability_route, domain_skill)。有两个用途：
+    1. classify_intent 模型不可用时的确定性兜底（经 _classify_intent_by_rules 写回 state）；
+    2. restore_memory 在真正 classify_intent 之前，为长期记忆召回决策提供"预判 intent/domain"，
+       避免召回规则拿到的 intent/domain 恒为 None（召回发生在分类之前）。
+
+    参数:
+        text: 用户本轮原始输入。
+
+    返回:
+        (intent, capability_route, domain_skill)；非领域请求时 domain_skill 为 None。
+    """
+    # 本地规则统一用小写文本匹配。
+    lowered = text.lower()
+    # 天气类请求走通用工具层，后续 ToolRouter 会选择 weather_query。
+    if _text_has_any(lowered, ["天气", "weather"]):
+        return "weather_query", "general", None
+    # 计算类请求走通用工具层，后续会生成 calculator 工具调用。
+    if _text_has_any(lowered, ["计算", "多少", "calculator"]) or any(op in lowered for op in ["+", "-", "*", "/"]):
+        return "calculator_query", "general", None
+    # 新闻、搜索、融资、报道类请求走通用工具层，后续优先规划 web_search/news_search。
+    if _text_has_any(lowered, ["新闻", "搜索", "查一下", "最近", "融资", "报道", "news", "search"]):
+        return "web_or_news_search", "general", None
+    # 客户沟通、保险、破冰、异议等请求进入保险顾问 Domain Skill。
+    if _text_has_any(lowered, ["客户", "保险", "破冰", "异议", "计划书", "成交", "kyc"]):
+        return "insurance_advisor_help", "domain", "insurance_advisor"
+    # 兜底为普通对话，不强行触发工具或领域 RAG。
+    return "general_chat", "general", None
+
+
+def _classify_intent_by_rules(state: AgentState) -> None:
+    """关键词规则意图识别：作为模型分类不可用时的确定性兜底。"""
+    # 复用纯函数预判逻辑，保证兜底分类与召回预判使用同一套规则。
+    intent, capability_route, domain_skill = _rule_intent_hint(state.input_text)
+    state.intent = intent
+    state.capability_route = capability_route
+    # 只有领域请求才写 domain_skill；其余分支保持既有值不被覆盖。
+    if domain_skill:
+        state.domain_skill = domain_skill
 
 
 def semantic_risk_classification(state: AgentState) -> AgentState:
@@ -1229,19 +1322,10 @@ def generate_response(state: AgentState) -> AgentState:
     if state.answer:
         state.add_trace_event("node_finished", node_name="generate_response", output_summary=state.answer[:120])
         return state
-    # KYC 教练链路优先使用 compact_context，避免策略生成继续依赖散落变量。
-    if state.compact_context:
-        state.answer = _answer_from_compact_context(state)
-    # 信息不足但还没生成补问时，直接用缺失字段生成一条低压问题。
-    elif (
-        state.workflow_name == "insurance_kyc_coach_workflow"
-        and state.domain_skill == "insurance_advisor"
-        and state.information_status == "insufficient"
-    ):
-        next_focus = next((field for field in state.missing_fields if field not in state.asked_focuses), None)
-        state.answer = _question_for_focus(next_focus) if next_focus else "已有信息可以先输出初版策略。"
+    # 说明：KYC 教练链路的策略/补问生成已由 generate_strategy_node / generate_kyc_questions
+    # 在专用状态图节点内完成，不再进入本节点，因此这里不再重复 compact_context 相关逻辑。
     # 保险顾问路径使用销售洞察和合规原则生成低压沟通建议。
-    elif state.domain_skill == "insurance_advisor":
+    if state.domain_skill == "insurance_advisor":
         state.answer = (
             "当前建议先做低压沟通：先确认客户真实处境，再用资金分层引导长期稳定安排。"
             "可从客户行业、家庭责任、资金用途和风险偏好切入，避免直接推产品。"
