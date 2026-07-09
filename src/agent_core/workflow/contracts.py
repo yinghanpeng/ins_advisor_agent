@@ -207,6 +207,11 @@ class AgentRunResponse(BaseModel):
         default_factory=list,
         description="完整结构化 trace 事件，包含状态切换、工具、检索、风控、恢复和成本等事件。",
     )
+    # stream_events 是面向未来 SSE 的事件骨架，比 trace_events 更适合前端按节点/工具展示进度。
+    stream_events: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="流式事件骨架，包含节点开始/结束、工具调用、最终答案等可转 SSE 的事件。",
+    )
     # state_transitions 只记录状态跳转路径，不混入工具和检索细节。
     state_transitions: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -241,6 +246,16 @@ class AgentRunResponse(BaseModel):
     grounding_result: dict[str, Any] = Field(
         default_factory=dict,
         description="事实校验结果，说明回答是否有证据支撑、引用了哪些来源、是否存在冲突。",
+    )
+    # evaluation_result 暴露回答质量评估和重生成触发原因，便于生产排障与测试断言。
+    evaluation_result: dict[str, Any] = Field(
+        default_factory=dict,
+        description="回答质量评估结果，记录是否触发重生成、触发原因和重生成次数。",
+    )
+    # output_pii_scan_result 暴露输出侧 PII 扫描摘要，绝不包含原始敏感文本。
+    output_pii_scan_result: dict[str, Any] = Field(
+        default_factory=dict,
+        description="输出侧 PII 扫描结果摘要，只包含 PII 类型、位置摘要、动作和高敏标记。",
     )
     # cost 返回本轮资源消耗摘要，便于预算和性能分析。
     cost: dict[str, Any] = Field(

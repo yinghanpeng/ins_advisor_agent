@@ -141,8 +141,19 @@ class AgentGraph:
         #     }
         state = nodes.context_need_planning(state)
 
+        # Clarify 短路分支：如果 Context Need 已经判定缺关键槽位，
+        # 这里必须在工具/RAG/生成大模型之前中断，直接向用户补问。
+        if state.context_needs.get("clarify"):
+            state = nodes.generate_clarification_response(state)
+            state = nodes.response_packaging(state)
+            state = nodes.trace_finalize(state)
+            return state
+
         # 分支 A：需要外部工具（天气/搜索/计算等）时走工具链。
         if state.context_needs.get("tool"):
+            # 补充说明：生产级工具链不再只执行一次 routing/call/verify，
+            # 而是进入有界 agentic_tool_loop；loop 内部仍复用 general_tool_routing、
+            # general_tool_call 和 verify_tool_result，并在每轮执行工具 Guardrail。
             # 生成工具调用计划。
             #   产出 state.tool_plan：
             #     [
@@ -154,7 +165,7 @@ class AgentGraph:
             #         "requires_approval": false
             #       }
             #     ]
-            state = nodes.general_tool_routing(state)
+            state = nodes.agentic_tool_loop(state)
             # 执行工具（含权限与人审检查）。
             #   产出：
             #     tool_calls   = [ { "tool_name": "summarizer", "status": "success", "latency_ms": 0 } ]
@@ -167,11 +178,18 @@ class AgentGraph:
             #   本例 requires_approval=false，不进入此分支。
             if state.current_state == AgentNode.HUMAN_APPROVAL:
                 return state
+            # 工具循环中 planner 如果判断需要补充信息，也在这里转入澄清短路返回。
+            if state.context_needs.get("clarify"):
+                state = nodes.generate_clarification_response(state)
+                state = nodes.response_packaging(state)
+                state = nodes.trace_finalize(state)
+                return state
             # 校验工具结果，失败进入恢复但仍走保守回答。
             #   产出：
             #     errors      = []   // 无失败结果
             #     retry_count = 0    // 无需 recovery / 降级
-            state = nodes.verify_tool_result(state)
+            # 补充说明：verify_tool_result 已在 agentic_tool_loop 每轮内部执行，
+            # 这里不再重复调用，避免同一轮工具错误被重复计入 retry_count。
         # 分支 B：保险顾问等领域请求走 Domain Skill + 销售检索。
         #   （分支 B 用另一场景演示：input="帮我给这个企业主客户做保险破冰，怎么开口"）
         elif state.capability_route == "domain":
@@ -240,6 +258,21 @@ class AgentGraph:
         state = nodes.compliance_review(state)
         # 输出命中高风险时停在 HUMAN_APPROVAL。
         #   本例合规通过，不进入此分支。
+        if state.current_state == AgentNode.HUMAN_APPROVAL:
+            return state
+
+        # 输出侧 PII 二次扫描：检查生成答案中是否包含手机号、邮箱、身份证、银行卡等。
+        state = nodes.output_pii_scan(state)
+
+        # Evaluator-optimizer 有界闭环：只在证据不足、风险较高、PII 脱敏等情况下最多重生成一次。
+        state = nodes.evaluate_response_quality(state)
+        state = nodes.regenerate_response_if_needed(state)
+
+        # 重生成后必须再次执行 PII、grounding 和 compliance，避免优化后引入新的风险。
+        state = nodes.output_pii_scan(state)
+        state = nodes.grounding_verification(state)
+        state = nodes.compliance_review(state)
+        # 第二次合规审查仍可能进入 HUMAN_APPROVAL，必须立即返回等待审批。
         if state.current_state == AgentNode.HUMAN_APPROVAL:
             return state
 

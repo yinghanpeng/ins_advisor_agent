@@ -152,6 +152,7 @@ class WorkflowEngine:
             guardrails=state.guardrail_results,
             retrieved_context=state.retrieved_context,
             trace_events=state.trace_events,
+            stream_events=state.stream_events,
             state_transitions=state.state_transitions,
             tool_calls=state.tool_calls,
             tool_results=state.tool_results,
@@ -159,5 +160,7 @@ class WorkflowEngine:
             context_needs=state.context_needs,
             response_package=state.response_package,
             grounding_result=state.grounding_result,
+            evaluation_result=state.evaluation_result,
+            output_pii_scan_result=state.output_pii_scan_result,
             cost=state.cost,
         )

@@ -19,6 +19,19 @@ def run_agent(request: AgentRunRequest) -> AgentRunResponse:
     return WorkflowEngine().run(request)
 
 
+def run_agent_stream(request: AgentRunRequest) -> dict[str, object]:
+    """返回流式事件骨架；未来可替换为真正 SSE StreamingResponse。"""
+    # 第一版仍同步执行完整 workflow，只把 state.stream_events 作为 adapter-ready 输出。
+    response = run_agent(request)
+    # 返回最小流式包，保留 final_response 方便非 SSE 客户端兼容调试。
+    return {
+        "trace_id": response.trace_id,
+        "final_state": response.final_state,
+        "stream_events": response.stream_events,
+        "final_response": response.model_dump(),
+    }
+
+
 def build_router():
     """Return an APIRouter or None when FastAPI is not installed."""
     # FastAPI 是可选依赖；本地测试没有安装时，返回 None 而不是让导入失败。
@@ -34,6 +47,12 @@ def build_router():
     def agent_run(request: AgentRunRequest) -> AgentRunResponse:
         # 每个 API 请求交给 run_agent，避免路由函数里重复 workflow 逻辑。
         return run_agent(request)
+
+    # /agent/stream 当前返回事件骨架，未来可无破坏升级为 SSE。
+    @router.post("/agent/stream")
+    def agent_stream(request: AgentRunRequest) -> dict[str, object]:
+        # 不直接在路由里写状态机逻辑，仍复用 WorkflowEngine 和 run_agent_stream。
+        return run_agent_stream(request)
 
     # /agent/eval 是轻量评估入口，只返回 trace_id 和 final_state，方便自动化评测。
     @router.post("/agent/eval")

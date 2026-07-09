@@ -158,3 +158,47 @@
 - 接口预留已经在 capabilities、rag、observability、integrations 中完成。
 - 后续扩展时替换 adapter 内部实现，不需要重写 Agent Core 边界。
 
+## 16. Agentic 工具有界循环
+
+- 代码：`src/agent_core/agentic_loop/schemas.py`
+- 代码：`src/agent_core/agentic_loop/planner.py`
+- 代码：`src/agent_core/graph/nodes.py`
+- 文档：`docs/agentic-tool-loop.md`
+- 测试：`tests/test_agentic_tool_loop.py`
+
+说明：通用工具链从单次 `general_tool_routing → general_tool_call → verify_tool_result` 升级为 `agentic_tool_loop`。循环仍复用旧节点，但新增 `max_iterations`、`max_total_tool_calls`、重复计划检测、工具错误预算和 `_source_boundary` 校验，避免无限循环和工具结果越界。
+
+## 17. Clarify 短路分支
+
+- 代码：`src/agent_core/graph/builder.py`
+- 代码：`src/agent_core/graph/nodes.py`
+- 文档：`docs/clarify-and-interrupt.md`
+- 测试：`tests/test_clarify_branch.py`
+
+说明：`context_need_planning` 写入 `context_needs["clarify"]` 后，`_run_universal` 会在工具、RAG 和生成前直接调用 `generate_clarification_response`，再执行 `response_packaging → trace_finalize → return`。这避免缺槽位时误检索、误调用工具或让模型猜事实。
+
+## 18. Evaluator-Optimizer 有界闭环
+
+- 代码：`src/agent_core/graph/nodes.py`
+- 文档：`docs/evaluator-optimizer.md`
+- 测试：`tests/test_response_evaluator_optimizer.py`
+
+说明：回答生成后增加 `output_pii_scan → evaluate_response_quality → regenerate_response_if_needed`。重生成默认最多一次，复用同一 `compressed_context` 和 `tool_results`，不重新调用外部工具。重生成后再次执行 PII、grounding 和 compliance。
+
+## 19. Streaming 事件骨架
+
+- 代码：`src/agent_core/graph/state.py`
+- 代码：`src/agent_core/graph/nodes.py`
+- 代码：`src/agent_core/api/routes.py`
+- 文档：`docs/streaming-events.md`
+- 测试：`tests/test_stream_events.py`
+
+说明：新增 `stream_events` 和 `streaming_enabled`。当前版本不做 token streaming，但会记录节点、工具、工具循环和最终答案事件，API 层提供 `/agent/stream` adapter-ready 入口，后续可接 SSE。
+
+## 20. 输出侧 PII 二次扫描
+
+- 代码：`src/agent_core/guardrails/output_pii.py`
+- 代码：`src/agent_core/graph/nodes.py`
+- 测试：`tests/test_output_pii_scan.py`
+
+说明：输入 PII 扫描保护的是用户输入进入记忆、工具和模型之前的边界；输出 PII 扫描保护的是最终答案返回前的边界。它会脱敏手机号、身份证、邮箱、微信、银行卡和精确地址，只在 trace 中记录 PII 类型和位置摘要，不保存原始敏感文本。

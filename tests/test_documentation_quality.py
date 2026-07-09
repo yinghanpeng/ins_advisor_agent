@@ -4,6 +4,13 @@ from pathlib import Path
 import pytest
 
 from agent_core.evals.feedback import HumanFeedback
+from agent_core.agentic_loop.schemas import (
+    ToolLoopConfig,
+    ToolLoopDecision,
+    ToolLoopIteration,
+    ToolLoopState,
+    ToolObservation,
+)
 from agent_core.graph.state import AgentNode, AgentState
 from agent_core.guardrails.human_approval import ApprovalDecision, ApprovalRequest
 from agent_core.memory.business_schemas import (
@@ -74,6 +81,12 @@ PYDANTIC_MODELS = [
     ToolSpec,
     ToolCall,
     ToolResult,
+    # Agentic 工具循环 schema 约束 planner、observation 和循环预算。
+    ToolLoopConfig,
+    ToolLoopDecision,
+    ToolObservation,
+    ToolLoopIteration,
+    ToolLoopState,
     # RAG schema 模型约束 query、metadata、document、result 和 filters。
     RetrievalQuery,
     DocumentMetadata,

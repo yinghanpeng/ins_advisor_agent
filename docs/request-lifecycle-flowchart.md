@@ -606,6 +606,44 @@ flowchart TD
     Q --> R
 ```
 
+### 5.1 新版 Agentic 工具循环
+
+现在 `_run_universal` 不再在工具分支只执行一次 routing/call/verify，而是进入有界 `agentic_tool_loop`。旧节点仍被 loop 内部复用，所以原来的工具 schema、权限、执行器、校验和测试路径都保留。
+
+```mermaid
+flowchart TD
+    A["context_need_planning<br/>context_needs.tool=true"] --> B["agentic_tool_loop"]
+    B --> C{"达到 max_iterations<br/>或 max_total_tool_calls ?"}
+    C -- "是" --> S["停止工具循环<br/>tool_loop_stop_reason=max_iterations"]
+    C -- "否" --> D["plan_next_tool_or_finish<br/>规则 planner / 可选模型 planner"]
+    D --> E{"planner action"}
+    E -- "finish" --> S1["停止工具循环<br/>tool_loop_stop_reason=finished"]
+    E -- "ask_clarification" --> CL["generate_clarification_response<br/>response_packaging<br/>trace_finalize<br/>return"]
+    E -- "abort" --> AB["降级停止<br/>记录 errors 和 trace"]
+    E -- "call_tool" --> F["general_tool_routing 或 planner tool_plan"]
+    F --> G{"连续两轮计划完全相同 ?"}
+    G -- "是" --> RP["停止工具循环<br/>tool_loop_stop_reason=repeated_tool_plan"]
+    G -- "否" --> H["general_tool_call<br/>ToolGuardrail / permission / human approval"]
+    H --> I{"需要人工审批 ?"}
+    I -- "是" --> HA["HUMAN_APPROVAL<br/>返回等待确认"]
+    I -- "否" --> J["observe_tool_result<br/>补 _source_boundary"]
+    J --> K["verify_tool_result<br/>失败进入 RECOVERY / 降级"]
+    K --> L{"错误超过预算 ?"}
+    L -- "是" --> ER["停止工具循环<br/>tool_loop_stop_reason=tool_error_budget_exceeded"]
+    L -- "否" --> B
+```
+
+停止原因会写入：
+
+- `tool_loop_stop_reason`
+- `tool_loop_status`
+- `tool_loop_budget`
+- `tool_loop_iterations`
+- `trace_events`
+- `stream_events`
+
+每个工具结果都必须带 `_source_boundary`，外部工具返回只能作为证据数据使用，不能作为系统指令执行。
+
 ## 6. 领域 Skill / Sales Intelligence 分支详细流程
 
 ```mermaid
@@ -744,4 +782,53 @@ flowchart TD
 - `context_needs`：memory、long_term_memory、rag、tool、human、reject、clarify；
 - `response_package`：前端可展示结构；
 - `grounding_result`：事实校验结果；
+- `stream_events`：可转 SSE 的节点、工具和最终答案事件骨架；
+- `evaluation_result`：回答质量评估与重生成触发原因；
+- `output_pii_scan_result`：输出侧 PII 扫描摘要，不包含原始敏感文本；
 - `cost`：预算、上下文长度、工具次数、trace 数等成本信息。
+
+## 12. 2026-07 主链路增强后的目标形态
+
+本次改造后，默认通用链路的关键新增分支如下：
+
+```text
+initialize_context
+  → input_guardrail
+  → restore_memory
+  → normalize_messages
+  → classify_intent
+  → semantic_risk_classification
+  → extract_slots
+  → validate_slots
+  → query_understanding
+  → context_need_planning
+      ├─ clarify? → generate_clarification_response → response_packaging → trace_finalize → return
+      └─ continue
+  → agentic_tool_loop if context_needs.tool
+  → domain branch if capability_route == domain
+  → knowledge_fusion
+  → compress_context
+  → prompt_assembly
+  → model_routing
+  → generate_response
+  → grounding_verification
+  → compliance_review
+  → output_pii_scan
+  → evaluate_response_quality
+  → regenerate_response_if_needed
+  → output_pii_scan
+  → grounding_verification
+  → compliance_review
+  → response_packaging
+  → update_short_term_memory
+  → long_term_memory_candidate
+  → trace_finalize
+```
+
+其中：
+
+- Clarify 必须在工具/RAG/生成前中断，避免缺槽位时误查或猜事实；
+- Agentic 工具循环必须受预算、重复计划和错误预算限制；
+- Evaluator-optimizer 默认最多重生成一次；
+- Streaming 第一版只记录事件骨架，未来可接 SSE；
+- 输出侧 PII 扫描与输入侧 PII 扫描不同，前者保护最终答案返回前的边界。

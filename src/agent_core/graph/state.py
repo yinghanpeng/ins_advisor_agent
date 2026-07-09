@@ -80,11 +80,17 @@ class AgentNode(StrEnum):
     # 通用工具路由状态：判断是否需要调用天气、搜索、计算器、网页读取等通用工具。
     GENERAL_TOOL_ROUTING = "GENERAL_TOOL_ROUTING"
 
+    # Agentic 工具循环状态：在显式状态机内有界迭代规划、执行、观察和停止工具调用。
+    AGENTIC_TOOL_LOOP = "AGENTIC_TOOL_LOOP"
+
     # 通用工具调用状态：实际执行通用工具调用。
     GENERAL_TOOL_CALL = "GENERAL_TOOL_CALL"
 
     # 工具结果校验状态：校验工具返回是否成功、格式是否正确、是否需要重试或降级。
     VERIFY_TOOL_RESULT = "VERIFY_TOOL_RESULT"
+
+    # 澄清问题生成状态：在工具、RAG、模型生成前短路，向用户补问缺失关键信息。
+    GENERATE_CLARIFICATION_RESPONSE = "GENERATE_CLARIFICATION_RESPONSE"
 
     # 通用回答生成状态：基于通用工具结果或通用知识生成最终回答。
     GENERAL_RESPONSE_GENERATION = "GENERAL_RESPONSE_GENERATION"
@@ -172,6 +178,15 @@ class AgentNode(StrEnum):
 
     # 合规审查状态：检查输出是否有违规、夸大、幻觉、敏感信息泄露或高风险承诺。
     COMPLIANCE_REVIEW = "COMPLIANCE_REVIEW"
+
+    # 输出侧 PII 扫描状态：最终答案返回前二次扫描并脱敏手机号、邮箱、身份证等信息。
+    OUTPUT_PII_SCAN = "OUTPUT_PII_SCAN"
+
+    # 回答质量评估状态：检查回答是否缺证据、未回答、幻觉或应澄清未澄清。
+    EVALUATE_RESPONSE_QUALITY = "EVALUATE_RESPONSE_QUALITY"
+
+    # 回答重生成状态：在预算内最多重生成一次，复用同一上下文和工具结果。
+    REGENERATE_RESPONSE = "REGENERATE_RESPONSE"
 
     # 响应封装状态：生成前端可展示的 answer、引用、工具卡片和下一步建议。
     RESPONSE_PACKAGING = "RESPONSE_PACKAGING"
@@ -498,6 +513,24 @@ class AgentState(BaseModel):
         ),
     )
 
+    # stream_events 是 trace 的流式友好视图，API 未来可以直接转换成 SSE 事件。
+    stream_events: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "流式事件骨架列表。当前用于记录节点开始/结束、工具调用、最终答案等事件，"
+            "未来 API 可将其转换为 SSE；测试会检查它是否覆盖主链路关键节点。"
+        ),
+    )
+
+    # streaming_enabled 只表示调用端是否希望实时消费事件；当前版本即使为 False 也保留事件骨架。
+    streaming_enabled: bool = Field(
+        default=False,
+        description=(
+            "是否启用实时流式输出的请求级开关。第一版不做 token-by-token streaming，"
+            "但仍会写入 stream_events，方便未来无破坏接入 SSE。"
+        ),
+    )
+
     normalized_messages: list[dict[str, Any]] = Field(
         default_factory=list,
         description=(
@@ -633,6 +666,56 @@ class AgentState(BaseModel):
         ),
     )
 
+    # tool_loop_config 保存本次工具循环预算，允许 API/测试通过 metadata 或 state 覆盖默认值。
+    tool_loop_config: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Agentic 工具循环配置快照，例如 max_iterations、max_total_tool_calls、"
+            "是否启用模型 planner。用于 trace、API 展示和测试覆盖预算边界。"
+        ),
+    )
+
+    # tool_loop_iterations 保存每轮计划、执行和 observation，不保存模型隐藏推理链。
+    tool_loop_iterations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "工具循环每轮迭代记录。每项包含 decision、tool_calls、observations 和停止原因，"
+            "用于审计为什么继续或停止工具调用。"
+        ),
+    )
+
+    # tool_loop_stop_reason 记录工具循环最终停止原因，方便排查 max_iterations 或重复计划风险。
+    tool_loop_stop_reason: str | None = Field(
+        default=None,
+        description=(
+            "工具循环停止原因，例如 finished、max_iterations、repeated_tool_plan、"
+            "tool_error_budget_exceeded 或 human_approval。"
+        ),
+    )
+
+    # tool_loop_status 记录工具循环阶段，API 可用它展示 idle/running/finished/stopped。
+    tool_loop_status: str = Field(
+        default="idle",
+        description="工具循环状态，取值通常为 idle、running、finished 或 stopped。",
+    )
+
+    # tool_loop_budget 汇总本轮工具预算消耗，避免只看 cost 时分不清工具循环内部限制。
+    tool_loop_budget: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "工具循环预算消耗摘要，例如 max_iterations、used_iterations、"
+            "max_total_tool_calls、used_tool_calls 和 error_count。"
+        ),
+    )
+
+    # agentic_loop_enabled 表示通用工具链是否启用有界迭代循环；关闭时可回退旧单轮工具路径。
+    agentic_loop_enabled: bool = Field(
+        default=True,
+        description=(
+            "是否启用 Agentic 工具迭代循环。默认开启；测试或灰度可以关闭并回退旧工具节点。"
+        ),
+    )
+
     guardrail_results: list[dict[str, Any]] = Field(
         default_factory=list,
         description=(
@@ -700,6 +783,40 @@ class AgentState(BaseModel):
         description=(
             "封装后的前端响应结构。可包含 answer、citations、tool_cards、next_actions、"
             "risk_level、trace_id 等用户可见或前端可消费字段。"
+        ),
+    )
+
+    # clarification_question 保存本轮短路澄清问题，便于 API 区分“已回答”和“需要用户补充”。
+    clarification_question: str | None = Field(
+        default=None,
+        description=(
+            "澄清短路分支生成的问题。context_needs.clarify=True 时写入，"
+            "用于 response_package、trace 和前端展示下一轮应补充的信息。"
+        ),
+    )
+
+    # evaluation_result 保存 evaluator-optimizer 对候选回答的质量判断和触发原因。
+    evaluation_result: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "运行时回答质量评估结果。记录是否通过、是否需要重生成、触发维度、"
+            "降级警告等信息，供测试和生产审计使用。"
+        ),
+    )
+
+    # regeneration_attempts 记录回答重生成次数，硬限制最多一次，防止生成闭环无限循环。
+    regeneration_attempts: int = Field(
+        default=0,
+        ge=0,
+        description="回答重生成尝试次数。默认最多 1 次，用于防止 evaluator-optimizer 无限循环。",
+    )
+
+    # output_pii_scan_result 保存输出侧二次 PII 扫描结果，只记录类型和位置摘要，不记录原始 PII。
+    output_pii_scan_result: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "输出侧 PII 二次扫描结果。仅保存 PII 类型、位置摘要、是否脱敏和高敏标记，"
+            "不保存手机号、身份证、邮箱、银行卡等原始敏感文本。"
         ),
     )
 
