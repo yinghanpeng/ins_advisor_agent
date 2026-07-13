@@ -9,6 +9,8 @@ from agent_core.sales_intelligence.schemas import SalesInsightCard, SalesInsight
 
 
 def build_sales_insight_digest(cards: list[SalesInsightCard]) -> SalesInsightDigest:
+    """把已筛选销售卡片压缩为生成所需的策略、话术、动作和来源摘要。"""
+    # 仅投影结构化卡片字段并限制策略摘要长度，原始访谈全文不会进入 Prompt。
     return SalesInsightDigest(
         applicable_scene=", ".join(sorted({card.scene for card in cards})) or "unknown",
         insight_summary="；".join(card.effective_strategy for card in cards)[:1200],
@@ -25,4 +27,3 @@ def build_sales_insight_digest(cards: list[SalesInsightCard]) -> SalesInsightDig
         ],
         compliance_notes=[card.compliance_notes for card in cards if card.compliance_notes],
     )
-

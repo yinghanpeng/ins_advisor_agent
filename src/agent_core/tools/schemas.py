@@ -10,19 +10,23 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+# 风险等级限定为三档，供工具 Guardrail 进行稳定枚举判断。
 RiskLevel = Literal["low", "medium", "high"]
+# 权限等级区分公开、租户、特权和管理员，客户渠道只开放前两档。
 PermissionLevel = Literal["public", "tenant", "privileged", "admin"]
+# 副作用等级明确区分只读、写入、外部动作和金融动作，后三类会被同步阻断。
 SideEffectLevel = Literal["none", "read_only", "write", "external_action", "financial"]
+# 审计等级控制是否及以何种粒度记录工具调用元数据。
 AuditLevel = Literal["none", "basic", "full"]
 
 
 class ToolPermissionSpec(BaseModel):
     """Permission metadata used by tool guardrails and audit logs."""
 
-    # level 表示工具权限等级；ToolPermissionPolicy 会用它判断是否允许自动执行。
+    # level 表示工具权限等级；ToolPermissionPolicy 会用它判断是否允许客户渠道执行。
     level: PermissionLevel = Field(
         default="public",
-        description="工具权限等级。public 可本地调用，tenant 需要租户隔离，privileged/admin 需要更严格审批。",
+        description="工具权限等级。public 可本地调用，tenant 需要租户隔离，privileged/admin 在客户渠道直接禁止。",
     )
     # scope 表示具体权限作用域，例如 internet.read 或 local.compute，用于白名单校验。
     scope: str = Field(
@@ -33,11 +37,6 @@ class ToolPermissionSpec(BaseModel):
     requires_tenant_boundary: bool = Field(
         default=True,
         description="是否要求执行前校验租户边界，防止读取或写入其它租户的数据。",
-    )
-    # requires_human_approval 表示该权限本身就要求人审，即使工具本身没有显式 requires_approval。
-    requires_human_approval: bool = Field(
-        default=False,
-        description="调用该权限级别的工具前是否必须进入人工审批。",
     )
 
 
@@ -60,15 +59,15 @@ class ToolSpec(BaseModel):
         default_factory=dict,
         description="工具输出 JSON Schema。用于校验工具返回是否符合下游工作流预期。",
     )
-    # risk_level 决定工具是否需要更严格审计或人工审批。
+    # risk_level 决定工具是否需要更严格审计或同步阻断。
     risk_level: RiskLevel = Field(
         default="low",
-        description="工具风险等级。medium/high 工具应触发更严格的权限、审批或日志策略。",
+        description="工具风险等级。medium/high 工具应触发更严格的权限、同步阻断或日志策略。",
     )
-    # permission 是结构化权限对象，统一承载权限等级、scope 和人审要求。
+    # permission 是结构化权限对象，统一承载权限等级、scope 和租户边界要求。
     permission: ToolPermissionSpec = Field(
         default_factory=ToolPermissionSpec,
-        description="工具权限配置，声明调用该工具需要的权限等级、作用域和人工审批要求。",
+        description="工具权限配置，声明调用该工具需要的权限等级、作用域和租户边界。",
     )
     # side_effect 标记工具是否会改变外部世界，例如写数据库或提交表单。
     side_effect: bool = Field(
@@ -78,12 +77,7 @@ class ToolSpec(BaseModel):
     # side_effect_level 比 bool 更细，便于区分只读、写入、外部动作和金融动作。
     side_effect_level: SideEffectLevel = Field(
         default="read_only",
-        description="工具副作用等级。none/read_only 可自动执行；write/external_action/financial 通常需要审批。",
-    )
-    # requires_approval 是工具级人审开关，适合所有高风险写操作。
-    requires_approval: bool = Field(
-        default=False,
-        description="工具调用前是否必须等待人工确认。高风险副作用工具应设为 True。",
+        description="工具副作用等级。none/read_only 可执行；write/external_action/financial 在客户系统中直接禁止。",
     )
     # retryable 决定失败后能否自动重试，非幂等操作应关闭。
     retryable: bool = Field(
@@ -115,7 +109,7 @@ class ToolSpec(BaseModel):
     # audit_level 决定工具调用和结果记录的详细程度。
     audit_level: AuditLevel = Field(
         default="basic",
-        description="工具审计级别。full 表示需要记录更完整的参数摘要、结果摘要和审批链路。",
+        description="工具审计级别。full 表示需要记录更完整的参数摘要、结果摘要和策略决策。",
     )
     # idempotency_required 用于写操作，要求调用方提供幂等键防止重复提交。
     idempotency_required: bool = Field(
@@ -135,6 +129,8 @@ class ToolSpec(BaseModel):
 
 
 class ToolCall(BaseModel):
+    """模型或路由节点提交给执行器的结构化工具调用。"""
+
     # name 必须出现在 ToolRegistry 中，executor 不允许执行未注册工具。
     name: str = Field(..., description="本次要调用的工具名称，必须能在 ToolRegistry 中找到对应 ToolSpec。")
     # arguments 是工具实际入参，由 general_tool_routing 根据 Query Understanding 构造。
@@ -150,6 +146,8 @@ class ToolCall(BaseModel):
 
 
 class ToolResult(BaseModel):
+    """工具执行、阻断或失败后返回给工作流的统一结果契约。"""
+
     # name 标明该结果来自哪个工具，response_package 会用它生成工具卡片。
     name: str = Field(..., description="返回结果对应的工具名称。")
     # status 把成功、失败和风控阻断明确区分，便于 recovery 采取不同策略。

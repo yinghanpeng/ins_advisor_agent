@@ -2,7 +2,7 @@
 
 This retriever deliberately searches reviewed insight cards, not raw interview
 transcripts. It rewrites the user query, applies metadata filters, runs local
-hybrid retrieval, then maps selected chunks back to approved cards.
+hybrid retrieval, then maps selected chunks back to generation-eligible cards.
 """
 
 # 文件说明：
@@ -20,7 +20,7 @@ from agent_core.sales_intelligence.schemas import DialoguePattern, SalesInsightC
 
 
 class SalesIntelligenceRetriever:
-    """销售智能检索器，只检索已审核销售卡片，绝不直接返回原始访谈。"""
+    """销售智能检索器，只检索已通过静态生成准入的卡片，不返回原始访谈。"""
 
     def __init__(self, cards_dir: str | Path = "data/sales_insight_cards") -> None:
         """初始化销售洞察卡片目录。"""
@@ -39,7 +39,7 @@ class SalesIntelligenceRetriever:
             card
             # 从所有加载卡片中逐条筛选安全候选。
             for card in self._load_cards()
-            # suitable_for_rag 控制卡片是否适合作为检索资料；high risk 和未审批卡片不能进入生成。
+            # suitable_for_rag 控制是否可检索；high risk 和未通过生成准入的卡片不能进入生成。
             if card.suitable_for_rag and card.risk_level != "high" and card.approved_for_generation
         ]
         # 建立 source_id/chunk_id 到卡片对象的映射，检索返回 chunk 后可映射回原始卡片。
@@ -104,6 +104,7 @@ class SalesIntelligenceRetriever:
 
 def filter_generation_ready_patterns(patterns: list[DialoguePattern]) -> list[DialoguePattern]:
     """筛出允许进入最终生成的销售对话模式。"""
+    # 同时要求显式准入和非 high 风险，任一条件失败都按 default deny 过滤。
     return [
         pattern
         for pattern in patterns
@@ -112,7 +113,8 @@ def filter_generation_ready_patterns(patterns: list[DialoguePattern]) -> list[Di
 
 
 def build_dialogue_pattern_digest(patterns: list[DialoguePattern]) -> list[dict]:
-    """把已审核模式压缩成生成可用摘要，不暴露原始语料消息。"""
+    """把已通过静态生成准入的模式压缩成摘要，不暴露原始语料消息。"""
+    # 只投影策略所需字段，CorpusMessage、来源全文和内部治理信息不进入 Prompt。
     return [
         {
             "id": pattern.id,

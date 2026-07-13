@@ -1,8 +1,107 @@
 # 文件说明：
 # - 本文件是测试用例，用来验证生产级 Agent 架构中的一个或多个关键能力。
 # - 测试既是质量保障，也是给新手看的最小用法示例。
+import pytest
+
+from agent_core.graph.state import AgentNode
+from agent_core.observability.langsmith_client import LangSmithAdapter
 from agent_core.workflow.contracts import AgentRunRequest
-from agent_core.workflow.engine import WorkflowEngine
+from agent_core.workflow.engine import AGENT_STEP_LABELS, WorkflowEngine
+
+
+class _RecordingLogger:
+    """在内存中收集结构化日志，验证实时节点日志而不依赖控制台。"""
+
+    def __init__(self) -> None:
+        """初始化按发生顺序保存的日志列表。"""
+
+        self.records: list[dict[str, object]] = []
+
+    def event(self, event: str, **fields: object) -> None:
+        """记录普通结构化事件。"""
+
+        self.records.append({"event": event, **fields})
+
+    def warning(self, event: str, **fields: object) -> None:
+        """记录告警事件并保留 warning 级别。"""
+
+        self.records.append({"event": event, "level": "warning", **fields})
+
+
+class _FailingGraph:
+    """在首个状态迁移后抛错，用于证明异常不会吞掉已完成步骤日志。"""
+
+    def invoke(self, state):
+        """记录一次状态迁移后模拟节点异常。"""
+
+        state.move_to(AgentNode.INIT_CONTEXT, reason="test_failure")
+        raise RuntimeError("simulated failure")
+
+
+def test_every_agent_node_has_a_human_readable_flow_label():
+    """新增状态节点时必须同步提供流程日志名称，避免终端退回难读的内部枚举。"""
+
+    assert set(AGENT_STEP_LABELS) == {node.value for node in AgentNode}
+    assert all(label.strip() for label in AGENT_STEP_LABELS.values())
+
+
+def test_workflow_engine_logs_every_state_transition_in_real_time():
+    """每个执行步骤的状态迁移都必须实时形成一条安全结构化日志。"""
+
+    logger = _RecordingLogger()
+    engine = WorkflowEngine(
+        log=logger,
+        langsmith=LangSmithAdapter(enabled=False),
+    )
+
+    response = engine.run(AgentRunRequest(input="计算 12*8+3"))
+
+    logged_transitions = [
+        (record.get("from_state"), record.get("to_state"))
+        for record in logger.records
+        if record.get("event") == "trace_event"
+        and record.get("trace_event_name") == "state_transition"
+    ]
+    response_transitions = [
+        (transition["from_state"], transition["to_state"])
+        for transition in response.state_transitions
+    ]
+    assert logged_transitions == response_transitions
+    flow_steps = [record for record in logger.records if record.get("event") == "agent_flow_step"]
+    assert [record.get("step_index") for record in flow_steps] == list(range(1, len(flow_steps) + 1))
+    assert flow_steps[0]["step_name"] == "初始化"
+    assert any(record.get("step_name") == "输入安全拦截" for record in flow_steps)
+    summary = next(record for record in logger.records if record.get("event") == "agent_flow_summary")
+    assert summary["status"] == "completed"
+    assert str(summary["flow"]).startswith("初始化 → 输入安全拦截 → 恢复记忆")
+    assert logger.records[0]["event"] == "agent_run_started"
+    assert logger.records[-1]["event"] == "agent_run_finished"
+    assert all("input_text" not in record for record in logger.records)
+
+
+def test_workflow_engine_logs_failure_state_before_reraising():
+    """节点抛错时必须记录失败状态，同时保留异常供 API 错误边界处理。"""
+
+    logger = _RecordingLogger()
+    engine = WorkflowEngine(
+        log=logger,
+        langsmith=LangSmithAdapter(enabled=False),
+    )
+    engine.graph = _FailingGraph()
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        engine.run(AgentRunRequest(input="触发测试异常"))
+
+    failure = next(record for record in logger.records if record.get("event") == "agent_run_failed")
+    assert failure["current_state"] == AgentNode.INIT_CONTEXT.value
+    assert failure["exception_type"] == "RuntimeError"
+    summary = next(record for record in logger.records if record.get("event") == "agent_flow_summary")
+    assert summary["status"] == "failed"
+    assert summary["flow"] == "初始化"
+    assert any(
+        record.get("trace_event_name") == "state_transition"
+        for record in logger.records
+    )
 
 
 def test_workflow_engine_routes_insurance_request():
@@ -12,10 +111,12 @@ def test_workflow_engine_routes_insurance_request():
     assert response.final_state == "FINAL"
     # domain_skill 证明领域路由命中保险顾问。
     assert response.domain_skill == "insurance_advisor"
-    # intent 证明意图识别为保险顾问帮助。
-    assert response.intent == "insurance_advisor_help"
-    # retrieved_context 证明销售洞察检索链路被触发。
-    assert response.retrieved_context
+    # intent 证明向量知识库命中了细分破冰意图。
+    assert response.intent == "insurance_break_ice"
+    # 首轮信息不足时先追问，不提前检索方法库或生成完整策略。
+    assert response.insurance_kyc_status["information_status"] == "insufficient"
+    # 活跃意图会写入 Session，下一轮优先判断是否在回答本问题。
+    assert response.active_intent["intent"] == "insurance_break_ice"
 
 
 def test_workflow_engine_handles_general_request():

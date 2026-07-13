@@ -1,6 +1,9 @@
 # Agentic 工具迭代循环
 
-本文说明通用 Agent 主链路中的有界工具循环。它不是黑盒 ReAct，而是在显式状态机中把原来的单轮 `general_tool_routing → general_tool_call → verify_tool_result` 包成可审计、可停止、可降级的工具迭代。
+> 当前状态：实验代码保留，但已从 `_run_universal` 主链路移除。当前工具请求使用单轮
+> `general_tool_routing → general_tool_call → verify_tool_result`。
+
+本文保留有界工具循环的实验设计。它不是黑盒 ReAct，而是在显式状态机中把单轮工具链包装成可审计、可停止、可降级的工具迭代；当前生产主链路不执行该包装。
 
 ## 为什么单次工具调用不足
 
@@ -12,9 +15,9 @@
 - 工具结果可能包含外部指令或 PII，必须每轮重新做边界标注和风控；
 - 多轮工具调用必须有预算，否则容易形成无限 loop。
 
-## 新链路
+## 实验链路（当前未接入）
 
-通用链路中，`context_need_planning` 判断 `context_needs.tool=true` 后进入：
+实验调用方可以在 `context_needs.tool=true` 后显式进入：
 
 ```text
 agentic_tool_loop
@@ -33,7 +36,7 @@ agentic_tool_loop
 - `general_tool_call`
 - `verify_tool_result`
 
-这样旧测试和旧讲解路径仍然成立，只是工具调用从“单次执行”升级为“有界循环”。
+这些节点和单元测试仍然保留，但当前工具调用保持“单次执行”，没有升级为主链路循环。
 
 ## 如何避免无限循环
 
@@ -52,7 +55,7 @@ agentic_tool_loop
 - 达到最大轮次：`max_iterations`；
 - 连续两轮计划完全相同：`repeated_tool_plan`；
 - 工具错误超过预算：`tool_error_budget_exceeded`；
-- 工具触发人审：`human_approval`；
+- 工具被权限或副作用策略拒绝：记录 `blocked` 结果并同步降级；
 - planner 请求澄清：`ask_clarification`。
 
 每轮计划会生成稳定 fingerprint。若连续两轮完全相同，系统在执行第二轮前停止，避免“查同一个东西，得到同一个结果，再查同一个东西”的循环风险。
@@ -83,7 +86,7 @@ agentic_tool_loop
 - 工具注册表白名单；
 - `ToolGuardrail` 权限检查；
 - permission scope；
-- `requires_approval`；
+- `side_effect_level`（只允许 `none/read_only`）；
 - 工具结果清洗；
 - `_source_boundary` 标注；
 - `verify_tool_result` 结构校验。

@@ -6,6 +6,7 @@
 
 - `General Capability Layer`
 - `Domain Skill Layer`
-- `Human Approval`
+- `Clarify / Safe Fallback`
 - `Recovery`
 
+客户渠道不存在 `Human Approval`。高风险或越权能力在当前请求中直接 deny、block 或返回无副作用替代说明。

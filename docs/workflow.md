@@ -1,49 +1,40 @@
-# Workflow 设计
+# 代码执行流设计
 
-Workflow 是比单个 Prompt 更稳定的任务流程定义。
+项目类名仍保留 `WorkflowEngine` 作为 API 兼容门面，但保险不再使用独立 Workflow 或
+`workflow_name` 分叉。实际顺序位于 `AgentGraph` 和节点函数中。
 
-## 通用流程
+## 统一入口
 
 ```text
-用户输入
-→ CLASSIFY_INTENT
-→ ROUTE_CAPABILITY
-→ 通用能力 或 Domain Skill
-→ 检索 / 工具 / 上下文构建
-→ GENERATE_RESPONSE
-→ COMPLIANCE_REVIEW
-→ FINAL / HUMAN_APPROVAL / ERROR
+initialize_context
+→ input_guardrail
+→ restore_memory
+→ normalize_messages
+→ active intent / vector intent / LLM adjudication
+→ confidence dispatch
+→ general path 或 insurance code handler
+→ output checks
+→ memory update
+→ trace_finalize
 ```
 
-## 保险破冰 Workflow
+## 保险代码处理器
 
-1. classify intent；
-2. extract customer KYC；
-3. extract sales pain；
-4. classify scene；
-5. retrieve Sales Intelligence；
-6. optionally retrieve external news；
-7. build compact context；
-8. generate response；
-9. compliance review；
-10. final response。
+```text
+load_business_memory
+→ extract_insurance_kyc_slots
+→ deterministic merge / scoring / route
+→ one gentle question 或 dual-KB strategy
+→ memory proposal / validation / persistence
+→ grounding / PII / compliance
+→ active-intent sync
+```
 
-## Step Contract
+写入放在生成之后：`generate_kyc_questions` 先设置实际展示的 `presented_kyc_focus`，Proposal 才记录该
+问题。这样生成异常不会把客户没有看到的问题误算成已问。
 
-Workflow step 定义在：
+附件 Dify Workflow 的 KYC、新闻、双知识库和策略规则已经分别迁到 `kyc.py`、`knowledge.py`、
+`nodes.py` 和 `builder.py`。原 `workflow/steps.py` 与 Insurance Workflow 类已删除。
 
-- `src/agent_core/workflow/contracts.py`
-- `src/agent_core/workflow/steps.py`
-
-每个 step 声明：
-
-- required inputs；
-- produced outputs；
-- allowed next states；
-- guardrails；
-- allowed tools；
-- retry policy；
-- trace fields。
-
-这样做的好处是：节点不再是“隐形 Prompt”，而是有明确输入输出边界的工程模块。
-
+公共 Pydantic 契约仍保留在 `workflow/contracts.py`，用于 API 请求/响应和通用结构，不再作为保险
+业务编排的第二套事实来源。

@@ -79,7 +79,7 @@ class SalesInsightCard(BaseModel):
         ...,
         description="原始访谈、转写稿或销售素材的来源 ID，用于审计和回溯。",
     )
-    # chunk_id 定位原文片段，方便人工复核某条卡片是否抽取准确。
+    # chunk_id 定位原文片段，方便自动评估或离线内容治理追溯抽取准确性。
     chunk_id: str = Field(
         ...,
         description="该卡片对应的访谈片段 ID。一个 source_id 可拆分出多个 chunk。",
@@ -172,9 +172,9 @@ class SalesInsightCard(BaseModel):
     # risk_level 控制这张卡片能否直接进入生成链路。
     risk_level: RiskLevel = Field(
         default="low",
-        description="卡片风险等级。high 卡片默认不直接用于生成，应先合规审查或人工审批。",
+        description="卡片风险等级。high 卡片不允许直接用于生成，应在语料入库阶段完成合规筛选。",
     )
-    # compliance_notes 保存人工或规则审查结论，供生成前再次提醒。
+    # compliance_notes 保存自动规则/模型准入结论，供生成前再次执行边界检查。
     compliance_notes: str = Field(
         default="",
         description="合规备注，记录需要避免的表达、引用限制或审查结论。",
@@ -189,20 +189,20 @@ class SalesInsightCard(BaseModel):
         default=True,
         description="该卡片是否适合作为评估样本来源。用于自动生成 sales quality eval case。",
     )
-    # approved_for_generation 是最终生成准入开关，默认 False 防止未审访谈直接被模型引用。
+    # approved_for_generation 是静态生成准入开关，不代表客户请求存在人工审批动作。
     approved_for_generation: bool = Field(
         default=False,
-        description="该卡片是否已通过审查、允许进入最终生成。默认 False，防止原始访谈直接出现在回答中。",
+        description="该卡片是否通过生成准入。默认 False；该静态标记不会挂起客户请求。",
     )
     # created_at 记录卡片创建时间，方便版本审计。
     created_at: str = Field(
         default_factory=utc_now_iso,
         description="卡片创建时间，ISO 字符串，用于版本追踪和审计。",
     )
-    # updated_at 记录最近更新时间，后续人工修订时应更新。
+    # updated_at 记录最近更新时间，自动再校验或离线内容修订时应更新。
     updated_at: str = Field(
         default_factory=utc_now_iso,
-        description="卡片最近更新时间，ISO 字符串，用于后续人工修订或再审查。",
+        description="卡片最近更新时间，ISO 字符串，用于自动再校验或离线内容修订。",
     )
 
 
@@ -249,77 +249,130 @@ class SalesInsightDigest(BaseModel):
 class CorpusBatch(BaseModel):
     """一次销售语料导入批次。"""
 
+    # id 是服务端生成的批次主键，用于串联同一次导入的案例资产。
     id: str = Field(default_factory=lambda: new_id("corpus_batch"), description="语料批次唯一 ID。")
+    # tenant_id 是批次隔离边界，所有派生 case/message 都应保持相同租户。
     tenant_id: str = Field(..., description="语料批次所属租户 ID。")
+    # batch_name 提供可读批次名称，便于离线治理和审计定位。
     batch_name: str = Field(..., description="批次名称，例如 2026Q2 高客访谈导入。")
+    # source_type 标识原始语料形态，决定对应解析和脱敏适配器。
     source_type: str = Field(..., description="语料来源类型，例如 interview、wechat_export、call_transcript。")
+    # upload_by 记录导入操作者或任务 ID，只用于内部审计。
     upload_by: str = Field(default="", description="上传人或导入任务 ID。")
+    # raw_file_uri 仅定位受控归档，不允许作为正文注入最终 Prompt。
     raw_file_uri: str = Field(default="", description="原始文件 URI，只用于归档和审计，不进入生成 Prompt。")
+    # total_conversations 记录批次规模且限制为非负，支持治理进度核对。
     total_conversations: int = Field(default=0, ge=0, description="该批次包含的对话数量。")
+    # pii_status 描述整批语料的脱敏阶段，未达到准入状态时不能进入生成资产。
     pii_status: Literal["raw", "redacted", "reviewed"] = Field(
         default="raw",
-        description="PII 处理状态：原始、已脱敏或已人工复核。",
+        description="PII 处理状态：原始、已脱敏或已通过自动/离线治理校验。",
     )
+    # created_at 记录批次建立时间，供增量治理和审计排序使用。
     created_at: str = Field(default_factory=utc_now_iso, description="语料批次创建时间。")
 
 
 class CorpusCase(BaseModel):
     """一个从真实语料中整理出的销售案例资产。"""
 
+    # id 是案例主键，后续消息和模式抽取都通过它关联。
     id: str = Field(default_factory=lambda: new_id("corpus_case"), description="语料 case 唯一 ID。")
+    # tenant_id 继承批次租户边界，禁止跨租户拼接真实沟通案例。
     tenant_id: str = Field(..., description="语料 case 所属租户 ID。")
+    # batch_id 指向来源导入批次，保证案例可追溯到治理任务。
     batch_id: str = Field(..., description="语料 case 所属导入批次 ID。")
-    case_title: str = Field(..., description="case 标题，用于内部检索和人工复核。")
+    # case_title 是内部可读标题，不应包含未脱敏客户身份。
+    case_title: str = Field(..., description="case 标题，用于内部检索和离线质量追溯。")
+    # scene_type 描述主要沟通场景，用于后续抽取与评测分层。
     scene_type: str = Field(default="", description="沟通场景类型，例如 KYC 补问、异议处理、低压维护。")
+    # target_persona 保存抽象客群标签，不保存真实客户姓名或联系方式。
     target_persona: str = Field(default="unknown", description="该案例涉及的内部客群标签。")
+    # trigger_module 标记案例对应的销售切入模块，支持能力检索。
     trigger_module: str = Field(default="unknown", description="该案例主要体现的销售切入模块。")
+    # advisor_stage 记录从业者成熟度，避免新手与资深打法无差别混用。
     advisor_stage: str = Field(default="unknown", description="案例中从业者阶段。")
+    # customer_stage 记录客户所处沟通阶段，帮助选择适配动作。
     customer_stage: str = Field(default="unknown", description="案例中客户所处阶段或反应阶段。")
+    # relationship_strength 抽象顾问与客户关系基础，影响话术压力水平。
     relationship_strength: str = Field(default="", description="顾问与客户关系强度摘要。")
+    # final_outcome 保存案例结果标签，供离线效果分析而非承诺未来结果。
     final_outcome: str = Field(default="", description="案例最终结果标签或摘要。")
+    # quality_score 用 0—100 评分控制案例是否适合进一步资产化。
     quality_score: int = Field(default=0, ge=0, le=100, description="该案例作为训练/评测资产的质量分。")
+    # raw_conversation_uri 只指向原始受控归档，不能进入在线生成上下文。
     raw_conversation_uri: str = Field(default="", description="原始对话归档 URI，不进入最终 Prompt。")
+    # redacted_conversation_uri 指向脱敏版本，可供抽取和评测任务读取。
     redacted_conversation_uri: str = Field(default="", description="脱敏对话归档 URI，可用于抽取和评测。")
+    # created_at 记录案例资产创建时间，支持版本和质量审计。
     created_at: str = Field(default_factory=utc_now_iso, description="语料 case 创建时间。")
 
 
 class CorpusMessage(BaseModel):
     """脱敏后的语料消息，只能作为抽取和评测来源。"""
 
+    # id 是单条脱敏消息主键，供抽取结果回溯具体轮次。
     id: str = Field(default_factory=lambda: new_id("corpus_message"), description="语料消息唯一 ID。")
+    # tenant_id 保持消息与案例、批次一致的租户隔离边界。
     tenant_id: str = Field(..., description="语料消息所属租户 ID。")
+    # corpus_case_id 将消息归属到单一案例，禁止跨案例重排上下文。
     corpus_case_id: str = Field(..., description="语料消息所属 case ID。")
+    # seq_no 是从一开始的消息顺序号，用于重建脱敏对话时序。
     seq_no: int = Field(..., ge=1, description="消息在语料 case 中的顺序号。")
+    # speaker_role 限定说话方枚举，避免自由标签导致抽取口径漂移。
     speaker_role: Literal["advisor", "customer", "observer", "system"] = Field(..., description="消息说话方角色。")
+    # content_redacted 只保存脱敏正文，原文不能通过该模型进入在线链路。
     content_redacted: str = Field(..., description="脱敏后的消息内容，仅用于抽取模式或构造 eval，不直接进入生成。")
+    # message_type 描述该轮功能，例如提问、回答、异议或收口。
     message_type: str = Field(default="", description="消息类型，例如 question、answer、objection、closing。")
+    # detected_intent 保存离线识别结果，用于模式抽取和评测切片。
     detected_intent: str = Field(default="", description="从该消息中识别出的意图。")
+    # sentiment 保存该轮态度标签，帮助评估动作是否匹配客户状态。
     sentiment: str = Field(default="", description="该消息的情绪或态度标签。")
+    # created_at 记录消息资产创建时间，而非假定为原始对话发生时间。
     created_at: str = Field(default_factory=utc_now_iso, description="语料消息创建时间。")
 
 
 class DialoguePattern(BaseModel):
     """从真实对话中抽取、脱敏、审查后的销售动作模式。"""
 
+    # id 是抽象模式主键，最终摘要引用该值而不暴露原始消息标识。
     id: str = Field(default_factory=lambda: new_id("dialogue_pattern"), description="销售对话模式唯一 ID。")
+    # tenant_id 确保模式只在来源租户内检索和使用。
     tenant_id: str = Field(..., description="模式所属租户 ID。")
+    # pattern_type 限定模式动作类型，支持稳定过滤和排序。
     pattern_type: PatternType = Field(..., description="模式类型，例如 opening、kyc_question、objection_handling。")
+    # scene_type 表示模式适用沟通场景，避免跨阶段机械套用。
     scene_type: str = Field(default="", description="模式适用的沟通场景。")
+    # target_persona 保存抽象目标客群，不承载真实个人身份。
     target_persona: str = Field(default="unknown", description="模式适用的内部客群标签。")
+    # trigger_module 标识模式主要解决的销售切入模块。
     trigger_module: str = Field(default="unknown", description="模式适用的销售切入模块。")
+    # advisor_stage 指明适用从业者阶段，帮助控制建议复杂度。
     advisor_stage: str = Field(default="unknown", description="模式适合的从业者阶段。")
+    # situation_summary 保存脱敏、抽象后的情境而非完整客户故事。
     situation_summary: str = Field(..., description="抽象后的情境摘要，不包含真实客户身份或完整故事。")
+    # customer_signal 描述触发建议动作的典型客户信号。
     customer_signal: str = Field(default="", description="客户在该场景下表现出的典型信号。")
+    # recommended_move 是可迁移的建议动作，也是最终摘要核心字段。
     recommended_move: str = Field(..., description="建议的销售动作，必须是可迁移模式而非单个客户事实。")
+    # bad_move 保存需要避免的错误动作，供生成合规提醒使用。
     bad_move: str = Field(default="", description="该场景下不建议采取的动作。")
+    # example_wording 只能保存已脱敏且通过自动准入的话术样本。
     example_wording: str = Field(default="", description="可参考的话术样本，必须已脱敏并通过合规审查。")
+    # outcome_label 记录历史结果标签，不可被生成节点表述为结果保证。
     outcome_label: str = Field(default="", description="该模式对应的结果标签，例如 replied、meeting_booked。")
-    confidence: float = Field(default=0.8, ge=0, le=1, description="模式抽取或人工确认的置信度。")
+    # confidence 表示抽取与校验置信度，范围强制在 0 到 1。
+    confidence: float = Field(default=0.8, ge=0, le=1, description="模式抽取和自动校验后的置信度。")
+    # source_corpus_case_ids 只保存案例主键列表，支持离线溯源而不注入原文。
     source_corpus_case_ids: list[str] = Field(default_factory=list, description="该模式来源的语料 case ID 列表。")
+    # approved_for_generation 是静态自动准入开关，默认拒绝且不创建人工审批。
     approved_for_generation: bool = Field(
         default=False,
-        description="该模式是否已允许进入最终生成。默认 False，避免未审真实语料被直接引用。",
+        description="该模式是否通过生成准入。默认 False，避免未校验真实语料被直接引用。",
     )
+    # risk_level 默认中风险，high 模式会被检索摘要层同步过滤。
     risk_level: RiskLevel = Field(default="medium", description="模式风险等级；high 默认不能进入最终生成。")
+    # compliance_notes 保存自动规则结论和禁用表达，供再次校验。
     compliance_notes: str = Field(default="", description="模式审查备注，例如禁止承诺收益或杜绝避税避债表达。")
+    # created_at 记录模式创建时间，支持版本治理和过期策略。
     created_at: str = Field(default_factory=utc_now_iso, description="模式创建时间。")

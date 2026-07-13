@@ -56,8 +56,11 @@ class DocumentMetadata(BaseModel):
     )
     # approved_for_generation 决定该 chunk 是否允许作为最终回答证据。
     approved_for_generation: bool = Field(
-        default=True,
-        description="该片段是否允许作为最终生成证据。未审批内容应只用于分析或评估，不直接给用户。",
+        default=False,
+        description=(
+            "该片段是否允许作为最终生成证据。缺失审批字段时默认 False；"
+            "未通过生成准入的内容只用于分析或评估，不直接给用户。"
+        ),
     )
     # extra 保存暂未结构化的来源信息，例如发布时间、URL 或业务阶段。
     extra: dict[str, Any] = Field(
@@ -118,5 +121,5 @@ class MetadataFilter(BaseModel):
     # approved_only 为 True 时，只返回已经审批可用于生成的片段。
     approved_only: bool = Field(
         default=True,
-        description="是否只返回 approved_for_generation=True 的片段，避免未审查资料进入最终回答。",
+        description="是否只返回 approved_for_generation=True 的片段，避免未准入资料进入最终回答。",
     )

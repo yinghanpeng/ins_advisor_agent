@@ -34,6 +34,7 @@ class RuleBasedToolLoopPlanner:
         """输出下一步工具决策；已有成功工具结果时结束循环。"""
         # 如果上下文规划已经声明不需要工具，直接结束，避免误调 summarizer 兜底工具。
         if not state.context_needs.get("tool"):
+            # 返回结构化工具循环决策，调用方将按 action 执行或停止。
             return ToolLoopDecision(
                 action="finish",
                 finish_reason="context_needs.tool is false",
@@ -42,6 +43,7 @@ class RuleBasedToolLoopPlanner:
             )
         # 如果有成功工具结果，说明现有证据已足够进入知识融合和生成阶段。
         if any(item.get("status") == "success" for item in state.tool_results):
+            # 返回结构化工具循环决策，调用方将按 action 执行或停止。
             return ToolLoopDecision(
                 action="finish",
                 finish_reason="successful_tool_observation_available",
@@ -50,6 +52,7 @@ class RuleBasedToolLoopPlanner:
             )
         # 如果工具已失败且当前请求不允许继续重试，由 loop 外层根据预算决定停止或降级。
         if state.tool_results and all(item.get("status") != "success" for item in state.tool_results):
+            # 返回结构化工具循环决策，调用方将按 action 执行或停止。
             return ToolLoopDecision(
                 action="finish",
                 finish_reason="only_failed_tool_observations_available",
@@ -58,7 +61,9 @@ class RuleBasedToolLoopPlanner:
             )
         # 复用现有 ToolRouter 选择白名单工具；route 返回 None 时结束并走保守回答。
         spec = self.router.route(state.input_text)
+        # 没有任何注册工具匹配时返回 finish，不能用未注册名称或摘要工具强行兜底。
         if spec is None:
+            # 返回结构化工具循环决策，调用方将按 action 执行或停止。
             return ToolLoopDecision(
                 action="finish",
                 finish_reason="no_registered_tool_matched",
@@ -88,11 +93,13 @@ class ModelToolLoopPlanner:
         """尝试用模型输出工具决策；不可用或非法时返回 None。"""
         # 没有模型客户端时明确返回 None，让调用方走 RuleBasedToolLoopPlanner。
         if self.model_client is None:
+            # 记录本节点的可审计追踪事件，便于还原本轮路由与状态变化。
             state.add_trace_event(
                 "tool_loop_model_planner_unavailable",
                 iteration_index=iteration_index,
                 reason="model_client_not_configured",
             )
+            # 返回 None 明确通知调用方模型 Planner 不可用，应按配置选择规则兜底。
             return None
         # 第一版不强行接入真实模型 planner，避免引入网络依赖和隐藏推理链。
         state.add_trace_event(
@@ -100,6 +107,7 @@ class ModelToolLoopPlanner:
             iteration_index=iteration_index,
             reason="model_planner_adapter_not_enabled",
         )
+        # 返回 None 表示适配器主动跳过模型决策，不能把缺失输出当成工具计划。
         return None
 
 
@@ -111,11 +119,15 @@ def build_tool_loop_planner(state: AgentState) -> ToolLoopPlanner:
     fallback_to_rule = bool(state.tool_loop_config.get("fallback_to_rule_router", True))
     # 当前本地环境不注入模型客户端，因此只记录模型不可用并返回规则 planner。
     if enable_model:
+        # 模型 Planner 适配器返回 None 表示不可用，不代表失败或可以自由猜工具。
         model_decision = ModelToolLoopPlanner().try_decide(state, iteration_index=0)
+        # 只有获得结构化非空决策时才包装为静态 Planner。
         if model_decision is not None:
+            # 用静态 Planner 封装已校验的模型决策，避免后续轮次重新请求模型。
             return _StaticDecisionPlanner(model_decision)
     # 不允许规则兜底时返回一个只会 finish 的 planner，避免伪造工具计划。
     if not fallback_to_rule:
+        # 返回 _FinishOnlyPlanner 构造的结构化结果，供调用方继续处理。
         return _FinishOnlyPlanner()
     # 默认使用规则 planner，保证本地测试和 main.py 可运行。
     return RuleBasedToolLoopPlanner()
@@ -126,10 +138,12 @@ class _StaticDecisionPlanner:
 
     def __init__(self, decision: ToolLoopDecision) -> None:
         """保存已校验的模型决策。"""
+        # 保存实例依赖 decision，供后续方法在同一生命周期内复用。
         self.decision = decision
 
     def decide(self, state: AgentState, *, iteration_index: int) -> ToolLoopDecision:
         """返回已保存决策；调用方仍会做预算和工具 guardrail。"""
+        # 返回当前分支计算结果，供调用方继续路由、校验或响应组装。
         return self.decision
 
 
@@ -138,6 +152,7 @@ class _FinishOnlyPlanner:
 
     def decide(self, state: AgentState, *, iteration_index: int) -> ToolLoopDecision:
         """直接结束工具循环，避免模型缺失时编造工具结果。"""
+        # 返回结构化工具循环决策，调用方将按 action 执行或停止。
         return ToolLoopDecision(
             action="finish",
             finish_reason="planner_unavailable_and_rule_fallback_disabled",

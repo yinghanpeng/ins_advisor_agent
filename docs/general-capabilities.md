@@ -2,7 +2,7 @@
 
 通用能力层提供所有业务 Skill 都可以复用的能力。
 
-## 当前能力槽位
+## 当前能力清单
 
 - Web Search；
 - Web Page Reader；
@@ -33,4 +33,3 @@
 - `file_parser.py`。
 
 生产接入时只需要替换 adapter 内部实现，不需要改 Agent Core 的路由边界。
-

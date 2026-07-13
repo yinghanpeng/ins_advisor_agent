@@ -1,5 +1,6 @@
 from agent_core.graph.nodes import load_business_memory, restore_memory
 from agent_core.graph.state import AgentState
+from agent_core.guardrails.metadata import TRUSTED_BUSINESS_IDENTITY_FLAG
 from agent_core.memory.business_schemas import CustomerProfileFact, OpportunityCase
 from agent_core.memory.business_store import InMemoryBusinessMemoryStore
 from agent_core.memory.manager import MemoryLayer, MemoryManager
@@ -83,9 +84,14 @@ def test_business_memory_recall_uses_hybrid_rerank_for_relevant_customer_fact() 
         tenant_id="tenant_a",
         session_id="session_a",
         input_text="这个客户喜欢银行理财，我怎么低压切入",
-        workflow_name="insurance_kyc_coach_workflow",
+        intent="insurance_break_ice",
         domain_skill="insurance_advisor",
-        metadata={"advisor_id": "advisor_a", "customer_id": "customer_a", "conversation_id": "session_a"},
+        metadata={
+            TRUSTED_BUSINESS_IDENTITY_FLAG: True,
+            "advisor_id": "advisor_a",
+            "customer_id": "customer_a",
+            "conversation_id": "session_a",
+        },
     )
 
     load_business_memory(state, store)

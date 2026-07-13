@@ -12,9 +12,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent_core.graph.state import AgentNode
+from agent_core.guardrails.metadata import (
+    rejected_public_metadata_keys,
+    unknown_public_metadata_keys,
+)
 
 
 class StepRetryPolicy(BaseModel):
@@ -35,10 +39,10 @@ class StepRetryPolicy(BaseModel):
         default=0.2,
         description="两次重试之间的基础等待秒数。本地实现保持轻量，生产可替换为指数退避。",
     )
-    # 定义失败后进入哪个恢复状态，通常是 RECOVERY 或 HUMAN_APPROVAL。
+    # 定义失败后进入哪个恢复状态，通常是 RECOVERY 或 ERROR。
     recovery_state: AgentNode = Field(
         default=AgentNode.RECOVERY,
-        description="该 step 失败且可恢复时进入的状态节点，通常用于降级、重试或人工审批。",
+        description="该 step 失败且可恢复时进入的状态节点，通常用于降级、重试或安全终止。",
     )
 
 
@@ -100,10 +104,10 @@ class WorkflowStepContract(BaseModel):
 class WorkflowContract(BaseModel):
     """Named workflow contract used by Agent Core and Dify documentation."""
 
-    # 工作流名称用于区分通用 Agent、保险顾问、销售语料导入等不同图。
+    # name 标识一组可复用节点契约；保险在线路由不再通过该名称选择执行图。
     name: str = Field(
         ...,
-        description="工作流名称。用于区分通用 Agent、保险顾问、销售语料导入等不同执行图。",
+        description="节点契约集合名称。在线保险请求不使用它选择执行路径。",
     )
     # entry_state 声明这条工作流从哪个状态机节点开始。
     entry_state: AgentNode = Field(
@@ -123,6 +127,7 @@ class WorkflowContract(BaseModel):
 
 
 class AgentRunRequest(BaseModel):
+    """公开 Agent 请求契约，限制主体字段和 default-deny metadata。"""
     # input 是外部调用进入 Agent 的原始用户问题。
     input: str = Field(
         ...,
@@ -144,24 +149,54 @@ class AgentRunRequest(BaseModel):
         default="local",
         description="租户 ID。用于企业、团队或渠道隔离，避免跨租户读取记忆和知识库。",
     )
-    # workflow_name 允许调用方指定工作流，默认走通用 Agent 主链路。
+    # workflow_name 为旧 Dify/API 客户端保留；当前统一执行图不会按它分叉保险逻辑。
     workflow_name: str = Field(
         default="universal_agent_workflow",
-        description="希望执行的工作流名称。未指定时走通用 Agent 工作流。",
+        description="兼容运行标签，默认 universal_agent_workflow；不参与保险意图或 Handler 选择。",
     )
-    # domain_skill 可强制指定业务 Skill，也可留空让路由器自动判断。
+    # domain_skill 是调用提示和响应字段，不能绕过 Input Guardrail 或意图白名单。
     domain_skill: str | None = Field(
         default=None,
-        description="显式指定的业务 Skill，例如 insurance_advisor；为空时由路由器自动判断。",
+        description="可选领域提示；最终 Skill 仍由安全检查后的白名单意图路由决定。",
     )
-    # metadata 保存调用端和实验信息，避免为了调试字段不断修改核心契约。
+    # metadata 只保存不参与生成或数据选行的调用端信息；知识正文、新闻和业务 ID 都受保护。
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="请求扩展信息，例如 client=dify、channel=api、debug=true 或实验分组。",
+        description=(
+            "请求扩展信息，仅允许 source、client、channel、experiment_group、eval_id、request_id、locale。"
+            "公开请求不得通过该字段注入知识、新闻、对话模式、业务记录 ID 或内部信任标志。"
+        ),
     )
+
+    @field_validator("metadata")
+    @classmethod
+    def reject_protected_public_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """拒绝可影响生成内容或业务记录选择的客户 metadata 键。"""
+
+        # 校验发生在公开请求契约边界；一旦发现受保护键，整次请求直接验证失败，
+        # 而不是静默删除后继续运行，便于调用端发现误用或攻击并留下标准 422 记录。
+        rejected_keys = rejected_public_metadata_keys(value)
+        # 受保护键可以改变生成内容或业务记录选择，发现任一项就拒绝整个公开请求。
+        if rejected_keys:
+            # 错误只列键名，不回显恶意正文，避免把注入内容带入 API 日志。
+            joined_keys = ", ".join(rejected_keys)
+            # 以 Pydantic ValueError 形式返回标准请求体验证失败，不进入工作流。
+            raise ValueError(f"metadata 包含禁止的受保护字段: {joined_keys}")
+        # 对未识别键采用 default deny；否则以后新增内部 metadata 控制字段时，公开 API 会在未审计的
+        # 情况下自动获得该能力。允许列表只包含不选数据、不改流程的观测标签。
+        unknown_keys = unknown_public_metadata_keys(value)
+        # 即使键当前没有已知风险，只要不在公开允许列表中也默认拒绝。
+        if unknown_keys:
+            # 对键名排序结果做稳定拼接，同样不回显对应值。
+            joined_keys = ", ".join(unknown_keys)
+            # 抛出契约验证错误，要求调用方删除未审计扩展字段。
+            raise ValueError(f"metadata 包含未允许的字段: {joined_keys}")
+        # 返回浅拷贝，避免外部调用方在模型创建后修改原 dict，绕过本次验证结果。
+        return dict(value)
 
 
 class AgentRunResponse(BaseModel):
+    """进程内完整诊断响应；FastAPI 会进一步投影为客户安全 DTO。"""
     # trace_id 是外部排障入口，可以关联日志、LangSmith 和本地 eval 结果。
     trace_id: str = Field(
         ...,
@@ -172,7 +207,7 @@ class AgentRunResponse(BaseModel):
         ...,
         description="响应对应的会话 ID，便于调用方继续多轮对话或查询历史状态。",
     )
-    # final_state 说明本轮最终停在哪个状态，便于识别 FINAL、ERROR 或 HUMAN_APPROVAL。
+    # final_state 说明本轮最终停在哪个状态，便于识别 FINAL 或 ERROR。
     final_state: str = Field(
         ...,
         description="工作流最终状态，通常为 FINAL 或 ERROR。",
@@ -185,12 +220,27 @@ class AgentRunResponse(BaseModel):
     # intent 让前端和评估脚本知道本轮路由判断。
     intent: str | None = Field(
         default=None,
-        description="意图识别结果，例如 weather_query、break_ice_help、objection_handling。",
+        description="意图识别结果，例如 weather_query、insurance_break_ice、insurance_objection_handling。",
     )
     # domain_skill 表示实际命中的业务能力，例如 insurance_advisor。
     domain_skill: str | None = Field(
         default=None,
         description="实际命中的业务 Skill。通用问题可能为空。",
+    )
+    # intent_routing_result 暴露阈值层、来源和候选分数，便于线上评估但不包含客户槽位原值。
+    intent_routing_result: dict[str, Any] = Field(
+        default_factory=dict,
+        description="双层意图路由摘要，包含向量相似度、裁定置信度和执行档位。",
+    )
+    # active_intent 只返回控制信封，不返回 KYC 事实；前端可据此展示当前正在补充的方向。
+    active_intent: dict[str, Any] = Field(
+        default_factory=dict,
+        description="当前保险活跃意图控制状态；任务完成或取消后为空。",
+    )
+    # insurance_kyc_status 只暴露缺失字段名和分数，不返回资产、家庭等槽位值。
+    insurance_kyc_status: dict[str, Any] = Field(
+        default_factory=dict,
+        description="保险代码路径的状态摘要，不包含敏感槽位值。",
     )
     # guardrails 汇总输入、工具、输出风控结果。
     guardrails: list[dict[str, Any]] = Field(
@@ -232,10 +282,10 @@ class AgentRunResponse(BaseModel):
         default_factory=dict,
         description="Query Understanding 结果，例如指代消解、实体、时间范围、改写 query 和 filters。",
     )
-    # context_needs 解释本轮为什么需要或不需要 memory、RAG、tool、人审或拒答。
+    # context_needs 解释本轮为什么需要或不需要 memory、RAG、tool、安全降级或拒答。
     context_needs: dict[str, bool] = Field(
         default_factory=dict,
-        description="上下文需求规划结果，说明本轮是否需要 memory、rag、tool、human、reject 或 clarify。",
+        description="上下文需求规划结果，说明本轮是否需要 memory、rag、tool、safe_response、reject 或 clarify。",
     )
     # response_package 面向前端组件，比完整 AgentState 更轻。
     response_package: dict[str, Any] = Field(
@@ -264,43 +314,142 @@ class AgentRunResponse(BaseModel):
     )
 
 
+class PublicAgentRunResponse(BaseModel):
+    """Customer-safe HTTP response separated from the internal diagnostic DTO."""
+
+    # trace_id 允许客服关联服务端日志，但不会把完整 trace payload 暴露给客户。
+    trace_id: str = Field(..., description="供客户反馈问题时关联服务端日志的追踪 ID。")
+    # session_id 用于继续下一轮；生产环境必须使用网关签发且绑定登录主体的值。
+    session_id: str = Field(..., description="下一轮继续会话使用的 ID；生产部署必须由网关绑定到登录主体。")
+    # final_state 只暴露最终状态，不泄露内部节点迁移路径。
+    final_state: str = Field(..., description="本轮终态，通常为 FINAL 或 ERROR。")
+    # answer 在封装响应前已经通过输出 PII 扫描和合规检查。
+    answer: str = Field(..., description="已经过输出 PII 与合规检查的客户可读回答。")
+    # intent 供 UI 展示路由结果，但不携带向量候选或模型置信分。
+    intent: str | None = Field(default=None, description="本轮最终意图标签；不包含内部候选和分数。")
+    # domain_skill 只返回最终命中的能力标签，不暴露内部领域路由过程。
+    domain_skill: str | None = Field(default=None, description="本轮实际命中的领域 Skill。")
+    # active_intent 仅包含字段名和控制时间，不包含任何 KYC 实际值。
+    active_intent: dict[str, Any] = Field(
+        default_factory=dict,
+        description="保险多轮控制信封，只包含意图状态、待问字段名、已问字段名和过期时间。",
+    )
+    # insurance_kyc_status 只保留完整度控制信息，不返回家庭或资产答案。
+    insurance_kyc_status: dict[str, Any] = Field(
+        default_factory=dict,
+        description="保险 KYC 状态摘要，只包含信息状态、缺失字段名、已问字段名和轮次。",
+    )
+    # citations 只返回证据标识，实际检索片段正文继续保留在服务端。
+    citations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="脱敏引用标识，只包含 source/chunk/risk 等轻量字段，不返回知识正文。",
+    )
+    # next_actions 是前端可直接展示的低风险后续建议列表。
+    next_actions: list[str] = Field(default_factory=list, description="前端可展示的低风险下一步建议。")
+    # warnings 汇总可公开的证据不足、降级和合规改写提示。
+    warnings: list[str] = Field(default_factory=list, description="证据不足、降级或合规改写等公开提示。")
+    # clarification_question 只在本轮需要继续补充信息时返回单个问题。
+    clarification_question: str | None = Field(
+        default=None,
+        description="低置信或参数缺失时需要客户补充的一句澄清问题。",
+    )
+
+    @classmethod
+    def from_internal(cls, response: AgentRunResponse) -> "PublicAgentRunResponse":
+        """Project an internal response into the default-deny customer contract."""
+
+        # response_package 在输出检查后生成，内部 citations/next_actions 已经过安全整理；
+        # 此处刻意忽略工具卡、trace、检索正文、Query 改写、成本和模型评估细节。
+        package = response.response_package
+        # 活跃意图置信度/来源和 KYC 机会分/完整度分属于内部客户画像，不能返回客户；
+        # 下面只投影 UI 继续多轮所需的控制字段。
+        safe_active_intent = {
+            # 对固定允许列表逐项取值，新增内部字段不会自动进入公开响应。
+            key: response.active_intent[key]
+            for key in ["intent", "status", "pending_focus", "asked_focuses", "expires_at"]
+            # 仅包含内部响应实际存在的键，避免可选字段访问异常。
+            if key in response.active_intent
+        }
+        # 同样以默认拒绝方式投影 KYC 状态，只保留缺失字段名和轮次等控制信息。
+        safe_kyc_status = {
+            # 从内部状态读取当前白名单键对应的值。
+            key: response.insurance_kyc_status[key]
+            for key in [
+                "information_status",
+                "missing_fields",
+                "asked_focuses",
+                "kyc_question_round_count",
+            ]
+            # 忽略本次响应没有生成的可选键。
+            if key in response.insurance_kyc_status
+        }
+        # 构造客户专用 DTO；未显式列出的内部字段不会被序列化。
+        return cls(
+            trace_id=response.trace_id,
+            session_id=response.session_id,
+            final_state=response.final_state,
+            answer=response.answer,
+            intent=response.intent,
+            domain_skill=response.domain_skill,
+            active_intent=safe_active_intent,
+            insurance_kyc_status=safe_kyc_status,
+            citations=list(package.get("citations") or []),
+            next_actions=list(package.get("next_actions") or []),
+            warnings=list(package.get("warnings") or []),
+            clarification_question=package.get("clarification_question"),
+        )
+
+
 class EvalCase(BaseModel):
+    """离线评估样本契约，声明输入、预期路径和通过/失败规则。"""
+    # id 是离线评估样本的稳定主键，便于失败定位和报告关联。
     id: str = Field(..., description="评估样本 ID。用于定位失败 case 和生成评估报告。")
+    # type 表示该样本主要验证的能力类别，供 evaluator 选择附加断言。
     type: str = Field(..., description="评估类型，例如 route、guardrail、rag、sales_quality 或 recovery。")
+    # input 是送入完整 Agent 链路的原始测试文本。
     input: str = Field(..., description="喂给 Agent 的用户输入，用于复现完整工作流。")
+    # initial_state 允许测试预置画像、metadata 或预算，但生产请求不会使用该入口。
     initial_state: dict[str, Any] = Field(
         default_factory=dict,
         description="评估开始前预置到 AgentState 的状态字段，例如 profile、metadata 或 cost。",
     )
+    # expected_state 声明预期终态，None 表示该样本不检查状态名称。
     expected_state: str | None = Field(
         default=None,
-        description="期望最终进入的状态名称，例如 FINAL、ERROR 或 HUMAN_APPROVAL。",
+        description="期望最终进入的状态名称，例如 FINAL 或 ERROR。",
     )
+    # expected_tools 列出预期实际执行的工具，空列表表示不强制检查工具集合。
     expected_tools: list[str] = Field(
         default_factory=list,
         description="期望调用的工具名称列表。用于验证工具路由和权限控制。",
     )
+    # expected_sales_intelligence_route 验证销售智能内部路由标签是否符合预期。
     expected_sales_intelligence_route: str | None = Field(
         default=None,
         description="期望命中的销售智能路由，例如 break_ice、kyc_question、objection_handling。",
     )
+    # must_include 保存最终答案至少应命中的关键文本集合。
     must_include: list[str] = Field(
         default_factory=list,
         description="最终回答中必须包含的关键词或关键表达。",
     )
+    # must_not_include 保存最终答案绝不能出现的高风险或错误表达。
     must_not_include: list[str] = Field(
         default_factory=list,
         description="最终回答中禁止出现的词语，例如保证收益、避税避债等高风险表达。",
     )
+    # expected_guardrail 指定必须命中的风控规则；None 时不做单规则断言。
     expected_guardrail: str | None = Field(
         default=None,
         description="期望触发的风控规则名称。为空表示该样本不强制要求触发特定规则。",
     )
+    # expected_trace_fields 列出结构化 trace 必须包含的字段名称。
     expected_trace_fields: list[str] = Field(
         default_factory=list,
         description="trace_events 中必须出现的字段名，用于验证可观测性是否完整。",
     )
+    # pass_fail_rules 保存当前 evaluator 尚未结构化表达的附加离线判定说明。
     pass_fail_rules: list[str] = Field(
         default_factory=list,
-        description="该样本额外的通过/失败规则说明，供本地 evaluator 或人工复核使用。",
+        description="该样本额外的通过/失败规则说明，供本地 evaluator 或离线质量评估使用。",
     )

@@ -15,11 +15,12 @@
 ## 2. Workflow Step Contract
 
 - 代码：`src/agent_core/workflow/contracts.py`
-- 代码：`src/agent_core/workflow/steps.py`
+- 代码：`src/agent_core/graph/builder.py`
+- 代码：`src/agent_core/graph/nodes.py`
 - 文档：`docs/workflow.md`
 - 测试：`tests/test_production_contracts.py`
 
-说明：`WorkflowStepContract` 明确每个 step 的输入、输出、允许下一状态、guardrails、工具权限、重试策略和 trace 字段。
+说明：`WorkflowStepContract` 保留为节点契约模型；原 `workflow/steps.py` 已删除，实际执行顺序只由 `AgentGraph` 和节点函数定义，避免声明配置与运行代码出现两套真相。
 
 ## 3. Tool Schema 和权限等级
 
@@ -30,7 +31,7 @@
 - 文档：`docs/tool-system.md`
 - 测试：`tests/test_tools_and_cost.py`
 
-说明：`ToolSpec` 包含 input schema、output schema、risk level、permission level、scope、side effect、approval、retry、timeout、error schema。
+说明：`ToolSpec` 包含 input schema、output schema、risk level、permission level、scope、side effect、retry、timeout、error schema。客户渠道不支持待审批动作：只读且获准的工具可以执行，写入、外部动作、金融动作或越权工具同步拒绝。
 
 ## 4. RAG Query Rewrite / Hybrid Search / Metadata / Rerank
 
@@ -41,7 +42,7 @@
 - 代码：`src/agent_core/rag/vector.py`
 - 代码：`src/agent_core/sales_intelligence/retriever.py`
 - 文档：`docs/rag.md`
-- 测试：`tests/test_rag_hybrid_memory_approval.py`
+- 测试：`tests/test_rag_hybrid_memory.py`
 
 说明：当前实现为本地 deterministic hybrid retriever，融合 lexical score、local vector-like score、metadata score，并支持 library、tag、risk、approved filter。生产扩展路径是替换 `HybridRetriever` 内部实现为 Elasticsearch / OpenSearch + Vector DB + reranker model。
 
@@ -53,9 +54,13 @@
 - 代码：`src/agent_core/memory/manager.py`
 - 代码：`src/agent_core/memory/policy.py`
 - 文档：`docs/memory.md`
-- 测试：`tests/test_rag_hybrid_memory_approval.py`
+- 测试：`tests/test_rag_hybrid_memory.py`
 
-说明：`MemoryManager` 统一访问 session/task/preference 三层 memory，并记录 audit log。生产扩展路径是将底层 map 替换为 Redis/Postgres/tenant-isolated storage。
+说明：本地测试继续使用 `MemoryManager`；FastAPI lifespan 已注入 `ProductionMemoryManager`：Session/Task
+使用 Redis TTL、容量限制和 CAS，Preference 使用 PostgreSQL 真 Upsert 和独立 Embedding 表，业务记忆
+使用 `PostgresBusinessMemoryStore`。数据库启用 RLS、复合租户外键、原文/证据字段加密、Consent、
+Retention、用户导出/删除和 Proposal Unit of Work。规范化 KYC 与 Session/Analysis JSONB 当前依靠
+RLS + Consent，不属于应用层密文，详见 `docs/memory-system.md` 的数据边界。
 
 ## 6. Context Builder
 
@@ -70,21 +75,25 @@
 ## 7. Prompt Injection 防护
 
 - 代码：`src/agent_core/guardrails/prompt_injection.py`
+- 代码：`src/agent_core/guardrails/insurance_input.py`
 - 代码：`src/agent_core/guardrails/input.py`
 - 代码：`src/agent_core/graph/nodes.py`
 - 文档：`docs/guardrails.md`
 - 测试：`tests/test_trace_and_security.py`
+- 测试：`tests/test_input_guardrail_hardening.py`
 
-说明：输入进入 `CLASSIFY_INTENT` 时先执行 Input Guardrail，命中越权/注入模式会直接进入 `ERROR`。
+说明：输入进入 `CLASSIFY_INTENT` 时先执行 Input Guardrail。规则层先做 HTML/URL/Unicode/零宽字符归一化，
+再扫描确定性动作短语、软可疑短语、伪造指令结构、Base64/Hex 编码和 Typoglycemia 变体；弱信号按分值
+聚合后才进入 LLM Judge。保险业务违规和代操作请求使用独立类别，避免与 Prompt Injection 混淆。
 
-## 8. Human Approval 机制
+## 8. 高风险同步阻断与降级
 
-- 代码：`src/agent_core/guardrails/human_approval.py`
+- 代码：`src/agent_core/guardrails/input.py`
+- 代码：`src/agent_core/guardrails/tool_guardrails.py`
 - 代码：`src/agent_core/graph/nodes.py`
-- 文档：`docs/human-in-the-loop.md`
-- 测试：`tests/test_rag_hybrid_memory_approval.py`
+- 测试：`tests/test_input_guardrail_hardening.py`
 
-说明：当前实现包含审批请求、审批决定和内存审批队列。生产扩展路径是接入审批数据库、运营后台和通知系统。
+说明：客户系统不会创建待审批任务。输入高风险代操作请求返回安全替代说明，非只读工具直接 deny，高风险输出当场改写。
 
 ## 9. Structured Trace Log
 
@@ -96,7 +105,10 @@
 - 文档：`docs/langsmith-integration.md`
 - 测试：`tests/test_trace_and_security.py`
 
-说明：每个状态迁移写入 `state_transitions` 和 `trace_events`，`WorkflowEngine` 将其写入本地结构化日志。LangSmith 是可选增强层。
+说明：每个状态迁移写入 `state_transitions` 和 `trace_events`，`WorkflowEngine` 将其写入本地结构化日志；启用
+LangSmith 后还会创建一个根 Run 和动态节点子 Run。可选择控制面或完整业务内容，完整模式包含状态前后快照、
+模型、工具、RAG、Prompt 和回答；认证凭据始终递归清除。SDK 异步批量发送，关闭时有限等待 flush，远端失败
+不会阻断客户请求。上线前仍需确定客户授权、Workspace 权限、采样率、保留周期和告警策略。
 
 ## 10. Eval Dataset
 
@@ -133,7 +145,7 @@
 - 节点说明：`dify/nodes/*.md`
 - 代码：`src/agent_core/integrations/dify_webhook.py`
 
-说明：Dify 是 Control Plane，通过 HTTP 节点调用 Agent Gateway。
+说明：Dify 是可选调用端，通过 HTTP 节点调用 Agent Gateway。保险意图、KYC、双知识库和策略均在 Python 中执行，Dify Workflow 不能选择或绕过保险路由。
 
 ## 14. 面试讲解文档
 
@@ -148,17 +160,17 @@
 
 - 注释：所有 Python 模块有 module docstring，关键类/函数有 docstring。
 - 日志：`StructuredLogger` 输出 JSON 日志，状态迁移和 trace event 会被写入本地日志。
-- 测试：`tests/` 覆盖 schema、pipeline、retrieval、guardrails、tools、cost、workflow、trace、安全、审批和 memory。
+- 测试：`tests/` 覆盖 schema、pipeline、retrieval、guardrails、tools、cost、workflow、trace、安全、同步阻断和 memory。
 - 文档：`docs/logging-and-comments-policy.md`
 
 当前限制：
 
-- 外部模型、真实搜索、真实向量库、真实 LangSmith 远程写入都需要密钥、网络和服务配置。
-- 当前替代方案是 adapter + mock/local deterministic implementation。
+- 外部模型、真实搜索、真实向量库和 LangSmith 远程写入都需要各自的密钥、网络和服务配置。
+- LangSmith 运行时 Run Tree 已实现；Dataset/Experiment 自动执行仍是评估扩展项。
 - 接口预留已经在 capabilities、rag、observability、integrations 中完成。
 - 后续扩展时替换 adapter 内部实现，不需要重写 Agent Core 边界。
 
-## 16. Agentic 工具有界循环
+## 16. 单轮工具链与 Agentic 实验能力
 
 - 代码：`src/agent_core/agentic_loop/schemas.py`
 - 代码：`src/agent_core/agentic_loop/planner.py`
@@ -166,7 +178,9 @@
 - 文档：`docs/agentic-tool-loop.md`
 - 测试：`tests/test_agentic_tool_loop.py`
 
-说明：通用工具链从单次 `general_tool_routing → general_tool_call → verify_tool_result` 升级为 `agentic_tool_loop`。循环仍复用旧节点，但新增 `max_iterations`、`max_total_tool_calls`、重复计划检测、工具错误预算和 `_source_boundary` 校验，避免无限循环和工具结果越界。
+说明：通用主链路当前使用单次 `general_tool_routing → general_tool_call → verify_tool_result`。
+`agentic_tool_loop`、预算和重复计划检测代码只作为实验能力保留，不由 `_run_universal` 调用。
+单轮链路仍执行 ToolGuardrail、同步权限拒绝、结果清洗、`_source_boundary` 和结果校验；不存在 Human Approval 或挂起分支。
 
 ## 17. Clarify 短路分支
 
@@ -175,7 +189,7 @@
 - 文档：`docs/clarify-and-interrupt.md`
 - 测试：`tests/test_clarify_branch.py`
 
-说明：`context_need_planning` 写入 `context_needs["clarify"]` 后，`_run_universal` 会在工具、RAG 和生成前直接调用 `generate_clarification_response`，再执行 `response_packaging → trace_finalize → return`。这避免缺槽位时误检索、误调用工具或让模型猜事实。
+说明：通用工具选定后，`general_tool_routing` 使用该工具的 `input_schema` 校验参数；缺参会写入 `context_needs["clarify"]`，并在执行器和生成前调用 `generate_clarification_response → response_packaging → trace_finalize → return`。KYC 缺失信息则继续由 `missing_fields` 和专用补问节点管理。
 
 ## 18. Evaluator-Optimizer 有界闭环
 
@@ -202,3 +216,15 @@
 - 测试：`tests/test_output_pii_scan.py`
 
 说明：输入 PII 扫描保护的是用户输入进入记忆、工具和模型之前的边界；输出 PII 扫描保护的是最终答案返回前的边界。它会脱敏手机号、身份证、邮箱、微信、银行卡和精确地址，只在 trace 中记录 PII 类型和位置摘要，不保存原始敏感文本。
+
+## 21. 双层意图路由与代码化保险处理器
+
+- 代码：`src/agent_core/intents/knowledge_base.py`
+- 代码：`src/agent_core/intents/router.py`
+- 代码：`src/agent_core/skills/insurance_advisor/kyc.py`
+- 代码：`src/agent_core/skills/insurance_advisor/knowledge.py`
+- 配置：`configs/intent_routing.yaml`、`configs/intent_catalog.yaml`、`configs/insurance_handler.yaml`
+- 文档：`docs/intent-routing-and-insurance-handler.md`
+- 测试：`tests/test_intent_routing.py`、`tests/test_kyc_workflow_contract.py`
+
+说明：向量相似度按 `0.85/0.60` 分层，LLM 裁定后按 `0.80/0.60` 分发；Redis active intent 优先处理续接和换题。保险 KYC 只抽本轮明确增量，Python 负责合并、缺口、轮次和路由；方法库与合同合规库独立检索。所有阈值、TopK、TTL、模型和 Provider 都来自配置文件或环境变量。

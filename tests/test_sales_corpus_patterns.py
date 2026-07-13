@@ -3,7 +3,7 @@ from agent_core.sales_intelligence.schemas import CorpusMessage, DialoguePattern
 
 
 def test_unapproved_dialogue_pattern_does_not_enter_generation_digest() -> None:
-    """未审批模式不能进入最终生成摘要。"""
+    """未通过生成准入的模式不能进入最终生成摘要。"""
     approved = DialoguePattern(
         tenant_id="tenant_a",
         pattern_type="objection_handling",

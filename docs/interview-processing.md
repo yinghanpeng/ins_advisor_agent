@@ -11,7 +11,7 @@
 5. `extract_structured_insight`：抽取结构化销售洞察卡片；
 6. `review_card`：做合规审查；
 7. `SalesInsightIndexer.save`：保存卡片；
-8. `SalesIntelligenceRetriever.retrieve`：检索已审核卡片；
+8. `SalesIntelligenceRetriever.retrieve`：检索通过生成准入的卡片；
 9. `build_sales_insight_digest`：压缩为生成可用 digest；
 10. `generate_eval_case`：生成评估样本。
 
@@ -23,6 +23,5 @@
 - JSON Schema 校验；
 - JSON repair；
 - 合规模型或规则审查；
-- 人工抽样审核；
+- 自动脱敏、风险与合规生成准入；
 - 持久化索引。
-

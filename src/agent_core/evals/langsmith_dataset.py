@@ -9,5 +9,7 @@ from agent_core.workflow.contracts import EvalCase
 
 
 def to_langsmith_examples(cases: list[EvalCase]) -> list[dict]:
-    return [{"inputs": {"input": case.input}, "outputs": case.model_dump()} for case in cases]
+    """把内部 EvalCase 列表转换为 LangSmith examples 的输入输出结构。"""
 
+    # inputs 只暴露待测用户输入，outputs 保留完整期望约束用于各类 evaluator。
+    return [{"inputs": {"input": case.input}, "outputs": case.model_dump()} for case in cases]

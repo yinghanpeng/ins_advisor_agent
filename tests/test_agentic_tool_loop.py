@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from agent_core.agentic_loop.schemas import ToolLoopDecision
 from agent_core.graph import nodes
-from agent_core.graph.state import AgentNode, AgentState
+from agent_core.graph.state import AgentState
 from agent_core.tools.schemas import ToolCall
 from agent_core.workflow.contracts import AgentRunRequest
 from agent_core.workflow.engine import WorkflowEngine
@@ -10,14 +10,18 @@ from agent_core.workflow.engine import WorkflowEngine
 
 def test_tool_task_enters_agentic_tool_loop() -> None:
     """工具任务应进入 agentic_tool_loop，并保留旧工具节点路径。"""
+    # 补充说明：主链路现已恢复单轮 routing/call/verify，本测试改为防止 Agentic Loop 被误接回。
     response = WorkflowEngine().run(AgentRunRequest(input="计算 12*8+3"))
 
     path = [item["to_state"] for item in response.state_transitions]
-    assert "AGENTIC_TOOL_LOOP" in path
+    assert "AGENTIC_TOOL_LOOP" not in path
     assert "GENERAL_TOOL_CALL" in path
     assert "VERIFY_TOOL_RESULT" in path
     assert response.tool_results[0]["output"]["_source_boundary"]["trust"] == "untrusted_external_context"
-    assert any(event["event"] == "node_finished" and event.get("node_name") == "agentic_tool_loop" for event in response.trace_events)
+    assert not any(
+        event["event"] == "node_finished" and event.get("node_name") == "agentic_tool_loop"
+        for event in response.trace_events
+    )
 
 
 class UniquePlanner:
@@ -88,8 +92,8 @@ def test_repeated_tool_plan_stops_loop(monkeypatch) -> None:
     assert result.tool_loop_iterations[-1]["stop_reason"] == "repeated_tool_plan"
 
 
-def test_tool_human_approval_returns_immediately(monkeypatch) -> None:
-    """工具触发 HUMAN_APPROVAL 时，agentic_tool_loop 立即返回。"""
+def test_denied_tool_is_blocked_and_degraded_without_pending_state(monkeypatch) -> None:
+    """工具被策略拒绝时同步阻断并降级，不进入挂起状态。"""
     monkeypatch.setattr(nodes, "_build_tool_loop_planner", lambda _state: RepeatedPlanner())
 
     class BlockingGuardrail:
@@ -97,18 +101,19 @@ def test_tool_human_approval_returns_immediately(monkeypatch) -> None:
             return {
                 "guardrail_name": "tool_permission",
                 "triggered": True,
-                "reason": "approval_required_for_test",
-                "action": "human_approval",
+                "reason": "side_effect_not_allowed",
+                "action": "deny",
             }
 
     monkeypatch.setattr(nodes, "ToolGuardrail", lambda: BlockingGuardrail())
-    state = AgentState(input_text="需要审批的工具", context_needs={"tool": True})
+    state = AgentState(input_text="不允许执行的工具", context_needs={"tool": True})
 
     result = nodes.agentic_tool_loop(state)
 
-    assert result.current_state == AgentNode.HUMAN_APPROVAL
-    assert result.tool_loop_stop_reason == "human_approval"
-    assert result.answer == "该工具调用需要人工确认后才能继续。"
+    assert result.final_state is None
+    assert result.tool_results[0]["status"] == "blocked"
+    assert result.tool_loop_stop_reason in {"repeated_tool_plan", "tool_error_budget_exceeded"}
+    assert "降级" in (result.answer or "")
 
 
 def test_failed_tool_result_is_verified_and_degraded() -> None:
@@ -123,8 +128,9 @@ def test_failed_tool_result_is_verified_and_degraded() -> None:
 
 def test_no_model_planner_falls_back_to_rule_based_without_fake_fact() -> None:
     """没有模型 planner 时回退规则路由，不能伪造外部事实。"""
+    # 补充说明：主链路不再创建 Planner；规则 ToolRouter 直接生成一次性工具计划。
     response = WorkflowEngine().run(AgentRunRequest(input="计算 12*8+3"))
 
     assert response.answer == "计算结果是：99。"
-    assert any(event["event"] == "tool_loop_model_planner_unavailable" for event in response.trace_events)
+    assert not any(event["event"] == "tool_loop_model_planner_unavailable" for event in response.trace_events)
     assert response.tool_results[0]["name"] == "calculator"

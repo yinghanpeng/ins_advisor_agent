@@ -33,8 +33,6 @@ class ToolLoopStopReason(StrEnum):
     REPEATED_TOOL_PLAN = "repeated_tool_plan"
     # 工具错误超过预算，停止继续调用工具并降级。
     TOOL_ERROR_BUDGET_EXCEEDED = "tool_error_budget_exceeded"
-    # 工具触发人工审批，主链路返回 HUMAN_APPROVAL 等待恢复。
-    HUMAN_APPROVAL = "human_approval"
 
 
 class ToolLoopConfig(BaseModel):

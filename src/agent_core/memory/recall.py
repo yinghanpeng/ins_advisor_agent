@@ -46,6 +46,7 @@ from agent_core.rag.schemas import (
 )
 
 
+# MemoryRecallLayer 是允许被模型/规则选择的长期记忆白名单，未知层不得直接检索。
 MemoryRecallLayer = Literal[
     "preference",
     "customer_profile",
@@ -56,12 +57,14 @@ MemoryRecallLayer = Literal[
 ]
 
 
+# RuleDecisionStatus 表示规则层能够直接决定、直接跳过或必须交给模型的三态结果。
 RuleDecisionStatus = Literal[
     "must_recall",
     "skip_recall",
     "ambiguous",
 ]
 
+# MemoryRecallDecisionStatus 记录最终决策来源及失败降级状态，供 Trace 区分规则与模型路径。
 MemoryRecallDecisionStatus = Literal[
     "rule_must_recall",
     "rule_skip_recall",
@@ -74,35 +77,49 @@ MemoryRecallDecisionStatus = Literal[
 class MemoryRecallDecision(BaseModel):
     """长期记忆召回决策。"""
 
+    # should_recall 是检索执行器的总开关，False 时不得访问长期记忆存储。
     should_recall: bool = Field(..., description="本轮是否需要召回长期记忆。")
+    # recall_layers 是最小权限范围，检索器会映射为对应 library 过滤条件。
     recall_layers: list[MemoryRecallLayer] = Field(
         default_factory=list,
         description="本轮允许召回的长期记忆层，例如 preference、customer_profile、advisor_profile。",
     )
+    # reason 用于审计，不进入用户回答的事实依据。
     reason: str = Field(default="", description="触发或跳过长期记忆召回的原因。")
+    # queries 保存一到多条 query rewrite，并保留各自 purpose/weight。
     queries: list[RetrievalQuery] = Field(default_factory=list, description="用于长期记忆检索的 query rewrite 列表。")
+    # top_k 和阈值共同限制进入上下文的条数与最低相关度。
     top_k: int = Field(default=5, ge=1, le=20, description="长期记忆召回最多返回条数。")
     score_threshold: float = Field(default=0.08, ge=0, le=1, description="低于该最终分数的记忆不进入上下文。")
+    # status 精确标记规则、模型或失败降级路径。
     status: MemoryRecallDecisionStatus = Field(
         default="rule_skip_recall",
         description="召回决策来源或失败状态，用于审计规则和模型各自的命中情况。",
     )
+    # filters 承载系统强制的 tenant/user/session/Case 边界；模型值不能覆盖强制身份。
     filters: dict[str, Any] = Field(
         default_factory=dict,
         description="长期记忆检索 filters，例如 tenant_id、user_id、session_id、case_id、max_risk_level。",
     )
+    # confidence 表示“是否需要召回”的把握度，不是检索内容相关度。
     confidence: float = Field(default=0.0, ge=0, le=1, description="召回决策置信度。规则强命中通常接近 1。")
+    # latency_budget_ms 供调用链做超时控制和可观测性记录。
     latency_budget_ms: int = Field(default=1200, description="召回决策允许消耗的延迟预算。")
 
 
 class MemoryRecallItem(BaseModel):
     """一条经过 hybrid search 和 rerank 的长期记忆结果。"""
 
+    # layer 决定 compact_summary 写入哪个隔离分区。
     layer: MemoryRecallLayer = Field(..., description="该记忆结果所属层级。")
+    # source_id/chunk_id 是检索去重和审计回放的稳定复合标识。
     source_id: str = Field(..., description="记忆来源 ID，用于审计和回放。")
     chunk_id: str = Field(..., description="记忆片段 ID，用于定位具体事实或偏好项。")
+    # content 已被截断且应为脱敏摘要，不能使用原始长对话替代。
     content: str = Field(..., description="进入上下文前的短摘要，不应包含 PII 或原始长对话。")
+    # metadata 保存事实键、certainty 等结构化信息，用于安全压缩而非自由文本解析。
     metadata: dict[str, Any] = Field(default_factory=dict, description="记忆结果的业务 metadata，例如 fact_key、certainty。")
+    # 四类分数分别保留粗排各分量和二阶段最终分，便于解释召回排序。
     lexical_score: float = Field(default=0.0, description="关键词检索得分。")
     vector_score: float = Field(default=0.0, description="向量近似检索得分。")
     metadata_score: float = Field(default=0.0, description="metadata 匹配得分。")
@@ -112,7 +129,9 @@ class MemoryRecallItem(BaseModel):
 class MemoryRecallResult(BaseModel):
     """长期记忆召回结果。"""
 
+    # decision 原样保留，确保每组命中都能追溯到召回原因和权限范围。
     decision: MemoryRecallDecision = Field(..., description="本次召回使用的决策对象。")
+    # items 是排序后的原子候选，compact_summary 是供生成节点直接消费的分层摘要。
     items: list[MemoryRecallItem] = Field(default_factory=list, description="最终进入上下文候选的 TopK 记忆。")
     compact_summary: dict[str, Any] = Field(default_factory=dict, description="按层级压缩后的记忆摘要。")
 
@@ -120,7 +139,9 @@ class MemoryRecallResult(BaseModel):
 class MemoryRecallRuleResult(BaseModel):
     """规则引擎对长期记忆是否召回的初步判断。"""
 
+    # status 决定下一步是短路返回还是调用 memory_recall_decision 模型。
     status: RuleDecisionStatus = Field(..., description="规则判断结果：必须召回、跳过或交给模型判断。")
+    # 其余字段保存规则选出的最小层级、审计理由和检索文本。
     recall_layers: list[MemoryRecallLayer] = Field(default_factory=list, description="规则命中的召回层级。")
     reason: str = Field(default="", description="规则命中原因，用于 trace。")
     queries: list[str] = Field(default_factory=list, description="规则生成的检索 query。")
@@ -129,10 +150,13 @@ class MemoryRecallRuleResult(BaseModel):
 class MemoryRecallDecisionModelOutput(BaseModel):
     """memory_recall_decision 模型必须返回的结构化 JSON。"""
 
+    # 模型只能从受限 Schema 表达决策，不能直接执行检索或返回长期记忆内容。
     should_recall: bool = Field(..., description="模型判断是否召回长期记忆。")
+    # recall_scopes 使用 MemoryRecallLayer 白名单，非法层会由 Pydantic 拒绝。
     recall_scopes: list[MemoryRecallLayer] = Field(default_factory=list, description="允许召回的长期记忆 scope。")
     reason: str = Field(..., description="模型决策原因。")
     queries: list[str] = Field(default_factory=list, description="模型生成的长期记忆检索 query。")
+    # 模型 filters 仅是建议，系统会在返回前覆盖 tenant/user/session 强制边界。
     filters: dict[str, Any] = Field(default_factory=dict, description="模型建议的检索 filters。")
     confidence: float = Field(..., ge=0, le=1, description="模型决策置信度。")
     latency_budget_ms: int = Field(default=1200, description="模型认为本次召回可接受的延迟预算。")
@@ -163,6 +187,7 @@ class MemoryRecallRuleEngine:
     把无关长期记忆召回到当前上下文。
     """
 
+    # 显式历史引用词一旦命中，需要同时召回偏好、画像、Case 和事件层。
     explicit_history_terms = [
         "按我喜欢的风格",
         "按我之前说的",
@@ -175,11 +200,23 @@ class MemoryRecallRuleEngine:
         "不要重复问",
         "你应该知道",
     ]
+    # 代词只有同时存在已滑出短期窗口的实体锚点时才升级为长期召回。
     pronoun_terms = ["他", "她", "它", "这个客户", "刚才那个", "上次那个", "之前那个产品"]
+    # 工具类关键词用于毫秒级跳过长期记忆。
     skip_terms = ["天气", "weather", "计算", "calculator"]
+    # 个性化词触发 Preference 与客户/顾问画像层。
     personalization_terms = ["风格", "偏好", "格式", "保险偏好", "销售偏好", "从业画像", "客户画像"]
-    business_terms = ["insurance_advisor", "insurance_kyc_coach_workflow", "sales_intelligence"]
-    missing_slot_terms = [
+    # 保险相关意图/Skill 构成业务召回白名单。
+    business_terms = [
+        "insurance_advisor",
+        "insurance_break_ice",
+        "insurance_objection_handling",
+        "insurance_strategy",
+        "insurance_kyc_collection",
+        "sales_intelligence",
+    ]
+    # 只有这些可从历史事实安全补齐的缺失字段会触发额外业务召回。
+    missing_field_terms = [
         "customer_type",
         "family_status",
         "risk_preference",
@@ -204,32 +241,37 @@ class MemoryRecallRuleEngine:
         本方法目标延迟毫秒级，不调用 LLM。按优先级依次检查：
 
         1. **skip_recall** — 用户禁止、工具类意图（天气/计算）、算术表达式；
-        2. **must_recall** — 命中历史引用、多轮指代、个性化关键词、保险业务、缺失槽位；
+        2. **must_recall** — 命中历史引用、多轮指代、个性化关键词、保险业务、KYC 缺失字段；
         3. **ambiguous** — 以上均不满足，交给 ``decide_long_term_memory_recall`` 的模型层。
 
         参数:
             input_text: 用户本轮原始输入。
-            workflow_name: 当前工作流名，如 ``insurance_kyc_coach_workflow``。
+            workflow_name: 兼容请求标签；保险业务召回以 intent/domain_skill/active intent 为准。
             intent: 意图分类结果（可能为 None，restore_memory 阶段尚未 classify）。
             domain_skill: 领域 Skill，如 ``insurance_advisor``。
             session_memory: 短期 SESSION 记忆，含 last_entity / last_intent / last_case_id。
-            metadata: 请求 metadata，含 missing_slots、case_id、allow_long_term_memory 等。
+            metadata: 请求 metadata，含 KYC missing_fields、case_id、allow_long_term_memory 等。
 
         返回:
             MemoryRecallRuleResult，status 三选一：must_recall / skip_recall / ambiguous。
         """
+        # 保留原始大小写文本用于中文/精确匹配，同时构造小写副本匹配英文词。
         text = input_text.strip()
+        # 小写副本只用于不区分大小写的英文工具词匹配。
         lowered = text.lower()
 
         # ── 第一优先级：明确跳过 ──
         # 用户显式禁止，或 metadata 关闭长期记忆开关。
         if metadata.get("allow_long_term_memory") is False or "不要使用历史" in text:
+            # 返回明确跳过结果，确保后续模型层不会重新开启长期读取。
             return MemoryRecallRuleResult(status="skip_recall", reason="本轮请求或用户显式禁止读取长期记忆。")
         # 工具类意图（天气/计算）不需要个性化或业务画像。
         if intent in {"weather_query", "calculator_query"} or any(term in lowered for term in self.skip_terms):
+            # 一次性工具请求直接返回跳过，避免画像对客观结果产生无关影响。
             return MemoryRecallRuleResult(status="skip_recall", reason="一次性工具类或通用事实请求不需要长期记忆。")
         # 含运算符和数字的表达式，判定为计算请求。
         if any(symbol in text for symbol in ["+", "-", "*", "/"]) and any(char.isdigit() for char in text):
+            # 算术表达式只需要计算工具，不召回偏好或业务事实。
             return MemoryRecallRuleResult(status="skip_recall", reason="计算类请求跳过长期记忆。")
 
         # ── 第二优先级：收集 recall_layers ──
@@ -237,6 +279,7 @@ class MemoryRecallRuleEngine:
         layers: list[MemoryRecallLayer] = []
         # 用户显式引用历史：「按我之前说的」「继续上次那个客户」等 → 全层级召回。
         if any(term in text for term in self.explicit_history_terms):
+            # 显式历史请求允许召回五个用户相关长期层。
             layers.extend(["preference", "customer_profile", "advisor_profile", "case_state", "memory_event"])
         # 多轮指代：「他/这个客户」等代词命中时，是否升级为长期业务事实召回。
         #
@@ -247,29 +290,44 @@ class MemoryRecallRuleEngine:
         #    - 被指实体已在短期 recent_messages 覆盖 → 指代消解由 query_understanding 的短期逻辑完成，
         #      无需再跑一次长期 hybrid 召回（省延迟/成本，避免冗余）；
         #    - 锚点存在但已滑出短期窗口（长对话被截断 / 来自更早会话）→ 才升级为长期业务事实召回。
+        # 分别计算代词命中和实体锚点，避免把普通“他”无条件解释为跨会话引用。
         pronoun_hit = any(term in text for term in self.pronoun_terms)
+        # 优先使用最近实体，缺失时回退 Case ID 作为指代锚点。
         entity_anchor = session_memory.get("last_entity") or session_memory.get("last_case_id")
+        # 仅在有锚点且锚点不在短期消息窗口时，追加需要跨会话读取的三个业务层。
         if pronoun_hit and entity_anchor and not self._entity_in_short_term(entity_anchor, session_memory):
+            # 跨窗口指代需要客户画像、Case 和事件共同恢复上下文。
             layers.extend(["customer_profile", "case_state", "memory_event"])
         # 个性化关键词：「风格」「偏好」「客户画像」→ 偏好 + 画像层。
         if any(term in text for term in self.personalization_terms):
+            # 个性化请求追加用户偏好以及顾问/客户画像。
             layers.extend(["preference", "advisor_profile", "customer_profile"])
         # 保险领域工作流必然依赖客户/从业者/case 事实。
         if domain_skill == "insurance_advisor" or workflow_name in self.business_terms:
+            # 保险业务追加完整业务记忆和领域事实层。
             layers.extend(["customer_profile", "advisor_profile", "case_state", "memory_event", "domain_fact"])
-        # 关键槽位缺失时，尝试从长期记忆中补全（如 customer_type、budget）。
-        missing_slots = metadata.get("missing_slots") or []
-        if any(slot in missing_slots for slot in self.missing_slot_terms):
+        # KYC 业务字段缺失时，尝试从长期记忆中补全（如 customer_type、budget）。
+        # metadata 未提供缺失字段时使用空列表，不因 None 触发遍历异常。
+        missing_fields = metadata.get("missing_fields") or []
+        # 命中允许从长期记忆补齐的业务字段时，追加画像与 Case 层。
+        if any(field in missing_fields for field in self.missing_field_terms):
+            # 缺失 KYC 业务字段时追加可能已有答案的三个状态层。
             layers.extend(["customer_profile", "advisor_profile", "case_state"])
 
         # ── 第三优先级：must_recall 或 ambiguous ──
         if layers:
             # 生成多条 retrieval query：原始输入 + last_entity 增强 + case_id 增强。
+            # 原始输入始终是第一条 Query，实体和 Case 信息按存在性追加增强 Query。
             queries = [text]
+            # 存在实体锚点时追加实体增强 Query，提高客户画像命中率。
             if session_memory.get("last_entity"):
+                # 将实体与原输入拼接为第二条检索文本。
                 queries.append(f"{session_memory['last_entity']} {text}")
+            # 存在 Case 标识时追加 Case 增强 Query，提高任务状态命中率。
             if metadata.get("case_id") or metadata.get("opportunity_case_id"):
+                # 将可用 Case ID 与原输入拼接为第三条检索文本。
                 queries.append(f"case {metadata.get('case_id') or metadata.get('opportunity_case_id')} {text}")
+            # 返回按出现顺序去重后的层级和全部增强 Query。
             return MemoryRecallRuleResult(
                 status="must_recall",
                 recall_layers=list(dict.fromkeys(layers)),  # 去重并保持插入顺序
@@ -300,13 +358,19 @@ class MemoryRecallRuleEngine:
         """
         # 锚点为空时无法判定覆盖，交由上游按"无锚点"处理。
         anchor = str(entity_anchor).strip()
+        # 空锚点没有可搜索的实体文本，直接视为短期未覆盖。
         if not anchor:
+            # 空锚点无法在消息中确认覆盖，因此返回 False。
             return False
         # 逐条扫描最近消息，只要有一条文本包含该实体，即认为短期上下文已覆盖。
         for message in session_memory.get("recent_messages") or []:
+            # 字典消息读取 content，异常类型视为无正文。
             content = message.get("content") if isinstance(message, dict) else None
+            # 任一消息正文包含完整锚点即可确认短期窗口已覆盖该实体。
             if content and anchor in str(content):
+                # 找到任一覆盖消息后立即返回 True，无需继续扫描窗口。
                 return True
+        # 扫描完成仍未命中说明实体已经滑出或从未出现在短期窗口。
         return False
 
 
@@ -328,7 +392,9 @@ def plan_long_term_memory_recall(
     该函数保留给现有调用方使用。生产链路应优先调用 decide_long_term_memory_recall，
     因为 ambiguous case 需要继续走真实模型判断。
     """
+    # 将可选参数标准化为空字典，避免后续规则层重复处理 None。
     session_memory = session_memory or {}
+    # None 转为空字典，保留调用方已有 metadata 对象内容。
     metadata = metadata or {}
 
     # 调用规则引擎做毫秒级判断；risk_level 参数保留供未来扩展，当前规则层未直接使用。
@@ -342,7 +408,10 @@ def plan_long_term_memory_recall(
     )
 
     # 规则明确跳过：不召回，status=rule_skip_recall。
+    # 规则明确跳过时不再进入模型层，避免无价值延迟和越界读取。
+    # 规则明确跳过时不再调用决策模型，直接返回生产安全跳过结果。
     if rule.status == "skip_recall":
+        # 兼容规划入口把规则跳过转换为统一 Decision Schema。
         return MemoryRecallDecision(
             should_recall=False,
             reason=rule.reason,
@@ -352,6 +421,7 @@ def plan_long_term_memory_recall(
 
     # 规则不确定 + 本地无模型：安全降级，不召回长期记忆（生产链路应走 decide_long_term_memory_recall）。
     if rule.status == "ambiguous":
+        # 本地入口没有模型时采用安全跳过，并保留规则 Query 供 Trace 解释。
         return MemoryRecallDecision(
             should_recall=False,
             reason=rule.reason,
@@ -361,6 +431,7 @@ def plan_long_term_memory_recall(
         )
 
     # 规则明确召回：组装完整 MemoryRecallDecision，供 hybrid_recall_memory 使用。
+    # 规则必须召回时返回允许层级、Query、领域 TopK 和强置信度。
     return MemoryRecallDecision(
         should_recall=True,
         recall_layers=rule.recall_layers,
@@ -409,7 +480,9 @@ def decide_long_term_memory_recall(
         MemoryRecallDecision，status 可能是 rule_skip_recall / rule_must_recall /
         model_decision / model_unavailable_safe_skip / failed_schema_validation。
     """
+    # 从函数入口开始计时，最终把完整规则/模型决策耗时写入强制过滤字段。
     started_at = time.perf_counter()
+    # None 统一转换为空短期记忆，不修改调用方原字典。
     session_memory = session_memory or {}
     # 合并 tenant/user/session 到 metadata，供后续检索 filters 和模型输入使用。
     metadata = {
@@ -418,10 +491,12 @@ def decide_long_term_memory_recall(
         "user_id": user_id,
         "session_id": session_id,
     }
+    # 未显式注入时使用严格的 MemoryConfig 默认值，生产通常来自配置加载器。
     memory_config = memory_config or MemoryConfig()
 
     # ── 租户策略层：全局关闭长期记忆 ──
     if not memory_config.enabled:
+        # 租户关闭记忆时返回置信度 1 的策略跳过结果。
         return MemoryRecallDecision(
             should_recall=False,
             reason="当前租户策略关闭长期记忆。",
@@ -432,6 +507,7 @@ def decide_long_term_memory_recall(
         )
     # ── 安全策略：缺少 tenant_id 或 user_id 禁止读取跨会话记忆 ──
     if not tenant_id or not user_id:
+        # 缺身份边界时返回安全跳过，绝不尝试匿名跨会话检索。
         return MemoryRecallDecision(
             should_recall=False,
             reason="缺少 tenant_id 或 user_id，安全策略禁止读取长期记忆。",
@@ -450,7 +526,9 @@ def decide_long_term_memory_recall(
         session_memory=session_memory,
         metadata=metadata,
     )
+    # 规则明确跳过时立即返回，不进入模型判定或任何长期存储读取。
     if rule.status == "skip_recall":
+        # 将规则跳过结果包装为生产 Decision 并保留强制 filters。
         return MemoryRecallDecision(
             should_recall=False,
             reason=rule.reason,
@@ -459,7 +537,9 @@ def decide_long_term_memory_recall(
             confidence=0.95,
             latency_budget_ms=memory_config.decision_timeout_ms,
         )
+    # 规则明确召回时直接构造带系统过滤器的生产决策。
     if rule.status == "must_recall":
+        # 将规则层级和 Query 转换为生产检索可直接执行的 Decision。
         return MemoryRecallDecision(
             should_recall=True,
             recall_layers=rule.recall_layers,
@@ -474,6 +554,7 @@ def decide_long_term_memory_recall(
 
     # ── ambiguous：模型未启用或未注入 client → 安全降级 ──
     if not memory_config.model_decision_enabled or model_client is None:
+        # 模型未启用/未注入时返回安全跳过，不把 ambiguous 误当作允许读取。
         return MemoryRecallDecision(
             should_recall=False,
             reason="规则无法确定且未配置 memory_recall_decision 模型，安全降级为不召回长期记忆。",
@@ -486,6 +567,7 @@ def decide_long_term_memory_recall(
 
     # ── ambiguous：调用 memory_recall_decision 模型 ──
     try:
+        # complete_json 以 Pydantic Schema 校验模型输出；第二个结果仅含本次无需使用的模型元数据。
         output, _model_result = model_client.complete_json(
             messages=[
                 {
@@ -510,8 +592,10 @@ def decide_long_term_memory_recall(
             ],
             schema_model=MemoryRecallDecisionModelOutput,
         )
+    # 捕获模型调用、网络和 Schema 校验异常并进入安全跳过分支。
     except Exception as exc:
         # 模型 JSON 不合法或调用失败 → 不召回敏感长期记忆，保留短期 session。
+        # 返回显式失败状态供观测，不向上层传播模型异常中断主请求。
         return MemoryRecallDecision(
             should_recall=False,
             reason=f"memory_recall_decision 模型输出不可用，安全降级：{exc}",
@@ -523,6 +607,7 @@ def decide_long_term_memory_recall(
         )
 
     # 合并模型 filters 与系统强制 filters，并记录决策耗时。
+    # 模型 filters 先展开，随后由系统强制身份和默认风险上限覆盖同名键。
     filters = {
         **output.filters,
         "tenant_id": tenant_id,
@@ -531,7 +616,9 @@ def decide_long_term_memory_recall(
         "max_risk_level": output.filters.get("max_risk_level", "medium"),
         "decision_latency_ms": int((time.perf_counter() - started_at) * 1000),
     }
+    # 模型未生成 Query 时回退规则层原始 Query，确保 should_recall 不会带空检索请求。
     queries = output.queries or rule.queries
+    # 返回经过系统身份覆盖的最终模型 Decision。
     return MemoryRecallDecision(
         should_recall=output.should_recall,
         recall_layers=output.recall_scopes,
@@ -561,9 +648,13 @@ class ProductionMemoryRetriever:
         retrieval_config: RetrievalConfig | None = None,
     ) -> None:
         """注入生产召回所需的三件套：PostgreSQL 仓储、Embedding 客户端、Reranker 客户端。"""
+        # Repository 执行带租户/用户隔离的 pgvector Hybrid Search。
         self.repository = repository
+        # Embedding Client 将多条 Query 批量映射为检索向量。
         self.embedding_client = embedding_client
+        # Reranker Client 对粗排候选进行独立二阶段语义精排。
         self.reranker_client = reranker_client
+        # RetrievalConfig 提供批量、超时等运行参数；未注入时使用受控默认值。
         self.retrieval_config = retrieval_config or RetrievalConfig()
 
     def recall(
@@ -596,16 +687,23 @@ class ProductionMemoryRetriever:
         """
         # 决策层已判定不召回，直接返回空结果。
         if not decision.should_recall:
+            # 空结果仍保留原 Decision，便于下游 Trace 解释为何没有访问数据库。
             return MemoryRecallResult(decision=decision, items=[], compact_summary={})
+        # should_recall 为真却没有 Query 属于上游契约错误，不能执行无范围检索。
         if not decision.queries:
+            # 显式抛错使调用方修复决策，而不是退化为全量长期记忆读取。
             raise ValueError("长期记忆召回需要至少一个 query")
 
         # ── Step 1: 批量 embedding + pgvector hybrid search ──
+        # 保持决策 Query 顺序批量向量化，zip(strict=True) 会校验返回数量完全一致。
         query_texts = [query.text for query in decision.queries]
+        # 一次批量请求获取与 Query 顺序对应的全部向量。
         embeddings = self.embedding_client.embed(query_texts)
         # merged 按 hit.id 去重，同一记忆被多条 query 命中时保留最高分。
         merged: dict[str, PersistedMemoryHit] = {}
+        # Query 与向量严格一一对应，长度不一致由 strict zip 立即报错。
         for query, embedding in zip(decision.queries, embeddings, strict=True):
+            # 每条 Query 分别执行 PostgreSQL 词法、向量与 metadata 融合检索。
             hits = self.repository.search_long_term_memory(
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -617,21 +715,31 @@ class ProductionMemoryRetriever:
                 top_k=max(decision.top_k * 2, decision.top_k),  # 粗排取 2 倍候选供 reranker
                 score_threshold=decision.score_threshold,
             )
+            # 同一记忆被多条改写 Query 命中时，只保留 final_score 最高的一次。
             for hit in hits:
+                # 读取该 ID 当前保留的最佳命中。
                 previous = merged.get(hit.id)
+                # 首次命中或本条分数更高时更新去重映射。
                 if previous is None or hit.final_score > previous.final_score:
+                    # 首次命中或更高分命中覆盖去重映射。
                     merged[hit.id] = hit
 
         # ── Step 2: Reranker 精排 ──
+        # 在调用 Reranker 前按粗排 final_score 稳定排序，确保索引映射可复现。
         candidates = sorted(merged.values(), key=lambda item: item.final_score, reverse=True)
+        # 只有存在候选才调用外部 Reranker，空结果直接跳过网络请求。
         if candidates:
+            # Reranker 使用合并 Query 评估全部候选，仅请求最终 top_k 个索引。
             ranking = self.reranker_client.rerank(
                 query=" ".join(query_texts),
                 documents=[hit.content for hit in candidates],
                 top_k=decision.top_k,
             )
+            # 防御性忽略模型返回的越界索引，合法索引按 Reranker 顺序映射回候选。
             ranked = [candidates[item.index] for item in ranking if item.index < len(candidates)]
+        # 没有候选时进入空列表分支，不调用 Reranker。
         else:
+            # 无候选时保持空列表，不调用外部 Reranker。
             ranked = candidates
 
         # ── Step 3: 转换 + 阈值过滤 + 压缩摘要 ──
@@ -640,6 +748,7 @@ class ProductionMemoryRetriever:
             for hit in ranked[: decision.top_k]
             if hit.final_score >= decision.score_threshold
         ]
+        # 返回阈值过滤后的原子条目及其固定分层摘要。
         return MemoryRecallResult(
             decision=decision,
             items=items,
@@ -671,13 +780,19 @@ def preference_memory_to_documents(
         {"preferred_style": "喜欢结构化中文",
          "memory_candidates": [{"type": "preferred_style", "value": "..."}]}
     """
+    # 累积由每个偏好键/候选转换的独立检索文档。
     documents: list[RetrievalDocument] = []
+    # 每个普通键单独成文档，memory_candidates 列表再按候选逐项展开。
     for key, value in preference_memory.items():
         # memory_candidates 是 long_term_memory_candidate 节点写入的候选列表，需逐条展开。
         if key == "memory_candidates" and isinstance(value, list):
+            # 列表下标形成稳定 chunk_id，使同一次快照中的候选可独立去重。
             for index, candidate in enumerate(value):
+                # 字典候选读取显式 type，异常结构使用统一 memory_candidate 类型。
                 candidate_type = str(candidate.get("type", "memory_candidate")) if isinstance(candidate, dict) else "memory_candidate"
+                # 字典候选读取 value，标量候选直接作为值。
                 candidate_value = candidate.get("value") if isinstance(candidate, dict) else candidate
+                # 将候选类型和值写入带 Preference metadata 的检索文档。
                 documents.append(
                     _memory_document(
                         tenant_id=tenant_id,
@@ -689,6 +804,7 @@ def preference_memory_to_documents(
                         extra={"layer": "preference", "key": candidate_type, "value": candidate_value},
                     )
                 )
+        # 普通 Preference 键值进入一文档一字段分支。
         else:
             # 普通键值对：每个 key 对应一条独立检索文档。
             documents.append(
@@ -702,6 +818,7 @@ def preference_memory_to_documents(
                     extra={"layer": "preference", "key": key, "value": value},
                 )
             )
+    # 返回拆分后的全部 Preference 检索文档，空输入自然得到空列表。
     return documents
 
 
@@ -732,14 +849,18 @@ def business_memory_to_documents(
     返回:
         混合多 layer 的 RetrievalDocument 列表，供 ``hybrid_recall_memory`` 统一检索。
     """
+    # 累积客户、顾问、Case 和事件四类业务检索文档。
     documents: list[RetrievalDocument] = []
 
     # ── 客户画像事实 ──
     for fact in customer_facts or []:
         # 过期事实和 PII 不进入检索候选集，避免隐私泄露和过时信息污染。
         if not fact.is_current or fact.sensitivity_level == "pii":
+            # 过期或 PII 客户事实不构建任何检索文本。
             continue
+        # 标准化值优先，缺失时回退原始事实值。
         value = fact.normalized_value if fact.normalized_value is not None else fact.fact_value
+        # 每条安全客户事实转换为独立 customer_profile 文档。
         documents.append(
             _memory_document(
                 tenant_id=tenant_id,
@@ -762,8 +883,11 @@ def business_memory_to_documents(
 
     # ── 从业者画像事实 ──
     for fact in advisor_facts or []:
+        # 非当前顾问事实已经被新版本替代，不参与任何在线检索。
         if not fact.is_current:
+            # 非当前顾问事实不参与检索文档构建。
             continue
+        # 每条当前顾问事实转换为独立 advisor_profile 文档。
         documents.append(
             _memory_document(
                 tenant_id=tenant_id,
@@ -784,6 +908,7 @@ def business_memory_to_documents(
 
     # ── 机会 case 状态（单条合成文档）──
     if opportunity_case is not None:
+        # 当前 Case 的关键路由字段合成为一条 Case 状态文档。
         documents.append(
             _memory_document(
                 tenant_id=tenant_id,
@@ -810,6 +935,7 @@ def business_memory_to_documents(
 
     # ── 事件记忆 ──
     for event in events or []:
+        # 每个事件单独成文档，保留 event_type 和 evidence 摘要。
         documents.append(
             _memory_document(
                 tenant_id=tenant_id,
@@ -821,6 +947,7 @@ def business_memory_to_documents(
                 extra={"layer": "memory_event", "event_type": event.event_type, "event_id": event.id},
             )
         )
+    # 返回混合业务层文档集合，由召回 Decision 的 library 过滤进一步收窄。
     return documents
 
 
@@ -859,6 +986,7 @@ def hybrid_recall_memory(
     # ── 前置短路：决策层已判定不需要召回，或上游没有可检索文档 ──
     # 常见场景：规则 skip_recall、ambiguous 安全降级、preference dict 为空。
     if not decision.should_recall or not documents:
+        # 短路结果保留决策对象，且不初始化 HybridRetriever。
         return MemoryRecallResult(decision=decision, items=[], compact_summary={})
 
     # ── Step 1: 构建 metadata 过滤条件 ──
@@ -923,30 +1051,47 @@ def _rerank_memory_results(
     返回:
         按 rerank_score 降序排列的 MemoryRecallItem 列表。
     """
+    # 合并全部 Query 文本用于本地字符重叠 bonus。
     query_text = " ".join(query.text for query in decision.queries)
+    # items 累积通过租户和层级二次校验的召回条目。
     items: list[MemoryRecallItem] = []
+    # 逐个粗排结果执行租户/层级二次过滤并累加业务加分。
     for result in results:
+        # 读取 RetrievalDocument 的强类型 metadata。
         metadata = result.document.metadata
         # 租户隔离二次校验（HybridRetriever 已过滤，此处防御性检查）。
         if metadata.tenant_id != tenant_id:
+            # 防御性丢弃任何跨租户粗排结果。
             continue
+        # 复制 extra 避免后续读取修改文档元数据对象。
         extra = dict(metadata.extra)
+        # layer 决定条目是否属于 Decision 授权范围。
         layer = extra.get("layer")
         # 只保留 decision.recall_layers 允许的层级。
         if layer not in decision.recall_layers:
+            # 未授权记忆层即使文本相关也不能进入上下文。
             continue
 
         # ── 记忆业务 bonus 累加 ──
         bonus = 0.0
+        # 当前事实优先于历史事实；缺省 True 兼容不带版本字段的 Case/Preference 文档。
         if extra.get("is_current", True):
+            # 当前记录增加 0.05 业务权重。
             bonus += 0.05
+        # 用户已确认事实优先于 uncertain 线索。
         if extra.get("certainty") == "confirmed":
+            # 已确认事实再增加 0.05。
             bonus += 0.05
+        # Case 状态对保险任务推进更直接，因此给予小幅固定加分。
         if metadata.library == "case_memory":
+            # Case 聚合状态增加 0.03。
             bonus += 0.03
+        # 追加最高 0.18 的中文字符重叠加分。
         bonus += _character_overlap_bonus(query_text, result.document.text)
 
+        # 最终分限制在 1.0 内，避免多项 bonus 超出标准范围。
         final_score = min(1.0, result.score + bonus)
+        # 构造统一 RecallItem 并截断可能过长的文档正文。
         items.append(
             MemoryRecallItem(
                 layer=layer,
@@ -960,6 +1105,7 @@ def _rerank_memory_results(
                 rerank_score=final_score,
             )
         )
+    # 最终按 rerank_score 降序返回，后续统一应用阈值和 TopK。
     return sorted(items, key=lambda item: item.rerank_score, reverse=True)
 
 
@@ -978,9 +1124,13 @@ def _memory_hit_to_recall_item(hit: PersistedMemoryHit) -> MemoryRecallItem:
     """
     # scope 不在已知 layer 映射中时，降级为 domain_fact。
     layer = hit.scope if hit.scope in LAYER_TO_LIBRARY else "domain_fact"
+    # 复制数据库 metadata，避免 setdefault 修改原命中对象。
     metadata = dict(hit.metadata)
+    # 补齐记忆类型，已有显式值时不覆盖。
     metadata.setdefault("memory_type", hit.memory_type)
+    # 补齐 PostgreSQL pgvector 来源标签供审计。
     metadata.setdefault("source", "postgres_pgvector")
+    # 转换为与本地检索一致的 RecallItem，供统一摘要逻辑消费。
     return MemoryRecallItem(
         layer=layer,  # type: ignore[arg-type]
         source_id=hit.id,
@@ -1010,6 +1160,7 @@ def _compact_memory_items(items: list[MemoryRecallItem]) -> dict[str, Any]:
     返回:
         compact_summary dict，写入 memory_context 或 profile_state。
     """
+    # 初始化固定分层结构，保证即使某层无命中也有稳定容器类型。
     summary: dict[str, Any] = {
         "preference": {},
         "customer_profile": {"confirmed": {}, "uncertain": {}},
@@ -1017,22 +1168,39 @@ def _compact_memory_items(items: list[MemoryRecallItem]) -> dict[str, Any]:
         "case_state": {},
         "memory_events": [],
     }
+    # 按层级分派到固定摘要结构，禁止把任意 metadata 平铺到顶层。
     for item in items:
+        # Preference 以稳定 key/value 形式合并。
         if item.layer == "preference":
+            # 优先使用 metadata key，缺失时回退 chunk_id。
             key = str(item.metadata.get("key", item.chunk_id))
+            # 优先使用结构化 value，缺失时回退截断内容。
             summary["preference"][key] = item.metadata.get("value", item.content)
+        # 客户画像必须继续区分 confirmed 和 uncertain 两个桶。
         elif item.layer == "customer_profile":
+            # 读取 certainty 并缺省视为 confirmed。
             certainty = item.metadata.get("certainty", "confirmed")
+            # uncertain 单独入桶，其他值保守落入 confirmed 兼容历史数据。
             bucket = "uncertain" if certainty == "uncertain" else "confirmed"
+            # 事实键缺失时回退 chunk_id 保持可寻址。
             key = str(item.metadata.get("fact_key", item.chunk_id))
+            # 写入对应 certainty 桶的结构化事实值。
             summary["customer_profile"][bucket][key] = item.metadata.get("fact_value", item.content)
+        # 顾问画像直接按事实键合并当前值。
         elif item.layer == "advisor_profile":
+            # 顾问事实同样优先使用 fact_key。
             key = str(item.metadata.get("fact_key", item.chunk_id))
+            # 写入结构化事实值，缺失时回退内容摘要。
             summary["advisor_profile"][key] = item.metadata.get("fact_value", item.content)
+        # Case 状态是单一聚合对象，使用 metadata 更新对应分区。
         elif item.layer == "case_state":
+            # Case metadata 合并到唯一 Case 状态分区。
             summary["case_state"].update(item.metadata)
+        # 事件保持列表形式，避免多个同类事件互相覆盖。
         elif item.layer == "memory_event":
+            # 事件 metadata 按排序顺序追加，保留多事件历史。
             summary["memory_events"].append(item.metadata)
+    # 返回固定五分区摘要；未命中分区保持空对象/空列表。
     return summary
 
 
@@ -1065,6 +1233,7 @@ def _memory_document(
     返回:
         完整的 RetrievalDocument 对象。
     """
+    # 返回带低风险、准入标记和业务 extra 的统一检索文档。
     return RetrievalDocument(
         text=text,
         metadata=DocumentMetadata(
@@ -1102,15 +1271,25 @@ def _build_memory_queries(
     返回:
         带 weight 的多条 RetrievalQuery。
     """
+    # 原始输入是首条最高权重长期记忆 Query。
     queries = [RetrievalQuery(text=text, purpose="memory", weight=1.0)]
+    # 读取上一意图用于可选增强 Query。
     last_intent = session_memory.get("last_intent")
+    # 存在上一意图时追加低权重意图增强 Query。
     if last_intent:
+        # 添加权重 0.7 的意图增强 Query。
         queries.append(RetrievalQuery(text=f"{text} {last_intent}", purpose="memory", weight=0.7))
+    # 读取上一实体用于可选实体增强 Query。
     last_entity = session_memory.get("last_entity")
+    # 存在实体锚点时追加较高权重实体增强 Query。
     if last_entity:
+        # 添加权重 0.8 的实体增强 Query。
         queries.append(RetrievalQuery(text=f"{text} {last_entity}", purpose="memory", weight=0.8))
+    # 领域 Skill 作为画像检索 Query，权重低于用户原始文本。
     if domain_skill:
+        # 添加权重 0.6 的领域画像 Query。
         queries.append(RetrievalQuery(text=f"{domain_skill} {text}", purpose="profile", weight=0.6))
+    # 保持原始 Query 在首位并返回所有存在的增强 Query。
     return queries
 
 
@@ -1127,15 +1306,25 @@ def _is_low_value_for_long_term_memory(text: str, intent: str | None) -> bool:
     返回:
         True 表示不应召回长期记忆。
     """
+    # 已分类的工具型意图无需长期记忆。
     if intent in {"weather_query", "calculator_query"}:
+        # 已分类工具意图直接判为低长期记忆价值。
         return True
+    # 小写文本用于中英文关键词统一判断。
     lowered = text.lower()
+    # 同时含运算符和数字的表达式按一次性计算请求处理。
     if any(symbol in text for symbol in ["+", "-", "*", "/"]) and any(char.isdigit() for char in text):
+        # 算术表达式无需画像或历史事实。
         return True
+    # 中英文天气/计算关键词同样构成明确跳过信号。
     if any(keyword in lowered for keyword in ["天气", "weather", "计算", "calculator"]):
+        # 关键词工具请求同样跳过长期召回。
         return True
+    # 简单问候没有个性化事实依赖，跳过长期召回。
     if text in {"你好", "hello", "hi", "在吗"}:
+        # 简单问候不依赖跨会话事实。
         return True
+    # 未命中任一低价值条件时交给其他召回规则继续判断。
     return False
 
 
@@ -1152,7 +1341,9 @@ def _needs_preference_recall(text: str, domain_skill: str | None) -> bool:
     返回:
         True 表示可能需要召回 preference 层。
     """
+    # 稳定偏好召回的显式触发词列表。
     preference_terms = ["我喜欢", "我的偏好", "按我的", "上次我说", "记得我", "风格", "继续用"]
+    # 命中显式偏好词或处于任一领域 Skill 时返回需要偏好召回。
     return any(term in text for term in preference_terms) or domain_skill is not None
 
 
@@ -1165,12 +1356,12 @@ def _needs_business_recall(
 ) -> bool:
     """判断是否需要召回客户/从业者/case 业务长期记忆（历史遗留 helper）。
 
-    触发条件：KYC 工作流、保险顾问 intent/skill、metadata 含 customer_id/case_id、
+    触发条件：保险顾问 intent/skill、metadata 含 customer_id/case_id、
     或输入含保险业务关键词。当前主链路由 ``MemoryRecallRuleEngine.business_terms`` 覆盖。
 
     参数:
         text: 用户输入。
-        workflow_name: 工作流名。
+        workflow_name: 兼容运行标签；该 helper 不使用它判断保险路由。
         intent: 意图。
         domain_skill: 领域 Skill。
         metadata: 请求 metadata。
@@ -1178,13 +1369,24 @@ def _needs_business_recall(
     返回:
         True 表示可能需要召回 customer_profile / case_state 等业务层。
     """
-    if workflow_name == "insurance_kyc_coach_workflow":
+    # 兼容参数当前不参与判断，显式删除避免未使用变量误导读者。
+    del workflow_name
+    # 保险 Skill 或保险意图明确需要客户、顾问和 Case 业务记忆。
+    if domain_skill == "insurance_advisor" or intent in {
+        "insurance_break_ice",
+        "insurance_objection_handling",
+        "insurance_strategy",
+        "insurance_kyc_collection",
+    }:
+        # 保险 Skill/意图明确需要业务长期记忆。
         return True
-    if domain_skill == "insurance_advisor" or intent == "insurance_advisor_help":
-        return True
+    # 已存在内部客户/Case 关联时说明当前请求具有业务上下文依赖。
     if metadata.get("customer_id") or metadata.get("opportunity_case_id"):
+        # 内部主体关联存在时视为业务上下文请求。
         return True
+    # 业务上下文兜底触发词列表。
     business_terms = ["客户", "这个人", "这个客户", "上次", "之前", "继续", "保险", "kyc", "破冰", "异议", "策略"]
+    # 兜底按业务关键词判断是否可能需要画像/Case 召回。
     return any(term in text for term in business_terms)
 
 
@@ -1201,11 +1403,17 @@ def _character_overlap_bonus(query_text: str, document_text: str) -> float:
     返回:
         0.0 ~ 0.18 之间的 bonus 分数。
     """
+    # 提取 Query 中唯一汉字集合。
     query_chars = {char for char in query_text if "\u4e00" <= char <= "\u9fff"}
+    # 提取文档中唯一汉字集合。
     document_chars = {char for char in document_text if "\u4e00" <= char <= "\u9fff"}
+    # 任一侧没有汉字时无法计算中文字符重叠，返回零加分。
     if not query_chars or not document_chars:
+        # 无可比较中文字符时不提供额外排序加分。
         return 0.0
+    # 以 Query 汉字数为分母计算覆盖率，max 防止除零。
     overlap = len(query_chars & document_chars) / max(len(query_chars), 1)
+    # 按重叠比例线性缩放，并把 bonus 上限限制为 0.18。
     return min(0.18, overlap * 0.18)
 
 
@@ -1219,4 +1427,5 @@ def _truncate_memory_content(text: str, limit: int = 220) -> str:
     返回:
         截断后的文本，超长时末尾追加 ``...``。
     """
+    # 未超限原样返回；超限截取前 limit 字符并追加省略号。
     return text if len(text) <= limit else text[:limit] + "..."

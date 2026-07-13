@@ -13,6 +13,7 @@ class ContextBuilder:
     """Build compact contexts for generation nodes."""
 
     def build_sales_digest(self, retrieved_context: list[dict]) -> dict:
+        """把已过滤销售证据投影为带来源边界的最小生成摘要。"""
         # 生成节点不直接拿销售访谈原文，而是拿压缩后的 digest，降低 token 成本和敏感信息泄露风险。
         return {
             # applicable_scene 告诉生成节点这份 digest 适用于保险顾问沟通场景。

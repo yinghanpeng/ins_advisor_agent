@@ -10,5 +10,6 @@ from datetime import UTC, datetime
 
 def utc_now_iso() -> str:
     """Return current UTC time as an ISO-8601 string."""
-    return datetime.now(UTC).isoformat()
 
+    # 每次调用实时读取带时区 UTC 时间并转为 ISO-8601，便于跨服务排序和解析。
+    return datetime.now(UTC).isoformat()

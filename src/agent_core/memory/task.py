@@ -8,4 +8,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class TaskMemory:
+    """保存当前任务进度及可恢复工作流状态的内存映射。"""
+
+    # tasks 以租户 Session 复合 Key 索引任务级状态。
     tasks: dict[str, dict] = field(default_factory=dict)

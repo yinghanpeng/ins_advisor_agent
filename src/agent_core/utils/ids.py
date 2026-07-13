@@ -10,10 +10,13 @@ from uuid import uuid4
 
 def new_id(prefix: str) -> str:
     """Return a readable unique id with a stable prefix."""
+
+    # UUID4 提供随机唯一主体，稳定前缀让日志与存储中的实体类型易于识别。
     return f"{prefix}_{uuid4().hex}"
 
 
 def new_trace_id() -> str:
     """Return a new trace id."""
-    return new_id("trace")
 
+    # 统一复用 new_id，确保所有 trace 标识遵循相同命名与唯一性规则。
+    return new_id("trace")

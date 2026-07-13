@@ -40,6 +40,7 @@ def scan_pii(text: str) -> list[GuardrailSignal]:
         matches = pattern.findall(text)
         # 未命中则跳过该类别。
         if not matches:
+            # 当前类别无命中时继续下一条 PII 规则。
             continue
         # 命中则产出一条 PII 信号；severity 定为 MEDIUM，建议动作 MASK（脱敏续跑）。
         signals.append(

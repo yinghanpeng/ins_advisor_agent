@@ -1,15 +1,15 @@
 # 文件说明：
 # - 本配置文件用于描述运行时参数，避免把环境差异硬编码在 Python 代码中。
-# - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
+# - 修改配置后建议运行 python3 -m compileall -q src tests 和 python3 -m pytest -q 做回归验证。
 
-# app 描述 Dify 应用本身；这里把 Dify 定位为控制平面而非核心运行时。
+# app 描述 Dify 应用本身；这里把 Dify 定位为可选 HTTP 调用端而非核心运行时。
 app:
   # name 是 Dify 控制台中展示的应用名称。
   name: 生产级 Agent Control Plane
-  # advanced-chat 允许多轮对话和更复杂节点编排。
+  # advanced-chat 只负责保留 conversation.id；核心多轮状态仍在 Agent Core。
   mode: advanced-chat
-  # description 明确 Dify 不直接承载生产 Agent 状态机，只转发到 Agent Core。
-  description: Dify 作为控制平面，通过 HTTP 调用 FastAPI Agent Core，不直接承担生产运行时。
+  # description 明确 Dify 不做保险路由、KYC 或策略编排，只转发到 Agent Core。
+  description: Dify 作为可选调用端，通过 HTTP 调用 FastAPI Agent Core，不承载保险运行逻辑。
 # workflow 描述 Dify 侧推荐变量、节点和数据平面调用方式。
 workflow:
   # variables 是 Dify 工作流里可配置的运行变量。
@@ -17,34 +17,19 @@ workflow:
     # agent_core_url 指向 FastAPI 暴露的 /agent/run 接口。
     - name: agent_core_url
       default: http://localhost:8000/agent/run
-    # domain_skill 允许 Dify 明确指定业务 Skill，默认保险顾问。
-    - name: domain_skill
-      default: insurance_advisor
-  # recommended_nodes 是 Dify 画布中建议保留的逻辑节点名称，用于对齐 Agent Core 主链路。
+    # agent_core_tenant_id 必须与租户绑定 API Key 对应，不能由最终客户输入覆盖。
+    - name: agent_core_tenant_id
+      default: local
+    # agent_core_api_key 应配置为 Dify Secret，不要写入导出的 YAML 或前端变量。
+    - name: agent_core_api_key
+      default: ""
+  # recommended_nodes 只保留输入、一次 HTTP 调用和展示，禁止复制 Agent Core 的路由图。
   recommended_nodes:
-    # intent_router 对应 Agent Core 的 classify_intent。
-    - intent_router
-    # capability_router 对应能力路由。
-    - capability_router
-    # state_updater 对应状态/记忆更新。
-    - state_updater
-    # workflow_router 对应业务工作流路由。
-    - workflow_router
-    # sales_intelligence_router 对应销售智能检索链路。
-    - sales_intelligence_router
-    # general_tool_router 对应通用工具路由。
-    - general_tool_router
-    # domain_tool_router 预留业务工具路由。
-    - domain_tool_router
-    # tool_result_verifier 对应工具结果校验。
-    - tool_result_verifier
-    # context_builder 对应上下文构建和压缩。
-    - context_builder
-    # strategy_generator 对应回答/策略生成。
-    - strategy_generator
-    # compliance_reviewer 对应输出合规审查。
-    - compliance_reviewer
-    # final_response 对应最终响应封装。
+    # user_input 接收 sys.query，不执行任何本地业务判断。
+    - user_input
+    # agent_core_http 是唯一业务调用节点，所有 Guardrail/Intent/KYC/Tool 都在服务端执行。
+    - agent_core_http
+    # final_response 只展示 Agent Core 返回的 answer 和 trace_id。
     - final_response
   # data_plane_call 是 Dify 真正调用 Agent Core 的 HTTP 请求配置。
   data_plane_call:
@@ -52,14 +37,18 @@ workflow:
     method: POST
     # url 从变量 agent_core_url 读取，方便本地/生产环境切换。
     url: "{{ agent_core_url }}"
+    # Header 与 body tenant_id 必须一致；Gateway 会在进入 Agent 前校验并限流。
+    headers:
+      X-Tenant-ID: "{{ agent_core_tenant_id }}"
+      X-API-Key: "{{ agent_core_api_key }}"
     # body 映射到 AgentRunRequest 字段。
     body:
       # input 使用 Dify 当前用户问题。
       input: "{{ sys.query }}"
       # session_id 使用 Dify conversation.id，保证多轮记忆能串起来。
       session_id: "{{ conversation.id }}"
-      # domain_skill 透传 Dify 变量。
-      domain_skill: "{{ domain_skill }}"
+      # tenant_id 由 Dify 应用配置固定，不接受 sys.query 或客户参数映射。
+      tenant_id: "{{ agent_core_tenant_id }}"
       # metadata 标记调用来源，Agent Core trace 中能看到 source=dify。
       metadata:
         source: dify

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 
+# 能力缺口到关键词的稳定映射，用于离线轻量分类而非最终语义裁定。
 CAPABILITY_SIGNALS = {
     "icebreaking": ["破冰", "开场", "不知道怎么聊"],
     "kyc_questioning": ["KYC", "信息不完整", "怎么问"],
@@ -20,8 +21,12 @@ CAPABILITY_SIGNALS = {
 
 
 def infer_sales_capability_gap(text: str) -> str:
+    """按固定关键词识别最先命中的销售能力缺口。"""
+    # 按字典定义顺序遍历能力类别，保证多类同时命中时输出可复现。
     for capability, signals in CAPABILITY_SIGNALS.items():
+        # 任一关键词出现在文本中即认为当前能力类别命中。
         if any(signal in text for signal in signals):
+            # 返回稳定内部能力标签，供后续场景规划或评测使用。
             return capability
+    # 没有任何规则命中时返回 unknown，不基于关键词之外的信息猜测。
     return "unknown"
-

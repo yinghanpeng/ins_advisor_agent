@@ -1,8 +1,20 @@
+# 文件说明：
+# - 本配置文件定义混合检索的候选数量、过滤阈值和各路信号权重。
+# - 各权重相加为 1.0，用于计算可比较的最终召回分数。
+
+# retrieval 是数据库检索与重排阶段共享的默认参数。
 retrieval:
+  # top_k 表示每次检索最多保留的高分候选数量。
   top_k: 8
+  # score_threshold 过滤最终综合分低于该值的弱相关结果。
   score_threshold: 0.05
+  # vector_weight 是向量语义相似度在最终分数中的权重。
   vector_weight: 0.45
+  # lexical_weight 是关键词或全文匹配分数在最终分数中的权重。
   lexical_weight: 0.25
+  # metadata_weight 是租户、类别和业务标签等元数据匹配分数的权重。
   metadata_weight: 0.15
+  # recency_weight 是内容新近程度在最终分数中的权重。
   recency_weight: 0.10
+  # confidence_weight 是数据来源可信度或自动/离线生成准入置信度的权重。
   confidence_weight: 0.05

@@ -7,5 +7,6 @@ from __future__ import annotations
 
 
 def supervise(status: str) -> str:
+    """依据执行状态选择恢复分支或正常继续分支。"""
+    # 只有明确的 error 状态进入恢复链路，其余状态继续，避免误触发重试。
     return "recover" if status == "error" else "continue"
-

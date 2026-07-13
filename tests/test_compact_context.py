@@ -64,7 +64,7 @@ def test_compact_context_filters_pii_and_separates_certainty() -> None:
 
 
 def test_compact_context_only_allows_approved_non_high_risk_patterns() -> None:
-    """未审批或高风险 DialoguePattern 不进入 compact_context。"""
+    """未通过生成准入或高风险的 DialoguePattern 不进入 compact_context。"""
     safe_pattern = DialoguePattern(
         tenant_id="tenant_a",
         pattern_type="kyc_question",
@@ -106,3 +106,36 @@ def test_compact_context_only_allows_approved_non_high_risk_patterns() -> None:
 
     assert [item["id"] for item in context["retrieved_patterns"]] == [safe_pattern.id]
     assert "保证收益" not in str(context)
+
+
+def test_compact_context_denies_knowledge_with_missing_approval_flag() -> None:
+    """双知识库条目缺 approved_for_generation 时必须默认拒绝。"""
+
+    context = build_compact_context(
+        confirmed_customer_facts=[],
+        uncertain_customer_facts=[],
+        advisor_facts=[],
+        opportunity_case=None,
+        kyc_completeness_score=100,
+        opportunity_score=80,
+        external_grade="A",
+        asked_focuses=[],
+        missing_fields=[],
+        support_note="",
+        method_knowledge=[
+            {
+                "content": "缺少审批字段，不能进入 Prompt",
+                "document_id": "missing_approval",
+                "metadata": {},
+            },
+            {
+                "content": "显式审批的方法摘要",
+                "document_id": "approved",
+                "metadata": {"approved_for_generation": True},
+            },
+        ],
+    )
+
+    # compact_context 是生成前最后一道边界，因此即使上游漏过滤也只允许显式审批条目。
+    assert [item["document_id"] for item in context["method_knowledge"]] == ["approved"]
+    assert "缺少审批字段" not in str(context)

@@ -78,6 +78,7 @@ def scan_and_redact_output_pii(text: str) -> tuple[str, dict[str, Any]]:
         matches = list(item.pattern.finditer(redacted))
         # 未命中则跳过该类别。
         if not matches:
+            # 当前规则没有发现 PII，继续扫描下一类别。
             continue
         # 高敏标记向上聚合，用于节点提升 risk_level。
         high_sensitivity = high_sensitivity or item.high_sensitivity
@@ -111,13 +112,17 @@ def redact_pii_in_public_payload(value: Any) -> Any:
     """递归脱敏 trace/stream payload，避免公开事件里残留原始 PII。"""
     # 字符串直接复用输出 PII 规则替换。
     if isinstance(value, str):
+        # 获取脱敏文本并忽略仅供内部判断的扫描详情。
         redacted, _result = scan_and_redact_output_pii(value)
+        # 公共 Payload 只返回脱敏文本。
         return redacted
     # 列表逐项递归，保持原有顺序。
     if isinstance(value, list):
+        # 返回逐项脱敏后的新列表，不修改调用方容器。
         return [redact_pii_in_public_payload(item) for item in value]
     # 字典逐值递归，保留 key 以免破坏事件结构。
     if isinstance(value, dict):
+        # 返回保留键结构但递归清理每个值的新字典。
         return {key: redact_pii_in_public_payload(item) for key, item in value.items()}
     # 其他类型原样返回。
     return value

@@ -12,6 +12,7 @@ from agent_core.models.client import (
     RerankerClient,
 )
 
+# 公开导出列表限定业务节点可直接依赖的稳定模型客户端与结果契约。
 __all__ = [
     "ChatCompletionResult",
     "OpenAICompatibleChatClient",

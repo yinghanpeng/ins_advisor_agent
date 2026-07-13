@@ -10,6 +10,8 @@ from agent_core.workflow.contracts import EvalCase
 
 
 def generate_eval_case(card: SalesInsightCard) -> EvalCase:
+    """从一张销售洞察卡片生成可追踪的质量与合规评测样本。"""
+    # 将场景、下一问、禁用表达和预期 trace 投影为统一 EvalCase 契约。
     return EvalCase(
         id=f"eval_{card.source_id}_{card.chunk_id}",
         type="sales_intelligence_card",
@@ -22,4 +24,3 @@ def generate_eval_case(card: SalesInsightCard) -> EvalCase:
         expected_trace_fields=["trace_id", "selected_sales_insights", "sales_insight_digest"],
         pass_fail_rules=["must_include", "must_not_include", "guardrail_pass"],
     )
-

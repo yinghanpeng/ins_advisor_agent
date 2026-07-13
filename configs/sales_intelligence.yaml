@@ -2,21 +2,37 @@
 # - 本配置文件用于描述运行时参数，避免把环境差异硬编码在 Python 代码中。
 # - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
 
+# sales_intelligence 定义销售访谈语料、洞察卡片和评估种子的目录及治理要求。
 sales_intelligence:
+  # raw_archive_dir 保存原始访谈归档；其中内容不能直接作为模型指令。
   raw_archive_dir: data/raw_interviews
+  # processed_dir 保存完成清洗、切分和脱敏后的访谈数据。
   processed_dir: data/processed_interviews
+  # cards_dir 保存从访谈中抽取并通过静态生成准入后的结构化销售洞察卡片。
   cards_dir: data/sales_insight_cards
+  # eval_seed_dir 保存由真实业务模式提炼的脱敏评估种子案例。
   eval_seed_dir: data/eval_seed_cases
+  # require_anonymization 要求原始访谈在下游使用前完成匿名化处理。
   require_anonymization: true
+  # require_compliance_review 要求洞察进入生成链路前通过自动保险合规准入。
   require_compliance_review: true
+  # high_risk_approved_for_generation=false 表示高风险话术不得用于回答生成。
   high_risk_approved_for_generation: false
+  # libraries 列出销售智能检索可使用的逻辑资料库。
   libraries:
+    # structured_insights 保存从语料抽取的通用结构化洞察。
     - structured_insights
+    # kyc_question_library 保存客户画像和需求发现问题模板。
     - kyc_question_library
+    # icebreaking_library 保存合规的客户破冰策略与表达模板。
     - icebreaking_library
+    # case_evidence_library 保存经过核实、可追溯的案例证据。
     - case_evidence_library
+    # objection_handling_library 保存常见异议的合规回应方法。
     - objection_handling_library
+    # proposal_closing_playbook 保存建议呈现与推进下一步的流程模板。
     - proposal_closing_playbook
+    # script_template_library 保存可按场景填充的话术结构模板。
     - script_template_library
+    # compliance_notes 保存保险销售红线、披露要求和风险提示。
     - compliance_notes
-

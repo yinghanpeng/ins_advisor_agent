@@ -1,3 +1,5 @@
+-- 重要：本文件是历史设计说明，不是可执行 migration 入口。
+-- 生产结构以 migrations/ 下的编号 SQL 为唯一权威来源，请使用 make db-upgrade。
 -- 保险高客沟通教练业务记忆系统 PostgreSQL DDL
 -- 第一版本地 demo 使用 InMemoryBusinessMemoryStore；本文件是生产落地方案。
 -- 生产建议启用：
@@ -216,7 +218,7 @@ CREATE TABLE analysis_runs (
 
 CREATE INDEX idx_analysis_runs_case_created ON analysis_runs (tenant_id, opportunity_case_id, created_at DESC);
 
-CREATE TABLE generated_outputs (
+CREATE TABLE business_generated_outputs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
@@ -233,7 +235,7 @@ CREATE TABLE generated_outputs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_generated_outputs_case_created ON generated_outputs (tenant_id, opportunity_case_id, created_at DESC);
+CREATE INDEX idx_business_generated_outputs_case_created ON business_generated_outputs (tenant_id, opportunity_case_id, created_at DESC);
 
 CREATE TABLE memory_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -344,12 +346,15 @@ CREATE TABLE memory_embeddings (
     tenant_id TEXT NOT NULL,
     owner_table TEXT NOT NULL,
     owner_id TEXT NOT NULL,
-    embedding_model TEXT NOT NULL DEFAULT 'text-embedding-3-small',
-    embedding vector(1536),
+    embedding_model TEXT NOT NULL DEFAULT 'configured-embedding-model',
+    embedding halfvec(3072),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_memory_embeddings_owner ON memory_embeddings (tenant_id, owner_table, owner_id);
--- 生产可按 pgvector 版本选择 ivfflat 或 hnsw 索引：
--- CREATE INDEX idx_memory_embeddings_vector ON memory_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- 3072 维 Embedding 使用 halfvec，才能被 pgvector 的 ivfflat 索引支持：
+-- CREATE INDEX idx_memory_embeddings_vector ON memory_embeddings USING ivfflat (embedding halfvec_cosine_ops) WITH (lists = 100);
+-- 重要：本文件是历史设计说明，不是可执行 migration 入口。
+-- 生产结构以 migrations/001_initial_pgvector.sql 到最新编号文件为唯一权威来源，
+-- `make db-upgrade` 会通过 schema_migrations 台账和校验和顺序执行。

@@ -12,7 +12,9 @@ from agent_core.tools.schemas import ToolSpec
 
 @dataclass
 class ToolPermissionPolicy:
-    # allowed_scopes 是当前自动执行允许的权限范围；不在集合里的工具必须被阻断或转人审。
+    """定义客户渠道允许的只读工具作用域与权限等级白名单。"""
+
+    # allowed_scopes 是当前客户渠道允许的权限范围；不在集合里的工具直接阻断。
     allowed_scopes: set[str] = field(
         default_factory=lambda: {
             # local 表示纯本地能力。
@@ -33,20 +35,40 @@ class ToolPermissionPolicy:
             "files.read",
         }
     )
-    # allowed_levels 限制自动执行只允许 public/tenant；privileged/admin 需要更严格审批。
+    # allowed_levels 限制客户渠道只允许 public/tenant；privileged/admin 直接阻断。
     allowed_levels: set[str] = field(default_factory=lambda: {"public", "tenant"})
 
     def can_call(self, spec: ToolSpec) -> bool:
-        # 任何显式需要审批的工具都不能自动调用，必须进入 HUMAN_APPROVAL。
-        if spec.requires_approval or spec.permission.requires_human_approval:
+        """判断客户渠道是否同时满足副作用、scope 与权限级别约束。"""
+        # 客户系统不允许任何写入、对外动作或金融副作用工具。
+        if spec.side_effect or spec.side_effect_level not in {"none", "read_only"}:
+            # 副作用工具同步拒绝，不创建人工审批或异步等待状态。
             return False
-        # scope 必须命中允许集合；兼容检查 permission.scope 和旧字段 permission_scope。
-        return spec.permission.scope in self.allowed_scopes or spec.permission_scope in self.allowed_scopes
+        # scope 和权限级别必须同时命中客户渠道白名单。
+        scope_allowed = spec.permission.scope in self.allowed_scopes or spec.permission_scope in self.allowed_scopes
+        # 同时满足 scope 与 public/tenant 等级才允许执行，任一失败都返回 False。
+        return scope_allowed and spec.permission.level in self.allowed_levels
 
     def explain(self, spec: ToolSpec) -> dict:
         """Return a structured decision for logs and tool guardrails."""
-        # allowed 同时要求 can_call 通过，并且权限等级属于自动执行白名单。
-        allowed = self.can_call(spec) and spec.permission.level in self.allowed_levels
+        # 先计算最终布尔值，下面再给出稳定的首个拒绝原因。
+        allowed = self.can_call(spec)
+        # 副作用拒绝优先级最高，避免把金融动作误报为普通 scope 问题。
+        if spec.side_effect or spec.side_effect_level not in {"none", "read_only"}:
+            # 记录稳定机器码，日志和前端可据此展示“客户渠道不支持该动作”。
+            denial_reason = "side_effect_not_allowed"
+        # 权限级别不在 public/tenant 时返回 level 拒绝。
+        elif spec.permission.level not in self.allowed_levels:
+            # privileged/admin 统一归类为权限等级不允许。
+            denial_reason = "permission_level_not_allowed"
+        # level 允许但新旧任一 scope 都未命中时返回 scope 拒绝。
+        elif spec.permission.scope not in self.allowed_scopes and spec.permission_scope not in self.allowed_scopes:
+            # 新旧 scope 字段都未命中白名单时记录作用域拒绝。
+            denial_reason = "permission_scope_not_allowed"
+        # 所有约束通过时使用空拒绝原因。
+        else:
+            # 空字符串表示无拒绝原因，与 allowed=True 保持一致。
+            denial_reason = ""
         # 返回完整权限决策，让 ToolGuardrail 可以写入 guardrail_results 和 trace。
         return {
             "tool_name": spec.name,
@@ -54,5 +76,6 @@ class ToolPermissionPolicy:
             "permission_level": spec.permission.level,
             "permission_scope": spec.permission.scope,
             "risk_level": spec.risk_level,
-            "requires_approval": spec.requires_approval or spec.permission.requires_human_approval,
+            "side_effect_level": spec.side_effect_level,
+            "denial_reason": denial_reason,
         }

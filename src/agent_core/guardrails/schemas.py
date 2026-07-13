@@ -16,25 +16,25 @@ from pydantic import BaseModel, Field
 class GuardrailAction(StrEnum):
     """最终动作枚举，取代过去只有 block/pass 的二元判断。
 
-    动作优先级（严格从高到低）：BLOCK > REVIEW > MASK > ALLOW。
+    动作优先级（严格从高到低）：BLOCK > SAFE_FALLBACK > MASK > ALLOW。
     """
 
     # 放行：输入安全，可继续进入主链路。
     ALLOW = "allow"
     # 脱敏续跑：命中 PII 等敏感信息，先做遮蔽再继续，而不是直接拦截。
     MASK = "mask"
-    # 人工复核：灰区语义无法自动判定安全，交人工审批（fail-closed 的中间档）。
-    REVIEW = "review"
+    # 安全降级：不执行原请求，立即返回安全替代说明，不等待人工。
+    SAFE_FALLBACK = "safe_fallback"
     # 拦截：确定性越权 / 注入 / 违规，直接终止请求。
     BLOCK = "block"
 
 
 class RiskLevel(StrEnum):
-    """统一风险分级，供工具权限、人审和输出策略复用。"""
+    """统一风险分级，供工具权限、同步阻断和输出策略复用。"""
 
     # 无明显风险。
     LOW = "low"
-    # 可疑但不确定，通常触发 LLM Judge 或人工复核。
+    # 可疑但不确定，通常触发 LLM Judge 或安全降级。
     MEDIUM = "medium"
     # 确定性高风险，直接拦截。
     HIGH = "high"
@@ -65,6 +65,12 @@ class GuardrailSignal(BaseModel):
     matched: str = Field(default="", description="命中的模式或片段摘要。")
     # 人类可读的说明。
     detail: str = Field(default="", description="信号说明。")
+    # score 是规则层给出的可审计风险分；LLM Judge 和 PII 等旧信号默认记 0，不改变原裁决优先级。
+    score: int = Field(
+        default=0,
+        ge=0,
+        description="该信号贡献的规则风险分，用于聚合弱特征并解释为什么进入灰区判定。",
+    )
     # 该信号"建议"的动作；最终动作仍由 PolicyCombiner 统一裁决。
     suggested_action: GuardrailAction = Field(
         default=GuardrailAction.ALLOW,

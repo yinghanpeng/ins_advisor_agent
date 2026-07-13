@@ -20,4 +20,4 @@ def test_main_message_entry_runs_successfully():
     )
     assert "最终回答" in result.stdout
     assert "state_path" in result.stdout
-    assert "insurance_advisor_help" in result.stdout
+    assert "insurance_break_ice" in result.stdout

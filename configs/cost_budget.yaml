@@ -2,15 +2,25 @@
 # - 本配置文件用于描述运行时参数，避免把环境差异硬编码在 Python 代码中。
 # - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
 
+# cost_budget 定义 token、工具和模型调用的请求级及日级预算上限。
 cost_budget:
+  # daily_token_budget 是单个部署实例每天允许消耗的 token 软上限。
   daily_token_budget: 200000
+  # request_token_budget 是单次请求从理解到生成允许消耗的 token 软上限。
   request_token_budget: 12000
+  # sales_intelligence_retrieval_budget 是销售智能检索与上下文整理的 token 配额。
   sales_intelligence_retrieval_budget: 3000
+  # max_tool_calls_per_request 限制一次请求最多执行 5 次工具调用。
   max_tool_calls_per_request: 5
+  # max_model_calls_per_request 限制一次请求最多执行 6 次模型调用。
   max_model_calls_per_request: 6
+  # budget_pressure_strategy 按顺序列出预算紧张时采用的降级策略。
   budget_pressure_strategy:
+    # reduce_top_k 优先减少召回候选数量，降低重排和上下文 token 消耗。
     - reduce_top_k
+    # skip_optional_news 跳过非必要新闻检索，减少网络工具与证据处理成本。
     - skip_optional_news
+    # use_compact_context 改用压缩上下文，保留核心证据并减少 prompt 长度。
     - use_compact_context
+    # return_partial_with_limit_notice 在仍超预算时返回带限制说明的部分结果。
     - return_partial_with_limit_notice
-

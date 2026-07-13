@@ -13,12 +13,17 @@ from typing import Any
 class TraceRecorder:
     """In-memory trace recorder for tests and local debugging."""
 
+    # events 按发生顺序保存结构化事件；default_factory 避免实例之间共享列表。
     events: list[dict[str, Any]] = field(default_factory=list)
 
     def record(self, event: str, **fields: Any) -> None:
         """记录一条本地 trace 事件，供测试和调试查询。"""
+
+        # 事件名与调用方字段合并后追加，保留完整时间顺序供断言和排障。
         self.events.append({"event": event, **fields})
 
     def by_event(self, event: str) -> list[dict[str, Any]]:
         """按事件名称过滤 trace 事件。"""
+
+        # 返回新的列表而不是内部列表引用，避免调用方意外改变 recorder 状态。
         return [item for item in self.events if item.get("event") == event]

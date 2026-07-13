@@ -7,8 +7,10 @@ from __future__ import annotations
 
 
 def run_langsmith_eval(_: list[dict]) -> dict:
+    """在未配置远程凭据的本地实现中返回明确的跳过状态。"""
+
+    # 不伪造远程评测结果；结构化说明跳过原因，便于 CI 区分 skipped 与 passed。
     return {
         "status": "skipped",
         "reason": "LangSmith remote eval requires API key and network access.",
     }
-

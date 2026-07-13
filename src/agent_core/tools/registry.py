@@ -10,10 +10,24 @@ from dataclasses import dataclass, field
 from agent_core.tools.schemas import ToolPermissionSpec, ToolSpec
 
 
+def _input_schema(
+    properties: dict[str, dict],
+    *,
+    required: list[str] | None = None,
+    additional_properties: bool = False,
+) -> dict:
+    """构造默认工具使用的严格 object Schema。"""
+    # 统一 object、属性、必填项和额外字段策略，避免各工具手写 Schema 口径漂移。
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required or [],
+        "additionalProperties": additional_properties,
+    }
+
+
 def default_tool_specs() -> list[ToolSpec]:
     """返回本地默认工具清单，每个工具都带 schema、权限和风险元数据。"""
-    # 本地 demo 使用宽松 JSON Schema；生产环境应替换成每个工具的严格参数 schema。
-    base_input = {"type": "object", "additionalProperties": True}
     # 输出 schema 同样先保持宽松，后续可按工具收敛到结构化返回。
     base_output = {"type": "object", "additionalProperties": True}
     # 下面每个 ToolSpec 都显式声明风险等级、权限 scope 和执行策略，供 ToolGuardrail 审查。
@@ -22,7 +36,10 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="web_search",
             description="Search the public web through an approved provider.",
-            input_schema=base_input,
+            input_schema=_input_schema(
+                {"query": {"type": "string", "minLength": 1}, "filters": {"type": "object"}},
+                required=["query"],
+            ),
             output_schema=base_output,
             risk_level="medium",
             permission=ToolPermissionSpec(level="tenant", scope="internet.read"),
@@ -32,7 +49,10 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="web_page_reader",
             description="Read and summarize a specific URL.",
-            input_schema=base_input,
+            input_schema=_input_schema(
+                {"url": {"type": "string", "minLength": 1}, "query": {"type": "string"}},
+                required=["url"],
+            ),
             output_schema=base_output,
             risk_level="medium",
             permission=ToolPermissionSpec(level="tenant", scope="internet.read"),
@@ -42,7 +62,10 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="weather_query",
             description="Query weather for a location.",
-            input_schema=base_input,
+            input_schema=_input_schema(
+                {"location": {"type": "string", "minLength": 1}},
+                required=["location"],
+            ),
             output_schema=base_output,
             permission_scope="weather.read",
             permission=ToolPermissionSpec(level="tenant", scope="weather.read"),
@@ -51,7 +74,7 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="time_query",
             description="Return current date/time information.",
-            input_schema=base_input,
+            input_schema=_input_schema({}),
             output_schema=base_output,
             retryable=False,
             timeout_seconds=2,
@@ -62,7 +85,10 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="calculator",
             description="Evaluate safe arithmetic expressions.",
-            input_schema=base_input,
+            input_schema=_input_schema(
+                {"expression": {"type": "string", "minLength": 1}},
+                required=["expression"],
+            ),
             output_schema=base_output,
             retryable=False,
             timeout_seconds=2,
@@ -73,12 +99,23 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="unit_converter",
             description="Convert supported units.",
+            input_schema=_input_schema(
+                {
+                    "value": {"type": "number"},
+                    "from": {"type": "string", "minLength": 1},
+                    "to": {"type": "string", "minLength": 1},
+                },
+                required=["value", "from", "to"],
+            ),
             permission=ToolPermissionSpec(level="public", scope="local.compute"),
         ),
         # file_parser 读取上传文件，必须保持 tenant 边界，避免跨用户文件泄露。
         ToolSpec(
             name="file_parser",
             description="Parse approved uploaded files.",
+            input_schema=_input_schema(
+                {"content": {"type": "string"}, "file_id": {"type": "string", "minLength": 1}},
+            ),
             risk_level="medium",
             permission=ToolPermissionSpec(level="tenant", scope="files.read"),
             permission_scope="files.read",
@@ -87,6 +124,10 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="knowledge_search",
             description="Search internal knowledge indexes.",
+            input_schema=_input_schema(
+                {"query": {"type": "string", "minLength": 1}, "filters": {"type": "object"}},
+                required=["query"],
+            ),
             permission=ToolPermissionSpec(level="tenant", scope="knowledge.read"),
             permission_scope="knowledge.read",
         ),
@@ -94,6 +135,10 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="news_search",
             description="Search recent news.",
+            input_schema=_input_schema(
+                {"query": {"type": "string", "minLength": 1}, "filters": {"type": "object"}},
+                required=["query"],
+            ),
             risk_level="medium",
             permission=ToolPermissionSpec(level="tenant", scope="internet.read"),
             permission_scope="internet.read",
@@ -102,6 +147,13 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="translation",
             description="Translate provided text.",
+            input_schema=_input_schema(
+                {
+                    "text": {"type": "string", "minLength": 1},
+                    "target_language": {"type": "string", "minLength": 1},
+                },
+                required=["text", "target_language"],
+            ),
             permission=ToolPermissionSpec(level="tenant", scope="llm.transform"),
             permission_scope="llm.transform",
         ),
@@ -109,6 +161,10 @@ def default_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="summarizer",
             description="Summarize provided text.",
+            input_schema=_input_schema(
+                {"text": {"type": "string", "minLength": 1}, "max_chars": {"type": "integer"}},
+                required=["text"],
+            ),
             permission=ToolPermissionSpec(level="tenant", scope="llm.transform"),
             permission_scope="llm.transform",
         ),
@@ -129,6 +185,7 @@ class ToolRegistry:
         registry = cls()
         # 逐个注册默认工具，register 可复用覆盖逻辑。
         for spec in default_tool_specs():
+            # 调用统一注册入口，以工具名为键写入 registry。
             registry.register(spec)
         # 返回带默认工具集合的 registry，供 ToolRouter 直接使用。
         return registry

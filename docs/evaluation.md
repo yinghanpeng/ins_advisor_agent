@@ -23,10 +23,15 @@
 - 高风险请求；
 - 成本压力；
 - 多轮状态；
+- 0.85/0.60 向量边界；
+- 0.80/0.60 意图执行度边界；
+- active intent 续接、取消和跨域换题；
 - Dify 调用；
 - LangSmith trace；
 - 销售破冰；
 - KYC 追问；
+- KYC 短回答合并、去重和配置化最大轮次；
+- 方法/合规双知识库为空时的安全降级；
 - 异议处理；
 - 案例讲述；
 - 计划书收口；
@@ -38,3 +43,11 @@
 python3 evals/run_evals.py
 ```
 
+代码回归使用：
+
+```bash
+python3 -m compileall -q src tests
+python3 -m pytest -q
+```
+
+当前阈值来自 `configs/intent_routing.yaml`，只代表初始工程配置。替换 Embedding 或裁定模型后，应按真实脱敏验证集分别评估 Top1 相似度分布、开放集误路由率、澄清率和保险意图切换准确率，再更新阈值与意图样例版本。

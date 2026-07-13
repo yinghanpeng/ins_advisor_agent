@@ -2,18 +2,33 @@
 # - 本配置文件用于描述运行时参数，避免把环境差异硬编码在 Python 代码中。
 # - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
 
+# general_capabilities 定义通用 Agent 可以路由到的非领域能力。
 general_capabilities:
+  # enabled 是允许进入工具路由器的通用能力白名单。
   enabled:
+    # web_search 允许检索公开互联网信息。
     - web_search
+    # web_page_reader 允许读取并解析用户指定的网页。
     - web_page_reader
+    # weather_query 允许查询指定地点的天气信息。
     - weather_query
+    # time_query 允许读取日期、时间和时区信息。
     - time_query
+    # calculator 允许执行受限的确定性算术计算。
     - calculator
+    # unit_converter 允许执行受支持单位之间的换算。
     - unit_converter
+    # file_parser 允许解析处于授权范围内的上传文件。
     - file_parser
+    # knowledge_search 允许检索租户隔离的内部知识索引。
     - knowledge_search
+    # news_search 允许通过获批 provider 查询近期新闻。
     - news_search
+    # translation 允许执行文本语言转换。
     - translation
+    # summarizer 允许对已提供文本执行摘要压缩。
     - summarizer
+  # default_mode=provider_required 表示依赖外部数据的能力必须有真实 provider 才能执行。
   default_mode: provider_required
+  # network_tools_require_provider 禁止网络工具在 provider 缺失时伪造外部事实。
   network_tools_require_provider: true

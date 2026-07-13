@@ -18,6 +18,7 @@ from agent_core.utils.time import utc_now_iso
 
 def configure_logging(level: str = "INFO") -> None:
     """Configure root logging with a compact plain formatter."""
+
     # 将字符串日志级别转换成 logging 常量；传错时回退到 INFO。
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format="%(message)s")
 
@@ -33,6 +34,7 @@ class StructuredLogger:
 
     def event(self, event: str, **fields: Any) -> None:
         """输出一条 JSON 结构化事件日志。"""
+
         # payload 是最终日志对象，统一包含时间、logger、event 和调用方传入字段。
         payload = {
             # ts 使用 UTC ISO 时间，便于跨服务排序。
@@ -51,6 +53,7 @@ class StructuredLogger:
 
     def warning(self, event: str, **fields: Any) -> None:
         """输出一条 JSON 结构化 warning 日志。"""
+
         # warning payload 比普通 event 多一个 level 字段，便于日志平台过滤。
         payload = {
             "ts": utc_now_iso(),

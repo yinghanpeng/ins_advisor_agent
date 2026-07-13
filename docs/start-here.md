@@ -1,93 +1,47 @@
-# 我看不懂项目，无从下手怎么办？
+# 第一次阅读项目
 
-如果你第一次打开这个项目，不要从所有目录一起看。按下面 5 步走就够了。
-
-## 第 1 步：先跑起来
-
-在项目根目录执行：
-
-```bash
-python3 main.py
-```
-
-你会看到 4 条示例输入，每条都会打印：
-
-- 用户输入；
-- 最终回答；
-- `trace_id`；
-- 意图识别结果；
-- 命中的业务 Skill；
-- 状态流转路径；
-- Guardrail 结果；
-- 检索到的销售洞察卡片；
-- 完整状态迁移记录。
-
-只测试一条输入：
+## 先运行
 
 ```bash
 python3 main.py --message "客户喜欢银行理财，我怎么破冰"
-```
-
-进入交互模式：
-
-```bash
 python3 main.py --interactive
+pytest -q
 ```
 
-## 第 2 步：只看 4 个文件
+首轮保险请求通常不会直接给完整策略，而是建立 active intent 并提出一个温和 KYC 问题。交互模式下
+继续回答，才能看到活跃意图续接、槽位合并和策略生成。
 
-先不要看完整工程，只看这几个：
+## 推荐阅读顺序
 
-1. `main.py`：本地怎么运行。
-2. `src/agent_core/workflow/engine.py`：请求从哪里进入 Agent Core。
-3. `src/agent_core/graph/nodes.py`：每个状态节点做什么。
-4. `src/agent_core/sales_intelligence/retriever.py`：销售洞察如何检索。
+1. `src/agent_core/workflow/engine.py`：统一兼容入口；
+2. `src/agent_core/graph/builder.py`：真实代码执行顺序；
+3. `src/agent_core/intents/router.py`：向量 + LLM 双层意图路由；
+4. `src/agent_core/graph/nodes.py`：状态节点；
+5. `src/agent_core/skills/insurance_advisor/kyc.py`：保险领域槽位；
+6. `src/agent_core/skills/insurance_advisor/knowledge.py`：双知识库；
+7. `tests/test_intent_routing.py`：阈值、活跃意图和换题最小示例。
 
-看懂这 4 个文件，你就能理解主链路。
-
-## 第 3 步：理解一句话架构
-
-这个项目可以先理解成：
+一句话架构：
 
 ```text
-用户输入
-→ WorkflowEngine
-→ 状态机节点
-→ 意图识别
-→ 通用能力或保险顾问 Skill
-→ Sales Intelligence 检索
-→ Context Builder
-→ 生成回答
-→ Guardrail 审查
-→ 最终输出和 trace
+输入安全
+→ Redis active intent
+→ 向量意图库
+→ 必要时 LLM 裁定
+→ 置信度分发
+→ 通用工具路径 / 保险代码处理器 / 主动澄清
+→ Grounding、PII、合规和记忆
 ```
 
-## 第 4 步：再看文档
+保险逻辑不再运行 Dify Workflow，也不要求调用方指定 `workflow_name`。
 
-推荐阅读顺序：
+## 修改方式
 
-1. `docs/conversation-flows.md`
-2. `docs/project-structure.md`
-3. `docs/production-readiness-checklist.md`
-4. `docs/sales-intelligence-layer.md`
-5. `docs/state-machine.md`
+- 新增意图：更新 `configs/intent_catalog.yaml`、知识库语料和路由测试；
+- 调整阈值：修改 `configs/intent_routing.yaml`，同时用标注集重新评估；
+- 新增保险字段：修改 `InsuranceKycDelta`、意图字段优先级、问题模板和业务记忆测试；
+- 接真实知识库：修改 `configs/insurance_handler.yaml` 和 Provider 配置；
+- 新增工具：定义 ToolSpec、Schema、权限、Runner 和失败测试；
+- 修改流程：在 `builder.py`/`nodes.py` 修改代码，并同步状态、文档和测试。
 
-## 第 5 步：再看测试
-
-测试是最短的“用法说明”：
-
-- `tests/test_workflow_engine.py`：主流程怎么跑；
-- `tests/test_trace_and_security.py`：trace 和注入防护怎么验证；
-- `tests/test_rag_hybrid_memory_approval.py`：RAG、Memory、审批怎么验证；
-- `tests/test_sales_pipeline.py`：访谈语料怎么变成卡片。
-
-## 你现在应该怎么改？
-
-如果你想继续开发，建议按这个顺序：
-
-1. 先把 `main.py` 跑通；
-2. 在 `src/agent_core/graph/nodes.py` 里加一个新节点；
-3. 在 `src/agent_core/workflow/steps.py` 里补 step contract；
-4. 在 `tests/` 里写一个对应测试；
-5. 再把文档补到 `docs/project-structure.md`。
-
+完整流程见 [request-lifecycle-flowchart.md](request-lifecycle-flowchart.md)。

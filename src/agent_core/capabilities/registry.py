@@ -7,5 +7,7 @@ from agent_core.tools.registry import ToolRegistry
 
 
 def build_general_capability_registry() -> ToolRegistry:
-    return ToolRegistry.with_defaults()
+    """构建包含项目默认通用工具的能力注册表。"""
 
+    # 复用工具层的默认注册表，保证 capability facade 与实际可执行工具集合一致。
+    return ToolRegistry.with_defaults()

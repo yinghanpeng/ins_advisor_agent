@@ -1,5 +1,42 @@
+# 文件说明：
+# - 本配置文件声明持久化数据库和 Redis 的连接入口及连接池参数。
+# - URL 只引用环境变量，避免在仓库中保存真实账号、密码或主机地址。
+
+# database 是 PostgreSQL、checkpoint 和缓存适配器读取的连接配置。
 database:
+  # database_url 从 DATABASE_URL 环境变量读取 PostgreSQL 连接字符串。
   database_url: ${DATABASE_URL}
+  # redis_url 从 REDIS_URL 环境变量读取 Redis 连接字符串。
   redis_url: ${REDIS_URL}
+  # redis_sentinel_master 非空时启用 Sentinel 模式；与 redis_url 互斥。
+  redis_sentinel_master: ${REDIS_SENTINEL_MASTER}
+  # redis_sentinel_nodes 是逗号分隔的 Sentinel host:port 列表；运行时负责拆分与格式校验。
+  redis_sentinel_nodes: ${REDIS_SENTINEL_NODES}
+  # redis_password 用于认证 Sentinel 发现到的实际 Redis Master；留空表示不发送 AUTH。
+  redis_password: ${REDIS_PASSWORD}
+  # redis_sentinel_password 仅在 Sentinel 节点本身启用认证时填写，可与 Master 密码不同。
+  redis_sentinel_password: ${REDIS_SENTINEL_PASSWORD}
+  # redis_database 是 Sentinel 发现 Master 后连接的逻辑数据库编号；空值默认使用 0。
+  redis_database: "${REDIS_DATABASE}"
+  # pool_size 是 PostgreSQL 客户端维持的基础连接池大小。
   pool_size: 5
+  # max_overflow 是高并发突发时允许临时创建的额外 PostgreSQL 连接数。
+  max_overflow: 10
+  # pool_timeout_seconds 是连接池耗尽后请求等待连接的最长时间。
+  pool_timeout_seconds: 10
+  # pool_recycle_seconds 定期回收长连接，避免负载均衡或防火墙关闭陈旧连接。
+  pool_recycle_seconds: 1800
+  # pool_pre_ping 在借出连接前检查可用性，降低数据库切换后的首请求失败。
+  pool_pre_ping: true
+  # redis_max_connections 限制单 API 实例的 Redis 连接池规模。
+  redis_max_connections: 100
+  # redis_health_check_interval_seconds 控制 redis-py 对空闲连接执行 PING 的间隔；0 表示禁用。
+  redis_health_check_interval_seconds: 30
+  # redis_socket_connect_timeout_seconds 限制建立 Redis TCP/TLS 连接的等待时间。
+  redis_socket_connect_timeout_seconds: 3.0
+  # redis_socket_timeout_seconds 限制单条 Redis 命令等待网络读写的时间。
+  redis_socket_timeout_seconds: 3.0
+  # redis_retry_on_timeout 控制 Redis 命令超时后是否按客户端策略重试。
+  redis_retry_on_timeout: true
+  # echo_sql 控制是否输出 SQL 语句；生产环境默认关闭以降低噪声和泄露风险。
   echo_sql: false

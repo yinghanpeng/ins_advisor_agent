@@ -39,7 +39,7 @@ def extract_structured_insight(segment: InterviewSegment, metadata: dict | None 
             asset_preference=metadata.get("asset_preference"),
             decision_style=metadata.get("decision_style"),
         ),
-        sales_pain_solved="从访谈片段中抽取的销售痛点，需要人工复核",
+        sales_pain_solved="从访谈片段中抽取的销售痛点，需要通过自动生成准入校验",
         root_cause="从业者缺少场景化提问和低压推进结构",
         # effective_strategy 暂取分段前 220 字，避免过长原文直接进入卡片。
         effective_strategy=segment.text[:220],
@@ -51,11 +51,11 @@ def extract_structured_insight(segment: InterviewSegment, metadata: dict | None 
         why_it_works="先建立共情，再把话题落到客户自己的资金安排。",
         # next_question 给出低压追问，便于从破冰进入 KYC。
         next_question="这笔钱未来三到五年更可能承担什么责任？",
-        # tags 标记这张卡是自动抽取，需要人工复核。
+        # tags 标记这张卡是自动抽取，后续只能由自动 Schema/风险/合规策略决定是否发布。
         tags=[segment.scene, "auto_extracted"],
-        # 自动抽取结果默认需要 review，不允许直接进入生产生成。
-        compliance_notes="auto extracted, requires review before production generation",
+        # 自动抽取结果默认不准入，禁止在客户请求中创建任何人工审批或等待任务。
+        compliance_notes="auto extracted; generation gate defaults to deny",
         approved_for_generation=False,
     )
-    # 抽取完成后立刻进入合规审查，不让未审查卡片进入索引。
+    # 抽取完成后立刻进入自动合规准入，不让未通过策略的卡片进入索引。
     return review_card(card)

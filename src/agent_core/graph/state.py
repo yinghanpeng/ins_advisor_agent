@@ -18,9 +18,9 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Callable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from agent_core.utils.ids import new_trace_id
 from agent_core.utils.time import utc_now_iso
@@ -56,25 +56,19 @@ class AgentNode(StrEnum):
     # 消息标准化状态：把原始输入和历史上下文合并为统一 message 结构。
     NORMALIZE_MESSAGES = "NORMALIZE_MESSAGES"
 
-    # 意图识别状态：判断用户到底想做什么，例如查天气、联网搜索、销售破冰、文件分析等。
+    # 双层意图识别状态：处理活跃意图后执行向量召回、必要的 LLM 裁定和置信度分发。
     CLASSIFY_INTENT = "CLASSIFY_INTENT"
 
-    # 语义风险分级状态：把请求分为 low/medium/high，供工具、人审和输出策略使用。
+    # 语义风险分级状态：把请求分为 low/medium/high，供工具、同步降级和输出策略使用。
     SEMANTIC_RISK_CLASSIFICATION = "SEMANTIC_RISK_CLASSIFICATION"
-
-    # 槽位抽取状态：抽取客户画像、任务参数、工具参数等结构化槽位。
-    EXTRACT_SLOTS = "EXTRACT_SLOTS"
-
-    # 槽位校验状态：判断关键槽位是否缺失，是否需要向用户澄清。
-    VALIDATE_SLOTS = "VALIDATE_SLOTS"
 
     # Query Understanding 状态：完成指代消解、时间解析、实体抽取和检索 filters 生成。
     QUERY_UNDERSTANDING = "QUERY_UNDERSTANDING"
 
-    # 上下文需求规划状态：判断本轮是否需要 Memory、RAG、Tool、Human 或 Reject。
+    # 上下文需求规划状态：判断本轮是否需要 Memory、RAG、Tool、安全降级、拒绝或澄清。
     CONTEXT_NEED_PLANNING = "CONTEXT_NEED_PLANNING"
 
-    # 能力路由状态：判断请求应该走通用能力、业务 Skill、销售智能层，还是人工审批。
+    # 能力路由状态：判断请求应该走通用能力、业务 Skill、销售智能层，还是策略阻断。
     ROUTE_CAPABILITY = "ROUTE_CAPABILITY"
 
     # 通用工具路由状态：判断是否需要调用天气、搜索、计算器、网页读取等通用工具。
@@ -116,7 +110,10 @@ class AgentNode(StrEnum):
     # 状态更新状态：把用户补充的信息写入 session、profile、task memory 等运行时状态。
     UPDATE_STATE = "UPDATE_STATE"
 
-    # KYC 分析与路由状态：产出 Dify KYC 分析节点的 18 个结构化字段。
+    # 保险 KYC 槽位抽取状态：LLM 只抽取本轮明确事实，代码负责后续合并和校验。
+    EXTRACT_INSURANCE_KYC = "EXTRACT_INSURANCE_KYC"
+
+    # KYC 分析与路由状态：基于代码化领域状态计算完整度、推进分和后续动作。
     ANALYZE_KYC_AND_ROUTE = "ANALYZE_KYC_AND_ROUTE"
 
     # 记忆写入提案状态：把本轮明确事实、事件、问题和快照整理成写入计划。
@@ -137,8 +134,11 @@ class AgentNode(StrEnum):
     # KYC 补问生成状态：按缺失字段和已问焦点生成下一轮低压问题。
     GENERATE_KYC_QUESTIONS = "GENERATE_KYC_QUESTIONS"
 
-    # 销售对话模式检索状态：只检索已审核、非高风险的 DialoguePattern。
+    # 销售对话模式检索状态：只检索已通过静态生成准入、非高风险的 DialoguePattern。
     RETRIEVE_DIALOGUE_PATTERNS = "RETRIEVE_DIALOGUE_PATTERNS"
+
+    # 保险双知识库检索状态：并列获取沟通方法/匿名案例与合同/合规边界。
+    RETRIEVE_INSURANCE_KNOWLEDGE = "RETRIEVE_INSURANCE_KNOWLEDGE"
 
     # 外部上下文检索状态：必要时补充热点新闻或公开资料摘要。
     RETRIEVE_EXTERNAL_CONTEXT_IF_NEEDED = "RETRIEVE_EXTERNAL_CONTEXT_IF_NEEDED"
@@ -191,7 +191,7 @@ class AgentNode(StrEnum):
     # 响应封装状态：生成前端可展示的 answer、引用、工具卡片和下一步建议。
     RESPONSE_PACKAGING = "RESPONSE_PACKAGING"
 
-    # 短期记忆更新状态：把本轮问题、回答、槽位和任务状态写回 session memory。
+    # 短期记忆更新状态：把本轮问题、回答、最近实体和任务状态写回 session memory。
     SHORT_TERM_MEMORY_UPDATE = "SHORT_TERM_MEMORY_UPDATE"
 
     # 长期记忆候选状态：判断哪些用户偏好或画像值得进入长期记忆候选。
@@ -199,9 +199,6 @@ class AgentNode(StrEnum):
 
     # Trace 收尾状态：补齐最终 trace、成本、状态和审计字段。
     TRACE_FINALIZE = "TRACE_FINALIZE"
-
-    # 人工审批状态：涉及发送、删除、发布、付款等高风险动作时，等待用户确认。
-    HUMAN_APPROVAL = "HUMAN_APPROVAL"
 
     # 恢复状态：处理工具失败、检索无结果、JSON 解析失败、上下文超长等异常。
     RECOVERY = "RECOVERY"
@@ -234,6 +231,9 @@ class AgentState(BaseModel):
 
     # Pydantic 默认保护 model_ 前缀；本项目需要 model_name 字段记录模型路由结果，所以关闭该限制。
     model_config = ConfigDict(protected_namespaces=())
+
+    # _trace_event_sink 是进程内实时日志回调，不参与状态序列化、响应投影或记忆持久化。
+    _trace_event_sink: Callable[[dict[str, Any]], None] | None = PrivateAttr(default=None)
 
     # =========================
     # 1. 请求身份与追踪字段
@@ -283,9 +283,8 @@ class AgentState(BaseModel):
     workflow_name: str = Field(
         default="universal_agent_workflow",
         description=(
-            "当前运行的工作流名称。"
-            "例如 universal_agent_workflow、weather_workflow、break_ice_assistant_workflow、"
-            "sales_interview_ingestion_workflow。"
+            "兼容调用方传入的运行标签，默认 universal_agent_workflow。"
+            "保险路由不再读取该字段，而是由双层意图识别自动进入代码化处理器。"
         ),
     )
 
@@ -335,15 +334,41 @@ class AgentState(BaseModel):
         default=None,
         description=(
             "用户意图识别结果。"
-            "例如 weather_query、web_search、break_ice_help、objection_handling、file_summary。"
+            "例如 weather_query、web_or_news_search、insurance_break_ice、insurance_objection_handling。"
+        ),
+    )
+
+    intent_confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "最终用于执行度判断的意图置信度。向量直达使用 Top1 相似度，"
+            "LLM 裁定使用结构化 confidence，活跃意图续接使用原任务置信度。"
+        ),
+    )
+
+    intent_routing_result: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "双层意图路由摘要。包含 source、vector_score、dispatch_action、候选意图分数和"
+            "active_intent_action；不得保存模型思维链或原始敏感槽位。"
+        ),
+    )
+
+    active_intent_state: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "从 Redis Session 恢复或准备写回的保险活跃意图信封。"
+            "只保存 intent、待回答焦点、已问焦点、置信度和时间，不保存精确资产原文。"
         ),
     )
 
     capability_route: str | None = Field(
         default=None,
         description=(
-            "能力路由结果。用于判断请求走通用能力、业务 Skill、销售智能层还是人工审批。"
-            "例如 general_capability、domain_skill、sales_intelligence、human_approval。"
+            "能力路由结果。用于判断请求走通用能力、业务 Skill、销售智能层还是策略阻断。"
+            "例如 general_capability、domain_skill、sales_intelligence、blocked。"
         ),
     )
 
@@ -469,7 +494,7 @@ class AgentState(BaseModel):
     kyc_question_round_count: int = Field(
         default=0,
         ge=0,
-        description="KYC 补问轮次。统一最多 4 轮，第 5 轮后禁止继续停在 insufficient。",
+        description="KYC 补问轮次。最大值由 intent_routing.max_kyc_question_rounds 配置。",
     )
 
     asked_focuses: list[str] = Field(
@@ -477,11 +502,11 @@ class AgentState(BaseModel):
         description="已经问过的 KYC 焦点。生产应来自 KYCQuestion 表或 store，而不是字符串拼接。",
     )
 
-    slot_values: dict[str, Any] = Field(
+    insurance_kyc_delta: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "本轮槽位抽取结果。可保存客户类型、公司实体、时间范围、工具参数、"
-            "澄清缺口等结构化信息，供后续 Query Understanding、Tool Planning 和生成节点使用。"
+            "本轮由 LLM/规则抽取并通过领域 Schema 校验的保险 KYC 增量。"
+            "它只属于保险代码路径，不是通用工具槽位。"
         ),
     )
 
@@ -570,7 +595,7 @@ class AgentState(BaseModel):
     context_needs: dict[str, bool] = Field(
         default_factory=dict,
         description=(
-            "上下文需求规划结果。用于声明本轮是否需要 memory、rag、tool、human、reject、"
+            "上下文需求规划结果。用于声明本轮是否需要 memory、rag、tool、safe_response、reject、"
             "以及是否需要澄清。后续 graph 根据该字段选择分支。"
         ),
     )
@@ -613,7 +638,7 @@ class AgentState(BaseModel):
         description=(
             "KYC 策略生成节点优先使用的紧凑上下文。"
             "它合并 confirmed/uncertain 客户事实、从业者事实、case 状态、已问焦点、"
-            "缺失字段、已审核销售模式和新闻摘要，并过滤 PII 与原始对话全文。"
+            "缺失字段、已通过生成准入的销售模式和新闻摘要，并过滤 PII 与原始对话全文。"
         ),
     )
 
@@ -638,6 +663,14 @@ class AgentState(BaseModel):
         ),
     )
 
+    insurance_knowledge_context: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "代码化保险处理器从沟通方法库与合同合规库检索到的紧凑上下文。"
+            "每条记录只包含受控摘要、分数和来源 ID，不包含未通过生成准入的原文。"
+        ),
+    )
+
     # =========================
     # 8. 工具调用与风控字段
     # =========================
@@ -654,7 +687,7 @@ class AgentState(BaseModel):
         default_factory=list,
         description=(
             "工具规划结果。每条计划建议包含 tool_name、arguments、risk_level、permission_scope、"
-            "requires_approval，用于执行前校验和 trace。"
+            "side_effect_level，用于执行前校验和 trace。"
         ),
     )
 
@@ -688,8 +721,8 @@ class AgentState(BaseModel):
     tool_loop_stop_reason: str | None = Field(
         default=None,
         description=(
-            "工具循环停止原因，例如 finished、max_iterations、repeated_tool_plan、"
-            "tool_error_budget_exceeded 或 human_approval。"
+            "工具循环停止原因，例如 finished、max_iterations、repeated_tool_plan 或 "
+            "tool_error_budget_exceeded。"
         ),
     )
 
@@ -737,7 +770,7 @@ class AgentState(BaseModel):
         default="low",
         description=(
             "本轮请求的语义风险等级。建议取 low、medium、high。"
-            "工具规划、人审、输出策略和审计都可以复用该字段。"
+            "工具规划、同步降级、输出策略和审计都可以复用该字段。"
         ),
     )
 
@@ -880,25 +913,35 @@ class AgentState(BaseModel):
             event: 事件名称，例如 state_transition、tool_called、rag_retrieved。
             **fields: 该事件的额外结构化字段。
         """
-        # trace_events 是完整审计事件流，所有事件都带统一身份字段，便于日志系统按 trace/session/workflow 聚合。
-        self.trace_events.append(
-            {
-                # ts 使用 UTC ISO 字符串，保证跨机器、跨时区日志可排序。
-                "ts": utc_now_iso(),
-                # event 记录事件类型，例如 state_transition、tool_called、rag_retrieved。
-                "event": event,
-                # trace_id 串联一次 Agent 请求的所有节点、工具和检索事件。
-                "trace_id": self.trace_id,
-                # session_id 让多轮对话排障时能跨请求关联。
-                "session_id": self.session_id,
-                # workflow_name 方便同一服务内区分通用 Agent、保险顾问、销售语料导入等不同工作流。
-                "workflow_name": self.workflow_name,
-                # domain_skill 记录命中的业务 Skill，通用请求可能为空。
-                "domain_skill": self.domain_skill,
-                # fields 承载调用方传入的节点名、工具结果、检索摘要、成本等事件细节。
-                **fields,
-            }
-        )
+        # trace_event 先构造成单一对象，确保内存审计轨迹与实时日志消费的是同一条事件。
+        trace_event = {
+            # ts 使用 UTC ISO 字符串，保证跨机器、跨时区日志可排序。
+            "ts": utc_now_iso(),
+            # event 记录事件类型，例如 state_transition、tool_called、rag_retrieved。
+            "event": event,
+            # trace_id 串联一次 Agent 请求的所有节点、工具和检索事件。
+            "trace_id": self.trace_id,
+            # session_id 让多轮对话排障时能跨请求关联。
+            "session_id": self.session_id,
+            # workflow_name 仅保留兼容调用标签；真实保险路由由 intent/domain_skill 解释。
+            "workflow_name": self.workflow_name,
+            # domain_skill 记录命中的业务 Skill，通用请求可能为空。
+            "domain_skill": self.domain_skill,
+            # fields 承载调用方传入的节点名、工具结果、检索摘要、成本等事件细节。
+            **fields,
+        }
+        # trace_events 始终保留完整进程内审计数据，供响应契约、评估与问题回放使用。
+        self.trace_events.append(trace_event)
+        # WorkflowEngine 绑定 Sink 后，每个节点事件会立即写日志，异常中断也不会丢失前序步骤。
+        if self._trace_event_sink is not None:
+            # Sink 只收到当前事件；日志层负责做字段白名单投影，禁止直接落完整业务上下文。
+            self._trace_event_sink(trace_event)
+
+    def bind_trace_event_sink(self, sink: Callable[[dict[str, Any]], None] | None) -> None:
+        """绑定请求级实时 Trace Sink；传入 None 可显式解除绑定。"""
+
+        # PrivateAttr 保证回调只存在于当前进程，不进入 Pydantic dump、数据库快照或 API 响应。
+        self._trace_event_sink = sink
 
     def move_to(
         self,
@@ -936,6 +979,7 @@ class AgentState(BaseModel):
         allowed_next_states = self.allowed_transitions.get(self.current_state.value)
         # 如果配置了 allowed_transitions 且目标节点不在白名单内，就立即阻断非法跳转。
         if allowed_next_states is not None and node.value not in allowed_next_states:
+            # 异常同时包含起点和终点，调用方可以精确定位缺少的状态白名单边。
             raise ValueError(
                 f"非法状态跳转：{self.current_state.value} -> {node.value}。"
                 "如需允许该路径，请在 allowed_transitions 中显式配置。"
@@ -955,6 +999,8 @@ class AgentState(BaseModel):
             "reason": reason,
             # metadata 保存跳转相关的小型结构化补充信息。
             "metadata": metadata or {},
+            # step_index 按本次请求真实执行顺序递增，分支跳过的节点不会占用序号。
+            "step_index": len(self.state_transitions) + 1,
         }
 
         # 保留一条轻量事件记录。后续如果希望 messages 只保存对话消息，
@@ -972,6 +1018,8 @@ class AgentState(BaseModel):
 
         # 如果进入终止节点，记录最终状态。
         if node in {AgentNode.FINAL, AgentNode.ERROR}:
+            # 保存实例依赖 final_state，供后续方法在同一生命周期内复用。
             self.final_state = node
 
+        # 返回当前实例，支持链式校验或构造流程。
         return self

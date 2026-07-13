@@ -58,4 +58,5 @@ def main() -> int:
 
 # 直接运行 python3 evals/run_evals.py 时执行 main；被测试导入时不自动运行。
 if __name__ == "__main__":
+    # 直接运行评估脚本时把失败状态传给 CI；作为模块导入时只暴露可复用 main。
     raise SystemExit(main())

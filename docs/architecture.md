@@ -1,33 +1,39 @@
 # 架构设计
 
-本项目采用 Control Plane / Data Plane 分离架构。
+项目采用显式状态机驱动的单 Agent 混合架构。外层 Python 控制顺序、安全和状态；模型当前参与灰区
+语义裁定与保险 KYC 事实抽取。通用回答和保险策略现阶段使用可测试的确定性生成器，真实生成模型端点
+已预留但尚未成为默认执行路径。
 
 ```mermaid
 flowchart TD
-    A["用户 / 前端 / Dify"] --> B["FastAPI Agent Gateway"]
-    B --> C["Agent Core"]
-    C --> D["AgentGraph Runtime<br/>显式状态机"]
-    C --> E["General Capability Layer 通用能力层"]
-    C --> F["Domain Skill Router 业务技能路由"]
-    F --> G["Insurance Advisor Skill 保险顾问技能"]
-    G --> H["Sales Intelligence Layer 销售实战智能层"]
-    C --> I["Guardrails 安全合规"]
-    C --> J["Cost Control 成本控制"]
-    D --> K["本地结构化日志"]
-    D --> L["LangSmith Adapter"]
+    A["CLI / Web / Dify Adapter"] --> B["FastAPI Gateway"]
+    B --> C["WorkflowEngine compatibility facade"]
+    C --> D["AgentGraph code runtime"]
+    D --> G["Input / Tool / Output Guardrails"]
+    D --> M["Redis Session / Task / Active Intent"]
+    D --> I["Vector Intent Knowledge Base"]
+    I --> J["LLM Intent Adjudicator"]
+    J --> K["Confidence Dispatcher"]
+    K -->|general| T["Tool / RAG / Direct Response"]
+    K -->|insurance| H["Code-native Insurance Handler"]
+    H --> P["Insurance KYC Pydantic Schema"]
+    H --> BM["Business Memory Store"]
+    H --> KB1["Methods / Anonymous Cases KB"]
+    H --> KB2["Contract / Compliance KB"]
+    H --> N["Optional Read-only News Tool"]
+    D --> O["Grounding / Compliance / PII"]
+    D --> L["Structured Trace / LangSmith Adapter"]
 ```
 
-## 各层职责
+## 层级职责
 
-- `FastAPI Agent Gateway`：负责公网入口、请求校验、鉴权、限流、租户隔离、trace id 注入。
-- `AgentGraph Runtime`：自研显式状态机（`src/agent_core/graph/builder.py`），负责节点执行、线性状态流转和未来 checkpoint/recovery。
-- `Agent Core`：负责意图路由、工具系统、RAG、Memory、Context、Guardrails、Recovery、Cost Control。
-- `Domain Skill`：负责垂直业务逻辑，当前第一个 Skill 是保险顾问。
-- `Sales Intelligence Layer`：负责销售访谈语料加工、结构化卡片、检索、合规审查、评估生成。
-- `Dify Control Plane`：负责可视化配置、Prompt 管理、内部调试，不承担生产主入口职责。
-- `LangSmith`：负责可选 trace、dataset、evaluation、experiment，本地日志仍是基础保障。
+- Gateway：鉴权、租户绑定、限流、请求上限和隐私接口；
+- AgentGraph：确定性节点顺序、状态转移、恢复和最终收敛；
+- Intent Layer：活跃意图、漂移检测、向量 TopK、LLM 裁定和置信度分发；
+- General Capability：Tool Schema、权限、副作用检查、执行和结果校验；
+- Insurance Handler：领域 KYC、业务记忆、双知识库、新闻清洗和策略生成；
+- Guardrails：输入、工具、输出和 PII；高风险同步阻断或降级；
+- Observability：不含 PII 和隐藏推理链的结构化 Trace。
 
-## 为什么这样拆
-
-如果所有逻辑都写进一个 Prompt，后续很难排查问题，也无法做权限、状态恢复、成本预算和评估。当前拆法让每层边界清楚：业务 Skill 可以换，工具 provider 可以换，RAG 后端可以换，但 Agent Core 的运行契约保持稳定。
-
+Dify 可继续调用 HTTP API 或管理离线 Prompt，但不再承载保险运行逻辑。完整流程见
+[request-lifecycle-flowchart.md](request-lifecycle-flowchart.md)。

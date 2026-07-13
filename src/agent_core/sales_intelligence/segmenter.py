@@ -44,6 +44,7 @@ def classify_scene(text: str) -> str:
     for scene, keywords in SCENE_KEYWORDS.items():
         # 本地版本使用关键词分类，生产可替换为模型分类器。
         if any(keyword in text for keyword in keywords):
+            # 返回首个命中的稳定场景标签，保证规则分类结果可复现。
             return scene
     # 没有命中任何关键词时返回 unknown，避免随意猜测销售场景。
     return "unknown"

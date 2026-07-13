@@ -5,7 +5,10 @@
 """
 
 from agent_core.config.runtime import (
+    ApiRuntimeConfig,
     DatabaseConfig,
+    IntentRoutingConfig,
+    InsuranceKnowledgeConfig,
     MemoryConfig,
     ModelEndpointConfig,
     RetrievalConfig,
@@ -13,8 +16,12 @@ from agent_core.config.runtime import (
     load_runtime_settings,
 )
 
+# 明确配置包的稳定公开接口，调用方无需依赖 runtime.py 的内部 YAML 辅助函数。
 __all__ = [
+    "ApiRuntimeConfig",
     "DatabaseConfig",
+    "IntentRoutingConfig",
+    "InsuranceKnowledgeConfig",
     "MemoryConfig",
     "ModelEndpointConfig",
     "RetrievalConfig",

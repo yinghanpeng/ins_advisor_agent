@@ -10,4 +10,5 @@ from agent_core.utils.time import utc_now_iso
 
 def run(_: dict | None = None) -> dict[str, str]:
     """返回当前 UTC 时间，作为无外部依赖的时间工具。"""
+    # 在返回时实时读取 UTC 时间，避免模块加载时间被错误地当作请求时间。
     return {"utc_time": utc_now_iso()}

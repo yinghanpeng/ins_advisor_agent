@@ -13,19 +13,19 @@ description = "Production Agent Framework with Insurance Advisor skill and Sales
 requires-python = ">=3.11"
 # dependencies 是核心运行依赖；main.py、本地 workflow 和测试都会用到。
 dependencies = [
-  # Pydantic v2 用于 AgentState、工具 schema、workflow contract 等结构化模型。
+  # Pydantic v2 用于 AgentState、意图/KYC、工具 Schema 和 API 等结构化模型。
   "pydantic>=2.7",
   # PyYAML 用于读取/导出 YAML 配置和 Dify workflow。
   "PyYAML>=6.0",
-  # LangSmith 是可选观测增强；缺 API key 时不会阻断本地运行。
-  "langsmith>=0.4",
+  # LangSmith SDK 提供已验证的 RunTree、自动批处理、flush 和多 Workspace Client 参数。
+  "langsmith>=0.9.8,<1.0",
   # httpx 统一承载 OpenAI-compatible Chat/Embedding/Reranker HTTP 调用。
   "httpx>=0.27",
   # SQLAlchemy Core 用于 PostgreSQL / pgvector repository 和 migration runner。
   "SQLAlchemy>=2.0",
   # psycopg 是 PostgreSQL 生产连接驱动，配合 SQLAlchemy 使用。
   "psycopg[binary]>=3.2",
-  # redis 用于后续限流、审批超时队列和分布式 runtime 状态。
+  # redis 用于限流、活跃意图、Session/Task 和分布式 runtime 状态。
   "redis>=5.0",
 ]
 
@@ -44,6 +44,15 @@ dev = [
   # alembic 可用于生产 migration 管理；本仓库同时提供轻量 SQL runner。
   "alembic>=1.13",
 ]
+# reranker 分组提供本地 CrossEncoder 服务；模型权重仍在首次启动时由 sentence-transformers 下载。
+reranker = [
+  # sentence-transformers 封装 Hugging Face CrossEncoder，支持中文语义相关性重排。
+  "sentence-transformers>=3.0",
+]
+
+[tool.setuptools.package-data]
+# 将本地调试台随 agent_core.api 包一起发布，非 editable 安装时也能访问根路径页面。
+"agent_core.api" = ["static/*.html"]
 
 [tool.pytest.ini_options]
 # pythonpath 指向 src，保证测试直接 import agent_core。

@@ -19,5 +19,4 @@
 
 ## 后续扩展
 
-生产环境应接入真实模型 token usage callback，并按 tenant / user / workflow 做预算隔离。
-
+生产环境应接入真实模型 token usage callback，并按 tenant / user / intent / domain_skill 做预算隔离。`workflow_name` 是兼容标签，不应成为保险成本边界。

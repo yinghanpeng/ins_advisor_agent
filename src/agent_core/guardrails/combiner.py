@@ -5,13 +5,13 @@
 # - 设计要求：纯函数、确定性、可审计、带严格优先级。相同输入永远得到相同裁决。
 # - 优先级（严格从高到低）：
 #     1) 任一 HIGH 且建议 BLOCK 的信号（硬闸确定性注入 / LLM 判 malicious） → BLOCK
-#     2) LLM Judge 明确判 suspicious（建议 REVIEW）                          → REVIEW（人工复核）
+#     2) LLM Judge 明确判 suspicious（建议 SAFE_FALLBACK）                    → 同步安全降级
 #     3) 任一 PII 信号                                                       → MASK（脱敏续跑）/ 按策略 BLOCK
 #     4) 仅有硬闸灰区软信号（soft_suspicious）：
 #          - LLM 判定 safe        → ALLOW
 #          - LLM 不可用/未覆盖     → 按 policy.gray_zone_default 兜底
 #     5) 无任何信号                                                          → ALLOW
-# - 关键设计：硬闸的"软可疑信号"本身不等于 REVIEW，它只是"灰区触发器"；
+# - 关键设计：硬闸的"软可疑信号"本身不直接决定动作，它只是"灰区触发器"；
 #   最终灰区如何处置由 LLM 判定或 policy.gray_zone_default 决定，从而实现"策略与机制解耦"。
 """
 
@@ -36,9 +36,9 @@ class InputGuardrailPolicy(BaseModel):
     """
 
     # 灰区兜底动作：软信号存在、但 LLM Judge 不可用或判定不确定时如何处置。
-    # 可选 allow / review / block；默认 review（fail-closed 的温和档，不直接拦截也不放任）。
+    # 可选 allow / safe_fallback / block；默认同步降级，不依赖人工渠道。
     gray_zone_default: GuardrailAction = Field(
-        default=GuardrailAction.REVIEW,
+        default=GuardrailAction.SAFE_FALLBACK,
         description="灰区无法自动判定安全时的兜底动作。",
     )
     # PII 命中时是否拦截；默认 False，即脱敏续跑（MASK）而非 BLOCK。
@@ -63,6 +63,7 @@ def combine(
 
     # 无任何信号：直接放行，风险 LOW。这是最常见的正常路径。
     if not signals:
+        # 返回不触发动作的低风险裁决，并保留空证据链。
         return GuardrailDecision(
             action=GuardrailAction.ALLOW,
             risk_level=RiskLevel.LOW,
@@ -72,24 +73,29 @@ def combine(
             sanitized_text=None,
         )
 
-    # 预先分类信号，按"来源 + 建议动作"精确区分，避免灰区软信号被误当成确定性 REVIEW。
+    # 预先分类信号，按"来源 + 建议动作"精确区分，避免灰区软信号被误当成确定性阻断。
     # block_signals：HIGH 且建议 BLOCK 的确定性信号（硬闸注入 或 LLM 判 malicious）。
     block_signals = [s for s in signals if s.severity == RiskLevel.HIGH and s.suggested_action == GuardrailAction.BLOCK]
-    # llm_review_signals：LLM Judge 明确判 suspicious（建议 REVIEW），这是真正需要人工复核的语义结论。
-    llm_review_signals = [
-        s for s in signals if s.source == SignalSource.LLM_JUDGE and s.suggested_action == GuardrailAction.REVIEW
+    # llm_fallback_signals：LLM Judge 明确判 suspicious，当前产品同步返回安全降级答复。
+    llm_fallback_signals = [
+        s
+        for s in signals
+        if s.source == SignalSource.LLM_JUDGE and s.suggested_action == GuardrailAction.SAFE_FALLBACK
     ]
     # pii_signals：PII 扫描信号。
     pii_signals = [s for s in signals if s.source == SignalSource.PII_SCAN]
-    # soft_gray_signals：硬闸软可疑信号，仅作"灰区触发器"，处置由 LLM/策略决定，本身不直接 REVIEW。
+    # soft_gray_signals：硬闸软可疑信号，仅作"灰区触发器"，处置由 LLM/策略决定。
     soft_gray_signals = [
-        s for s in signals if s.source == SignalSource.HARD_RULE and s.suggested_action == GuardrailAction.REVIEW
+        s
+        for s in signals
+        if s.source == SignalSource.HARD_RULE and s.suggested_action == GuardrailAction.SAFE_FALLBACK
     ]
     # llm_safe：LLM Judge 明确判定 safe（用于灰区放行）。
     llm_safe = any(s.source == SignalSource.LLM_JUDGE and s.suggested_action == GuardrailAction.ALLOW for s in signals)
 
     # 优先级 1：确定性拦截。任何 HIGH+BLOCK 信号一票否决。
     if block_signals:
+        # 返回高风险 BLOCK，并聚合所有确定性信号说明。
         return GuardrailDecision(
             action=GuardrailAction.BLOCK,
             risk_level=RiskLevel.HIGH,
@@ -99,21 +105,23 @@ def combine(
             sanitized_text=None,
         )
 
-    # 优先级 2：人工复核。仅当 LLM Judge 明确判 suspicious 时才进入 REVIEW（确定性的语义结论）。
-    if llm_review_signals:
+    # 优先级 2：同步安全降级。不执行原请求，也不创建待处理任务。
+    if llm_fallback_signals:
+        # 返回 MEDIUM 安全降级，让客户立即获得替代说明。
         return GuardrailDecision(
-            action=GuardrailAction.REVIEW,
+            action=GuardrailAction.SAFE_FALLBACK,
             risk_level=RiskLevel.MEDIUM,
             triggered=True,
-            reason="；".join(s.detail for s in llm_review_signals) or "LLM 判定为可疑，需人工复核。",
+            reason="；".join(s.detail for s in llm_fallback_signals) or "LLM 判定为可疑，已转为安全降级答复。",
             signals=signals,
             sanitized_text=None,
         )
 
-    # 优先级 3：PII 处置。到这里说明没有确定性拦截也无需人工，PII 走脱敏续跑（除非策略要求拦截）。
+    # 优先级 3：PII 处置。到这里说明没有确定性拦截，PII 走脱敏续跑（除非策略要求拦截）。
     if pii_signals:
         # 策略要求 PII 直接拦截时走 BLOCK。
         if policy.block_on_pii:
+            # 按租户策略返回 PII BLOCK，不生成脱敏续跑文本。
             return GuardrailDecision(
                 action=GuardrailAction.BLOCK,
                 risk_level=RiskLevel.MEDIUM,
@@ -123,6 +131,7 @@ def combine(
                 sanitized_text=None,
             )
         # 默认对 PII 脱敏后继续。
+        # 返回 MASK 并附带统一脱敏后的输入供下游替换。
         return GuardrailDecision(
             action=GuardrailAction.MASK,
             risk_level=RiskLevel.MEDIUM,
@@ -137,6 +146,7 @@ def combine(
     if soft_gray_signals:
         # LLM 已明确判定安全，灰区解除，直接放行。
         if llm_safe:
+            # 返回低风险 ALLOW，同时保留灰区信号供审计。
             return GuardrailDecision(
                 action=GuardrailAction.ALLOW,
                 risk_level=RiskLevel.LOW,
@@ -145,8 +155,9 @@ def combine(
                 signals=signals,
                 sanitized_text=None,
             )
-        # LLM 不可用或未覆盖：按租户策略兜底（默认 REVIEW，可配 allow/block）。
+        # LLM 不可用或未覆盖：按租户策略兜底（默认 SAFE_FALLBACK）。
         fallback_action = policy.gray_zone_default
+        # 返回策略指定动作并依据是否放行计算风险与 triggered。
         return GuardrailDecision(
             action=fallback_action,
             risk_level=RiskLevel.MEDIUM if fallback_action != GuardrailAction.ALLOW else RiskLevel.LOW,
@@ -157,6 +168,7 @@ def combine(
         )
 
     # 优先级 5：走到这里说明只剩 LLM 判 safe 或无实质风险信号，放行。
+    # 返回最终低风险 ALLOW，保留所有原始证据信号用于回放。
     return GuardrailDecision(
         action=GuardrailAction.ALLOW,
         risk_level=RiskLevel.LOW,

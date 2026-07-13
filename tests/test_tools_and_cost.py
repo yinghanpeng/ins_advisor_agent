@@ -1,10 +1,14 @@
 # 文件说明：
 # - 本文件是测试用例，用来验证生产级 Agent 架构中的一个或多个关键能力。
 # - 测试既是质量保障，也是给新手看的最小用法示例。
+import time
+
 from agent_core.capabilities.calculator import run as calculator_run
 from agent_core.cost.budget import CostBudget
+from agent_core.tools.executor import CAPABILITY_RUNNERS, execute_tool_call
 from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.router import ToolRouter
+from agent_core.tools.schemas import ToolCall
 
 
 def test_tool_registry_and_router():
@@ -61,3 +65,31 @@ def test_tool_spec_contains_permission_metadata():
     assert spec.permission.level == "tenant"
     # internet.read scope 会被 ToolPermissionPolicy 用于白名单判断。
     assert spec.permission.scope == "internet.read"
+
+
+def test_tool_timeout_returns_without_waiting_for_worker_shutdown(monkeypatch) -> None:
+    """Runner 超时后当前请求必须立即降级，不能被线程池上下文再次阻塞。"""
+    registry = ToolRegistry.with_defaults()
+    base_spec = registry.get("summarizer")
+    assert base_spec is not None
+    # 20ms 工具预算配合 250ms 慢任务，足以暴露 with ThreadPoolExecutor 的隐式 wait=True。
+    timeout_spec = base_spec.model_copy(
+        update={"timeout_ms": 20, "retryable": False, "retry_policy": {"max_attempts": 1}}
+    )
+
+    def slow_runner(arguments):
+        del arguments
+        time.sleep(0.25)
+        return {"summary": "late result"}
+
+    monkeypatch.setitem(CAPABILITY_RUNNERS, "summarizer", slow_runner)
+    started = time.perf_counter()
+    result = execute_tool_call(
+        ToolCall(name="summarizer", arguments={"text": "需要摘要的文本"}),
+        timeout_spec,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert result.status == "error"
+    assert "timeout" in (result.error or "")
+    assert elapsed < 0.15

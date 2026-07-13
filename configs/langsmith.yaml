@@ -2,15 +2,41 @@
 # - 本配置文件用于描述运行时参数，避免把环境差异硬编码在 Python 代码中。
 # - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
 
+# langsmith 描述可选远程观测平台的环境变量映射和采集范围。
 langsmith:
+  # enabled_env 指定控制 LangSmith tracing 是否启用的环境变量名。
   enabled_env: LANGSMITH_TRACING
+  # api_key_env 指定存放 LangSmith API Key 的环境变量名。
   api_key_env: LANGSMITH_API_KEY
+  # project_env 指定存放 LangSmith 项目名称的环境变量名。
   project_env: LANGSMITH_PROJECT
+  # endpoint_env 指定存放 LangSmith 服务端点的环境变量名。
   endpoint_env: LANGSMITH_ENDPOINT
+  # workspace_id_env 指定多 Workspace 账号选择目标 Workspace 的可选环境变量名。
+  workspace_id_env: LANGSMITH_WORKSPACE_ID
+  # sampling_rate_env 指定运行时追踪采样率环境变量名，允许范围为 0.0 到 1.0。
+  sampling_rate_env: LANGSMITH_SAMPLING_RATE
+  # flush_timeout_env 指定应用关闭时等待异步追踪上传完成的最长秒数环境变量名。
+  flush_timeout_env: LANGSMITH_FLUSH_TIMEOUT_SECONDS
+  # data_policy_env 在 control_plane_only 与 full_business_content 两种远程数据策略间切换。
+  data_policy_env: LANGSMITH_DATA_POLICY
+  # max_field_chars_env 限制完整模式单个字符串上传体积，超出部分保留截断标记。
+  max_field_chars_env: LANGSMITH_MAX_FIELD_CHARS
+  # max_collection_items_env 限制完整模式单个列表或字典的最大项目数。
+  max_collection_items_env: LANGSMITH_MAX_COLLECTION_ITEMS
+  # thread_grouping_env 控制是否把同一业务 Session 的根 Run 聚合到 Threads/Turns 视图。
+  thread_grouping_env: LANGSMITH_THREAD_GROUPING
+  # graceful_degradation 允许远程观测不可用时继续运行并保留本地 trace。
   graceful_degradation: true
+  # credential_redaction 是不可关闭的保护层；即使完整模式也禁止密钥、密码和认证 Token 上传。
+  credential_redaction: always_on
+  # trace_nodes 控制是否记录状态机节点的开始、结束和状态变化。
   trace_nodes: true
+  # trace_tools 控制是否记录工具调用元数据与执行结果摘要。
   trace_tools: true
+  # trace_retrieval 控制是否记录检索查询、候选与证据选择过程。
   trace_retrieval: true
+  # trace_guardrails 控制是否记录 Guardrail 决策和安全信号摘要。
   trace_guardrails: true
+  # trace_sales_intelligence 控制是否记录销售智能检索与洞察使用过程。
   trace_sales_intelligence: true
-

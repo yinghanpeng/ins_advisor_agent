@@ -24,10 +24,10 @@ class RecoveryPlan(BaseModel):
         ...,
         description="错误类型，例如 tool_timeout、json_parse_failed、rag_no_result、high_risk_output。",
     )
-    # action 决定 workflow 接下来是重试、降级、人审还是失败终止。
-    action: Literal["retry", "fallback", "human_approval", "fail"] = Field(
+    # action 决定 workflow 接下来是重试、降级还是失败终止。
+    action: Literal["retry", "fallback", "fail"] = Field(
         ...,
-        description="恢复动作：retry 重试，fallback 降级回答，human_approval 人工审批，fail 终止。",
+        description="恢复动作：retry 重试，fallback 同步降级回答，fail 终止。",
     )
     # reason 是面向 trace 和用户解释的恢复原因。
     reason: str = Field(..., description="选择该恢复动作的原因，要求可写入 trace 并对用户解释。")
@@ -54,9 +54,10 @@ class RecoveryPlan(BaseModel):
 
 
 def plan_recovery(error_type: str, reason: str, retryable: bool = False) -> RecoveryPlan:
-    """根据错误类型生成恢复计划，供 workflow engine 决定重试、降级或人工审批。"""
+    """根据错误类型生成恢复计划，供 workflow engine 决定重试、降级或终止。"""
     # retryable=True 时优先生成 retry 计划，并附带最终失败后的 fallback_message。
     if retryable:
+        # 返回最多两次尝试的计划；耗尽次数后使用同一原因生成保守降级说明。
         return RecoveryPlan(
             error_type=error_type,
             action="retry",
@@ -65,9 +66,15 @@ def plan_recovery(error_type: str, reason: str, retryable: bool = False) -> Reco
             max_attempts=2,
             fallback_message=fallback_answer(reason),
         )
-    # 高风险输出或高风险工具不自动降级，必须进入人工审批。
+    # 高风险输出或工具不执行原动作，同步返回安全降级说明。
     if error_type in {"high_risk_output", "high_risk_tool"}:
-        return RecoveryPlan(error_type=error_type, action="human_approval", reason=reason)
+        # 高风险错误不可自动重试原动作，直接返回无副作用的信息型降级计划。
+        return RecoveryPlan(
+            error_type=error_type,
+            action="fallback",
+            reason=reason,
+            fallback_message="该高风险操作或表达已被阻断，我可以提供无副作用的信息说明。",
+        )
     # 其他不可重试错误默认降级回答，保证用户能得到清楚说明。
     return RecoveryPlan(
         error_type=error_type,

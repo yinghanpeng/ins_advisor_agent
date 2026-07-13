@@ -37,7 +37,7 @@
 - `input_guardrail`
 - `context_need_planning`
 - `generate_clarification_response`
-- `agentic_tool_loop`
+- `agentic_tool_loop`（仅实验调用时；当前主链路不进入）
 - `general_tool_call`
 - `generate_response`
 - `grounding_verification`
@@ -56,7 +56,9 @@
 - `/agent/stream`
 - `run_agent_stream(request)`
 
-当前 `/agent/stream` 同步执行 workflow，然后返回 `stream_events` 和 `final_response`。未来可替换为 FastAPI `StreamingResponse` 或 SSE，不需要改 AgentState。
+当前 `/agent/stream` 同步执行 workflow，然后返回 `stream_events` 和客户安全的
+`PublicAgentRunResponse` 作为 `final_response`。完整 Trace、检索正文、工具输入输出和成本不会进入该
+字段。未来可替换为 FastAPI `StreamingResponse` 或 SSE，不需要改 AgentState。
 
 ## PII 安全
 

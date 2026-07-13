@@ -2,22 +2,39 @@
 # - 本配置文件用于描述运行时参数，避免把环境差异硬编码在 Python 代码中。
 # - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
 
+# domain_skills 是领域能力注册表，控制各业务 Skill 是否可被路由。
 domain_skills:
+  # insurance_advisor 是当前已实现的保险顾问领域 Skill。
   insurance_advisor:
+    # enabled=true 表示意图命中后允许进入保险顾问链路。
     enabled: true
-    workflow: break_ice_assistant_workflow
+    # handler 指向代码化保险会话处理器；不再依赖 Dify 或独立 Workflow 配置。
+    handler: agent_core.graph.builder.AgentGraph._run_insurance_conversation
+    # uses_sales_intelligence 表示该 Skill 会读取已通过静态生成准入的销售智能资料。
     uses_sales_intelligence: true
+    # prompt_directory 保存生成类 Prompt；事实合并、评分和路由必须留在 Python 代码中。
     prompt_directory: src/agent_core/skills/insurance_advisor/prompts
+  # research_assistant 预留多来源研究与证据综合领域 Skill。
   research_assistant:
+    # enabled=false 表示当前不允许路由到尚未实现的研究助手。
     enabled: false
+  # document_analysis 预留文件解析和文档问答领域 Skill。
   document_analysis:
+    # enabled=false 表示当前不允许路由到尚未实现的文档分析能力。
     enabled: false
+  # interview_assistant 预留访谈提纲和访谈辅助领域 Skill。
   interview_assistant:
+    # enabled=false 表示当前不允许路由到尚未实现的访谈助手。
     enabled: false
+  # sales_assistant 预留通用销售辅助领域 Skill。
   sales_assistant:
+    # enabled=false 表示当前不允许路由到尚未实现的销售助手。
     enabled: false
+  # customer_service 预留客户服务问答与工单辅助领域 Skill。
   customer_service:
+    # enabled=false 表示当前不允许路由到尚未实现的客服能力。
     enabled: false
+  # data_analysis 预留结构化数据分析领域 Skill。
   data_analysis:
+    # enabled=false 表示当前不允许路由到尚未实现的数据分析能力。
     enabled: false
-

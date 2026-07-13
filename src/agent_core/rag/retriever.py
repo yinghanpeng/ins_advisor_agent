@@ -17,10 +17,13 @@ from agent_core.rag.schemas import (
 from agent_core.rag.vector import token_jaccard
 
 
+# 风险等级转换为可比较数值，禁止直接比较字符串字典序。
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 class InMemoryRetriever:
+    """面向单元测试和轻量适配器的纯内存词法检索器。"""
+
     def __init__(self, documents: list[dict] | None = None) -> None:
         """初始化本地文档列表，用于轻量单元测试。"""
         # documents 是测试注入的原始 dict 文档；为空时使用空集合，保证检索器可安全实例化。
@@ -68,7 +71,8 @@ class HybridRetriever:
                         tenant_id=str(metadata.get("tenant_id", "local")),
                         tags=list(metadata.get("tags", [])),
                         risk_level=metadata.get("risk_level", "low"),
-                        approved_for_generation=bool(metadata.get("approved_for_generation", True)),
+                        # 外部 dict 缺少审批字段时默认拒绝；只接受 literal True，避免 "false" 被 bool() 当真。
+                        approved_for_generation=metadata.get("approved_for_generation", False) is True,
                         extra=dict(metadata.get("extra", {})),
                     ),
                 )
@@ -80,23 +84,29 @@ class HybridRetriever:
         """根据租户、知识库、审批状态、风险和标签判断文档是否允许进入候选集。"""
         # 没有 filters 时默认允许，方便本地测试不配置完整检索约束。
         if filters is None:
+            # 无约束模式不执行租户或准入过滤，仅用于显式选择的本地调用场景。
             return True
         # 取出文档 metadata，后续所有过滤都基于它。
         metadata = document.metadata
         # 租户过滤放在最前面，生产环境不能跨租户检索资料。
         if filters.tenant_id and metadata.tenant_id != filters.tenant_id:
+            # tenant_id 不一致立即拒绝，后续文本相关性不能覆盖隔离规则。
             return False
         # library 过滤保证销售智能检索不会混入其他知识库。
         if filters.libraries and metadata.library not in filters.libraries:
+            # 文档不属于目标知识库时拒绝，避免不同领域证据混入上下文。
             return False
         # 默认只检索 approved_for_generation=true 的资料。
         if filters.approved_only and not metadata.approved_for_generation:
+            # 未通过静态生成准入的资料默认拒绝，在线请求不触发人工审批。
             return False
         # 高风险资料即使文本相关，也不能进入生成链路。
         if RISK_ORDER[metadata.risk_level] > RISK_ORDER[filters.max_risk_level]:
+            # 风险级别超过本次检索上限时同步过滤，不允许高相关性绕过风控。
             return False
         # required_tags 全部命中才允许返回，避免场景不匹配的 chunk 混入结果。
         if filters.required_tags and not set(filters.required_tags).issubset(set(metadata.tags)):
+            # 必需标签没有全部覆盖时拒绝，避免把不适用场景的策略作为证据。
             return False
         # 所有 metadata 约束都通过后，文档才进入打分阶段。
         return True
@@ -105,21 +115,27 @@ class HybridRetriever:
         """计算业务 metadata 加权分，用于和词法/向量分融合。"""
         # 没有 filters 时给中性分，避免 metadata 分完全为 0。
         if filters is None:
+            # 返回固定中性分，让无过滤测试仍可观察三路融合行为。
             return 0.5
         # score_value 表示业务约束匹配程度，不直接代表文本语义相关性。
         score_value = 0.0
         # tenant_id 命中时加分，优先返回当前租户资料。
         if filters.tenant_id and document.metadata.tenant_id == filters.tenant_id:
+            # 在文本分之外奖励租户精确匹配，但租户不匹配已在过滤阶段拒绝。
             score_value += 0.25
         # library 命中时加分，优先返回目标知识库资料。
         if filters.libraries and document.metadata.library in filters.libraries:
+            # 奖励目标知识库命中，使同等文本相关性时领域资料优先。
             score_value += 0.25
         # 标签有重叠时加分，越贴近当前场景分越高。
         if filters.required_tags:
+            # 只计算必需标签交集，额外文档标签不会产生不受控加分。
             overlap = len(set(filters.required_tags) & set(document.metadata.tags))
+            # 每个重叠标签增加有限权重，并将标签部分上限限制为 0.3。
             score_value += min(0.3, overlap * 0.15)
         # 低风险资料优先级更高，鼓励生成链路使用更安全的证据。
         if document.metadata.risk_level == "low":
+            # 给低风险证据安全偏置，使相关度接近时优先使用更稳妥的材料。
             score_value += 0.2
         # metadata 分限制在 1.0 以内，便于和其他分数融合。
         return min(score_value, 1.0)
@@ -133,6 +149,7 @@ class HybridRetriever:
         """执行本地 hybrid search，并保留各类得分方便 trace。"""
         # 如果调用方只传字符串，包装成 RetrievalQuery，统一后续多 query 处理。
         if isinstance(queries, str):
+            # 将原始文本标记为默认检索 Query，后续循环无需分支处理两种输入类型。
             queries = [RetrievalQuery(text=queries)]
         # scored 用 source_id+chunk_id 去重，同一 chunk 被多个 query 命中时只保留最高分。
         scored: dict[tuple[str, str], RetrievalResult] = {}
@@ -142,6 +159,7 @@ class HybridRetriever:
             for document in self.documents:
                 # metadata 过滤先于打分，保证不合规/跨租户资料不会进入候选集。
                 if not self._metadata_allowed(document, filters):
+                    # 当前文档不满足硬约束时直接进入下一候选，不计算或记录任何分数。
                     continue
                 # lexical 代表 BM25/关键词匹配分，本地用轻量 score 模拟。
                 lexical = score(query.text, document.text) * query.weight

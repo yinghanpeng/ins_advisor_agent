@@ -37,6 +37,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
 # 如果 src 还没在模块搜索路径里，就插到最前面，保证导入的是当前项目源码。
 if str(SRC_DIR) not in sys.path:
+    # 把当前仓库的 src 放在搜索路径首位，避免误导入环境中同名旧包。
     sys.path.insert(0, str(SRC_DIR))
 
 # AgentRunRequest/AgentRunResponse 是本地入口、API、Dify webhook 共用的请求/响应契约。
@@ -70,6 +71,7 @@ def _state_path(response: AgentRunResponse) -> list[str]:
     """从响应里的状态迁移记录中提取清晰的状态路径。"""
     # 没有状态迁移时，至少返回 final_state，避免展示空路径。
     if not response.state_transitions:
+        # 用单元素列表保持有无迁移记录时的返回类型一致。
         return [response.final_state]
     # 第一条 transition 的 from_state 是整条路径的起点。
     first = response.state_transitions[0]["from_state"]
@@ -89,6 +91,7 @@ def run_one_message(engine: WorkflowEngine, message: str, index: int | None = No
     print("\n" + "=" * 88)
     # 展示本轮用户输入，便于和后面的 intent、tool、state_path 对照。
     print(f"{title}｜用户输入：{message}")
+    # 结束本轮标题区域，随后输出工作流结果。
     print("=" * 88)
 
     # 构造统一请求契约；这里的字段会在 WorkflowEngine.run 中转换成 AgentState。
@@ -144,11 +147,13 @@ def run_demo(messages: Iterable[str] = DEMO_MESSAGES) -> None:
     """运行默认 demo，让用户不用任何参数也能看到项目如何工作。"""
     # 提示当前是规则演示入口；生产运行需要配置真实模型、数据库和外部工具 provider。
     print("保险顾问生产级 Agent Framework 本地演示")
+    # 明确演示边界，避免用户把离线演示输出误认为实时外部数据。
     print("当前演示不调用外部模型、不联网，适合先理解项目流转。")
     # 创建一个 WorkflowEngine，所有示例共享同一个 MemoryManager。
     engine = WorkflowEngine()
     # 逐条运行默认示例，index 用于打印“示例 1/2/3/4”。
     for index, message in enumerate(messages, 1):
+        # 每条消息均复用同一个 Engine，以展示同一会话中的短期记忆效果。
         run_one_message(engine, message, index=index)
 
 
@@ -162,16 +167,23 @@ def run_interactive() -> None:
     while True:
         # input 可能遇到 EOFError，例如管道输入结束或终端关闭。
         try:
+            # 读取并去除用户输入首尾空白，避免空格被当成有效问题。
             message = input("\n你：").strip()
+        # 标准输入结束属于正常退出路径，无需暴露异常堆栈。
         except EOFError:
+            # 向终端确认交互会话已经结束。
             print("\n已退出。")
+            # 结束交互函数，避免循环继续读取已关闭的输入流。
             return
         # 用户输入 exit/quit 时退出交互模式。
         if message.lower() in {"exit", "quit"}:
+            # 用户显式输入退出命令时打印确认信息。
             print("已退出。")
+            # 立即结束交互会话，不再把退出词发送给 Agent。
             return
         # 空输入不触发 Agent，避免生成无意义 trace。
         if not message:
+            # 空消息直接进入下一轮读取，避免创建无业务意义的 trace。
             continue
         # 非空输入走完整 WorkflowEngine 主链路。
         run_one_message(engine, message)
@@ -195,12 +207,15 @@ def main() -> int:
     args = build_parser().parse_args()
     # -i/--interactive 优先级最高，进入多轮交互。
     if args.interactive:
+        # 启动持续复用同一 Engine 的命令行对话循环。
         run_interactive()
     # -m/--message 只执行一条用户输入。
     elif args.message:
+        # 为单条消息创建 Engine 并执行一次完整工作流。
         run_one_message(WorkflowEngine(), args.message)
     # 没有参数时运行默认四条 demo，帮助新手快速看懂项目。
     else:
+        # 无显式运行模式时执行内置示例集合。
         run_demo()
     # 返回 0 表示命令正常完成。
     return 0
@@ -208,4 +223,5 @@ def main() -> int:
 
 # 只有直接执行 python3 main.py 时才进入 main；被测试导入时不会自动运行 demo。
 if __name__ == "__main__":
+    # 模块作为脚本执行时把 main 返回码交给 shell，作为 import 使用时不会自动启动 CLI。
     raise SystemExit(main())

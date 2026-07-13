@@ -1,7 +1,7 @@
 """Output guardrails for insurance/financial advice."""
 
 # 文件说明：
-# - 本文件属于 Guardrails 层，负责输入安全、工具权限、输出合规或人工审批。
+# - 本文件属于 Guardrails 层，负责输出合规检查和同步安全降级。
 # - 保险金融场景必须拦截收益承诺、避税避债、恐吓营销和编造案例。
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ class OutputGuardrail:
         """检查最终回答是否包含禁用表达，并决定 pass 或 block。"""
         # 重点逻辑：用规则表先拦截最明确的保险/金融禁用表达。
         hits = [term for term in BLOCKED_TERMS if term in text]
+        # 返回稳定合规结果；命中任一禁语即标记 block。
         return {
             "guardrail_name": "insurance_output_compliance",
             "triggered": bool(hits),

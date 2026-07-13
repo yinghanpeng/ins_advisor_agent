@@ -1,67 +1,158 @@
+# 文件说明：
+# - 本配置文件为不同职责的模型定义独立端点、超时和重试预算。
+# - 所有模型名、地址和密钥均从环境变量注入，配置文件不保存真实凭证。
+
+# models 是 ModelRegistry 按职责解析模型客户端的总配置。
 models:
+  # default_chat 承担最终回答生成等质量优先的通用对话任务。
   default_chat:
+    # provider 指定客户端使用 OpenAI 兼容协议。
     provider: openai_compatible
+    # model 从 DEFAULT_CHAT_MODEL 环境变量读取实际模型标识。
     model: ${DEFAULT_CHAT_MODEL}
+    # base_url 从 LLM_BASE_URL 环境变量读取模型服务地址。
     base_url: ${LLM_BASE_URL}
+    # api_key 从 LLM_API_KEY 环境变量读取访问凭证。
     api_key: ${LLM_API_KEY}
+    # timeout_ms 限制单次默认对话调用最多等待 15 秒。
     timeout_ms: 15000
+    # max_retries 允许默认对话调用在瞬时错误后最多重试 2 次。
     max_retries: 2
 
+  # fast_reasoning 承担低延迟路由、判断和轻量结构化推理任务。
   fast_reasoning:
+    # provider 指定客户端使用 OpenAI 兼容协议。
     provider: openai_compatible
+    # model 从 FAST_REASONING_MODEL 环境变量读取低延迟模型标识。
     model: ${FAST_REASONING_MODEL}
+    # base_url 复用统一的 LLM 服务地址。
     base_url: ${LLM_BASE_URL}
+    # api_key 复用统一的 LLM 服务访问凭证。
     api_key: ${LLM_API_KEY}
+    # timeout_ms 将快速推理调用限制在 3 秒内。
     timeout_ms: 3000
+    # max_retries 只允许重试 1 次，避免路由阶段长时间阻塞。
     max_retries: 1
 
+  # memory_recall_decision 仅用于判断当前请求是否需要召回长期记忆。
   memory_recall_decision:
+    # provider 指定客户端使用 OpenAI 兼容协议。
     provider: openai_compatible
+    # model 从 MEMORY_RECALL_DECISION_MODEL 环境变量读取专用模型标识。
     model: ${MEMORY_RECALL_DECISION_MODEL}
+    # base_url 复用统一的 LLM 服务地址。
     base_url: ${LLM_BASE_URL}
+    # api_key 复用统一的 LLM 服务访问凭证。
     api_key: ${LLM_API_KEY}
+    # timeout_ms 与 memory.yaml 的召回决策延迟预算保持一致。
     timeout_ms: 1200
+    # max_retries 只允许重试 1 次，失败后由记忆策略安全降级。
     max_retries: 1
 
+  # query_understanding 用于生成规范化查询、实体和检索提示词。
   query_understanding:
+    # provider 指定客户端使用 OpenAI 兼容协议。
     provider: openai_compatible
+    # model 从 QUERY_UNDERSTANDING_MODEL 环境变量读取专用模型标识。
     model: ${QUERY_UNDERSTANDING_MODEL}
+    # base_url 复用统一的 LLM 服务地址。
     base_url: ${LLM_BASE_URL}
+    # api_key 复用统一的 LLM 服务访问凭证。
     api_key: ${LLM_API_KEY}
+    # timeout_ms 将查询理解调用限制在 3 秒内。
     timeout_ms: 3000
+    # max_retries 只允许重试 1 次，失败后回退到规则理解结果。
     max_retries: 1
 
-  # 意图分类专用端点：classify_intent 优先使用它做结构化意图路由；
-  # 未配置（本地无 API Key）时会自动回退到关键词规则，不影响链路。
+  # 意图裁定专用端点：只有向量相似度低于 0.85 时才调用；不承担第一层召回。
   intent_classifier:
+    # provider 指定客户端使用 OpenAI 兼容协议。
     provider: openai_compatible
+    # model 从 INTENT_CLASSIFIER_MODEL 环境变量读取意图分类模型标识。
     model: ${INTENT_CLASSIFIER_MODEL}
+    # base_url 复用统一的 LLM 服务地址。
     base_url: ${LLM_BASE_URL}
+    # api_key 复用统一的 LLM 服务访问凭证。
     api_key: ${LLM_API_KEY}
+    # timeout_ms 将意图分类调用限制在 2 秒内。
     timeout_ms: 2000
+    # max_retries 只允许重试 1 次，避免分类阶段显著增加首包延迟。
     max_retries: 1
 
+  # 活跃意图变化检测使用更小、更快的结构化模型；仅 local/test 未配置时可复用 fast_reasoning，
+  # staging/prod 会在启动阶段要求本端点完整，禁止静默复用或规则降级。
+  intent_shift_detector:
+    # provider 使用 OpenAI 兼容协议，部署方可接自建小模型服务。
+    provider: openai_compatible
+    # model 从独立环境变量读取，便于与正式意图裁定模型分开扩缩容。
+    model: ${INTENT_SHIFT_MODEL}
+    # base_url 与其它轻量模型复用统一服务地址。
+    base_url: ${LLM_BASE_URL}
+    # api_key 由运行环境注入，配置文件不保存密钥。
+    api_key: ${LLM_API_KEY}
+    # 漂移判断只允许 1.2 秒，超时后使用保守代码判断。
+    timeout_ms: 1200
+    # 不重试，避免活跃多轮每次都增加明显延迟。
+    max_retries: 0
+
+  # 保险 KYC 抽取器只抽本轮明确事实，不计算分数、不决定路由、不生成话术。
+  insurance_kyc_extractor:
+    # provider 使用 OpenAI 兼容结构化输出接口。
+    provider: openai_compatible
+    # model 可选择适合中文信息抽取的轻量模型。
+    model: ${INSURANCE_KYC_EXTRACTOR_MODEL}
+    # base_url 由统一模型服务配置提供。
+    base_url: ${LLM_BASE_URL}
+    # api_key 由 Secret Manager 或环境变量注入。
+    api_key: ${LLM_API_KEY}
+    # 单轮抽取限制 2 秒，失败后回退确定性规则且不写未验证事实。
+    timeout_ms: 2000
+    # 只允许一次重试，控制多轮问答首包延迟。
+    max_retries: 1
+
+  # guardrail 用于规则无法定性的灰区输入语义判定，不持有业务工具权限。
   guardrail:
+    # provider 指定客户端使用 OpenAI 兼容协议。
     provider: openai_compatible
+    # model 从 GUARDRAIL_MODEL 环境变量读取安全判定模型标识。
     model: ${GUARDRAIL_MODEL}
+    # base_url 复用统一的 LLM 服务地址。
     base_url: ${LLM_BASE_URL}
+    # api_key 复用统一的 LLM 服务访问凭证。
     api_key: ${LLM_API_KEY}
+    # timeout_ms 将 Guardrail 灰区判定限制在 2 秒内。
     timeout_ms: 2000
+    # max_retries 只允许重试 1 次，失败时由安全策略决定降级动作。
     max_retries: 1
 
+  # embedding 用于把知识、记忆和查询转换为同维度向量。
   embedding:
+    # provider 指定客户端使用 OpenAI 兼容协议。
     provider: openai_compatible
+    # model 从 EMBEDDING_MODEL 环境变量读取向量模型标识。
     model: ${EMBEDDING_MODEL}
+    # base_url 从 EMBEDDING_BASE_URL 读取可独立部署的向量服务地址。
     base_url: ${EMBEDDING_BASE_URL}
+    # api_key 从 EMBEDDING_API_KEY 读取向量服务访问凭证。
     api_key: ${EMBEDDING_API_KEY}
+    # dimensions 声明输出向量维度，必须与数据库 vector 列维度一致。
     dimensions: ${EMBEDDING_DIMENSIONS}
+    # timeout_ms 将单次向量化调用限制在 5 秒内。
     timeout_ms: 5000
+    # max_retries 允许向量化调用在瞬时错误后最多重试 2 次。
     max_retries: 2
 
+  # reranker 对初召回候选重新排序，提高最终证据相关性。
   reranker:
+    # provider 允许使用 OpenAI 兼容端点或独立 HTTP 重排服务。
     provider: openai_compatible_or_http
+    # model 从 RERANKER_MODEL 环境变量读取重排模型标识。
     model: ${RERANKER_MODEL}
+    # base_url 从 RERANKER_BASE_URL 读取重排服务地址。
     base_url: ${RERANKER_BASE_URL}
+    # api_key 从 RERANKER_API_KEY 读取重排服务访问凭证。
     api_key: ${RERANKER_API_KEY}
+    # timeout_ms 将单次重排调用限制在 3 秒内。
     timeout_ms: 3000
+    # max_retries 只允许重试 1 次，失败后保留初始检索排序。
     max_retries: 1

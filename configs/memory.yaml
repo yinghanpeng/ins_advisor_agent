@@ -1,6 +1,46 @@
+# 文件说明：
+# - 本配置文件控制短期记忆恢复和长期记忆按需召回的运行参数。
+# - 空值表示不在配置层强制覆盖，由运行时代码采用默认策略。
+
+# memory 是记忆子系统的总配置入口。
 memory:
+  # enabled 控制请求链路是否启用记忆恢复与候选写入能力。
   enabled: true
+  # model_decision_enabled 控制规则无法确定时是否允许模型判断长期记忆召回需求。
   model_decision_enabled: true
+  # decision_timeout_ms 是长期记忆召回决策模型的最大延迟预算，单位为毫秒。
   decision_timeout_ms: 1200
+  # default_ttl_days 非空时覆盖 Preference 默认 TTL；留空使用 preference_ttl_days。
   default_ttl_days:
+  # max_recall_items 限制单次请求最多注入上下文的记忆条目数量。
   max_recall_items: 8
+  # session_ttl_seconds 是 Redis 会话短期记忆的过期时间，默认 7 天。
+  session_ttl_seconds: 604800
+  # task_ttl_seconds 是 Redis 任务状态的过期时间，默认 1 天。
+  task_ttl_seconds: 86400
+  # preference_ttl_days 是 PostgreSQL 用户偏好的默认保留周期。
+  preference_ttl_days: 365
+  # max_session_messages 限制每个 Session 进入短期记忆的最近消息数量。
+  max_session_messages: 12
+  # max_payload_bytes 限制单个 Redis Memory Payload，防止异常大对象挤占内存。
+  max_payload_bytes: 262144
+  # max_entries_per_tenant 限制每个租户、每个短期层的最大 Redis Key 数量。
+  max_entries_per_tenant: 100000
+  # cas_max_retries 限制 WATCH 冲突后的指数退避重试次数。
+  cas_max_retries: 8
+  # retention_batch_size 是隐私和过期清理任务的单批处理数量。
+  retention_batch_size: 1000
+  # message_audit_ttl_days 控制 PostgreSQL 加密消息审计保留时间。
+  message_audit_ttl_days: 90
+  # session_snapshot_ttl_days 控制 KYC 工作快照保留时间。
+  session_snapshot_ttl_days: 30
+  # analysis_ttl_days 控制分析运行和生成结果保留时间。
+  analysis_ttl_days: 365
+  # business_event_ttl_days 控制业务事件和结果记录保留时间。
+  business_event_ttl_days: 730
+  # business_fact_ttl_days 控制客户/顾问稳定事实的最长保留时间。
+  business_fact_ttl_days: 1095
+  # encryption_key_env 指定业务记忆字段加密密钥所在的环境变量名。
+  encryption_key_env: MEMORY_ENCRYPTION_KEY
+  # require_encryption=true 表示生产 API 缺少加密密钥时必须启动失败。
+  require_encryption: true

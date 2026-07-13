@@ -8,4 +8,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class PreferenceMemory:
+    """保存跨 Session 复用的低风险用户交互偏好映射。"""
+
+    # preferences 以租户主体复合 Key 索引结构化偏好字段。
     preferences: dict[str, dict] = field(default_factory=dict)

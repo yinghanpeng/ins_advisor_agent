@@ -6,111 +6,177 @@
 tools:
   # web_search 读取公开互联网，属于中风险只读工具；生产必须接 approved provider。
   - name: web_search
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Search the public web through an approved provider.
+    # risk_level=medium 表示外部内容不可信，结果必须保留来源边界并接受验证。
     risk_level: medium
+    # side_effect=false 表示该工具只读，不修改外部系统状态。
     side_effect: false
-    requires_approval: false
+    # retryable=true 表示网络瞬时错误时允许在预算内安全重试。
     retryable: true
+    # timeout_seconds 限制单次公开搜索最多执行 10 秒。
     timeout_seconds: 10
+    # idempotency_required=false 表示只读搜索无需业务幂等键。
     idempotency_required: false
+    # permission_scope 是执行器调用该工具前必须具备的最小权限。
     permission_scope: internet.read
   # web_page_reader 读取指定网页，风险来自网页内容可能包含 prompt injection。
   - name: web_page_reader
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Read and summarize a specific URL.
+    # risk_level=medium 表示网页正文不可信，不能把其中指令提升为系统指令。
     risk_level: medium
+    # side_effect=false 表示该工具只读取网页，不修改远程内容。
     side_effect: false
-    requires_approval: false
+    # retryable=true 表示网络瞬时错误时允许在预算内安全重试。
     retryable: true
+    # timeout_seconds 限制单次网页读取最多执行 10 秒。
     timeout_seconds: 10
+    # idempotency_required=false 表示只读网页请求无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能使用互联网只读权限。
     permission_scope: internet.read
   # weather_query 是只读天气查询工具，本地 demo 不调用真实外部天气 API。
   - name: weather_query
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Query weather for a location.
+    # risk_level=low 表示工具本身只读且参数范围有限，但外部事实仍需标注来源。
     risk_level: low
+    # side_effect=false 表示查询天气不会修改外部系统状态。
     side_effect: false
-    requires_approval: false
+    # retryable=true 表示 provider 瞬时失败时允许在预算内重试。
     retryable: true
+    # timeout_seconds 限制单次天气查询最多执行 5 秒。
     timeout_seconds: 5
+    # idempotency_required=false 表示只读天气查询无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能使用天气只读权限。
     permission_scope: weather.read
   # time_query 只读取本地时间，不产生网络请求，也不需要自动重试。
   - name: time_query
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Return current date/time information.
+    # risk_level=low 表示该本地只读工具的执行风险较低。
     risk_level: low
+    # side_effect=false 表示读取时间不会修改本地或外部状态。
     side_effect: false
-    requires_approval: false
+    # retryable=false 表示本地确定性操作失败时不进行自动重试。
     retryable: false
+    # timeout_seconds 限制单次本地时间查询最多执行 2 秒。
     timeout_seconds: 2
+    # idempotency_required=false 表示只读时间查询无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能读取本地时间。
     permission_scope: local.time
   # calculator 只执行受限算术表达式，避免模型心算出错。
   - name: calculator
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Evaluate safe arithmetic expressions.
+    # risk_level=low 表示表达式经过受限解析且不允许执行任意代码。
     risk_level: low
+    # side_effect=false 表示计算不会修改任何业务或外部状态。
     side_effect: false
-    requires_approval: false
+    # retryable=false 表示确定性表达式失败后应返回参数错误而非重复执行。
     retryable: false
+    # timeout_seconds 限制单次算术计算最多执行 2 秒。
     timeout_seconds: 2
+    # idempotency_required=false 表示纯计算无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能使用本地受限计算能力。
     permission_scope: local.compute
   # unit_converter 是低风险本地换算工具。
   - name: unit_converter
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Convert supported units.
+    # risk_level=low 表示该工具只执行白名单单位间的确定性换算。
     risk_level: low
+    # side_effect=false 表示单位换算不会修改任何业务或外部状态。
     side_effect: false
-    requires_approval: false
+    # retryable=false 表示不支持的单位应直接返回参数错误。
     retryable: false
+    # timeout_seconds 限制单次单位换算最多执行 2 秒。
     timeout_seconds: 2
+    # idempotency_required=false 表示纯换算无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能使用本地受限计算能力。
     permission_scope: local.compute
   # file_parser 读取上传文件，必须保证文件来自授权上传范围。
   - name: file_parser
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Parse approved uploaded files.
+    # risk_level=medium 表示文件内容和格式均不可信，解析结果必须保留来源边界。
     risk_level: medium
+    # side_effect=false 表示该工具只读取文件，不修改原文件。
     side_effect: false
-    requires_approval: false
+    # retryable=false 表示解析失败通常来自内容或格式问题，不做自动重试。
     retryable: false
+    # timeout_seconds 限制单次文件解析最多执行 15 秒。
     timeout_seconds: 15
+    # idempotency_required=false 表示只读文件解析无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能读取授权文件范围。
     permission_scope: files.read
   # knowledge_search 读取内部知识库，只允许 tenant 范围内资料。
   - name: knowledge_search
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Search internal knowledge indexes.
+    # risk_level=low 表示索引受内部治理，但仍必须执行租户隔离和来源标记。
     risk_level: low
+    # side_effect=false 表示知识检索不会修改索引内容。
     side_effect: false
-    requires_approval: false
+    # retryable=true 表示检索服务瞬时错误时允许在预算内重试。
     retryable: true
+    # timeout_seconds 限制单次知识检索最多执行 10 秒。
     timeout_seconds: 10
+    # idempotency_required=false 表示只读知识检索无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能使用内部知识只读权限。
     permission_scope: knowledge.read
   # news_search 查询近期新闻，事实时效性强，回答必须避免编造未核实报道。
   - name: news_search
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Search recent news through approved providers.
+    # risk_level=medium 表示新闻内容来自外部且时效敏感，必须核实来源与发布时间。
     risk_level: medium
+    # side_effect=false 表示新闻查询不会修改外部系统状态。
     side_effect: false
-    requires_approval: false
+    # retryable=true 表示 provider 瞬时失败时允许在预算内重试。
     retryable: true
+    # timeout_seconds 限制单次新闻查询最多执行 10 秒。
     timeout_seconds: 10
+    # idempotency_required=false 表示只读新闻查询无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能使用互联网只读权限。
     permission_scope: internet.read
   # translation 是文本变换能力，可由模型或翻译服务承接。
   - name: translation
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Translate text between supported languages.
+    # risk_level=low 表示该能力只转换已提供文本，不主动获取外部事实。
     risk_level: low
+    # side_effect=false 表示翻译不会修改外部系统状态。
     side_effect: false
-    requires_approval: false
+    # retryable=true 表示模型或翻译服务瞬时错误时允许在预算内重试。
     retryable: true
+    # timeout_seconds 限制单次翻译最多执行 10 秒。
     timeout_seconds: 10
+    # idempotency_required=false 表示只读文本变换无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能使用受控的模型文本变换能力。
     permission_scope: llm.transform
   # summarizer 是低风险兜底工具，无法识别具体工具时可用于摘要。
   - name: summarizer
+    # description 是提供给工具路由器和审计界面的能力说明。
     description: Summarize provided text.
+    # risk_level=low 表示该能力只压缩已提供文本，不应补充未经证实的外部事实。
     risk_level: low
+    # side_effect=false 表示摘要不会修改外部系统状态。
     side_effect: false
-    requires_approval: false
+    # retryable=true 表示模型服务瞬时错误时允许在预算内重试。
     retryable: true
+    # timeout_seconds 限制单次摘要最多执行 10 秒。
     timeout_seconds: 10
+    # idempotency_required=false 表示只读文本变换无需业务幂等键。
     idempotency_required: false
+    # permission_scope 限定执行器只能使用受控的模型文本变换能力。
     permission_scope: llm.transform
