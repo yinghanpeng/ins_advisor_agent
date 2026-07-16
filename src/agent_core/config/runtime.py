@@ -285,7 +285,7 @@ class InsuranceKnowledgeConfig(_StrictConfigModel):
 
 
 class MemoryConfig(_StrictConfigModel):
-    """长期记忆策略配置。"""
+    """Redis 会话、PostgreSQL 偏好和业务记忆保留策略配置。"""
 
     # MemoryConfig 同时关闭 model_ 前缀保护，并继承配置字段的 extra fail-fast 约束。
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
@@ -302,16 +302,14 @@ class MemoryConfig(_StrictConfigModel):
     max_recall_items: int = Field(default=8, description="长期记忆最大召回条数。")
     # session_ttl_seconds 控制 Redis 会话上下文保留时间。
     session_ttl_seconds: int = Field(default=604800, ge=60, description="Redis Session 记忆 TTL，默认 7 天。")
-    # task_ttl_seconds 控制当前任务执行状态和活跃意图的短期保留时间。
-    task_ttl_seconds: int = Field(default=86400, ge=60, description="Redis Task 记忆 TTL，默认 1 天。")
     # preference_ttl_days 定义 PostgreSQL 稳定偏好事实的默认生命周期。
     preference_ttl_days: int = Field(default=365, ge=1, description="PostgreSQL Preference 默认保留天数。")
     # max_session_messages 限制每个 Session 保存的最近消息数量，避免上下文无限增长。
     max_session_messages: int = Field(default=12, ge=2, le=200, description="一个 Session 最多保留的最近消息数。")
     # max_payload_bytes 防止单条 Redis JSON 占用过多内存或被超大输入放大。
     max_payload_bytes: int = Field(default=262144, ge=1024, description="单条 Redis 记忆 Payload 最大字节数。")
-    # max_entries_per_tenant 为每层短期记忆增加租户级 Key 数硬上限。
-    max_entries_per_tenant: int = Field(default=100000, ge=1, description="每个租户每层短期记忆最大 Key 数。")
+    # max_entries_per_tenant 为每个租户的 Redis Session 主 Key 增加硬上限。
+    max_entries_per_tenant: int = Field(default=100000, ge=1, description="每个租户最多保留的 Redis Session 数。")
     # cas_max_retries 限制 Redis 乐观锁冲突后的重试次数，避免高竞争下无限循环。
     cas_max_retries: int = Field(default=8, ge=1, le=32, description="Redis 乐观锁冲突最大重试次数。")
     # retention_batch_size 控制定时清理任务每批删除规模，平衡事务时间和吞吐。

@@ -2,16 +2,17 @@
 
 Memory 不是简单把所有聊天历史塞进 Prompt，而是按用途分层。
 
-## 三层 Memory
+## 两层通用 Memory
 
 - Session Memory：最近消息、实体和不含槽位值的保险 active-intent 控制信封；
-- Task Memory：当前任务状态，例如状态机节点、工具结果和恢复信息；
 - Preference Memory：长期偏好，例如用户喜欢低压话术、输出格式偏好。
+
+当前客户请求是同步、线性执行，不保存独立任务层，也不提供断点续跑。保险多轮所需的业务工作状态由
+PostgreSQL `agent_session_states` 保存，已展示的追问焦点由 `kyc_questions` 保存。
 
 ## 当前实现
 
 - `src/agent_core/memory/session.py`
-- `src/agent_core/memory/task.py`
 - `src/agent_core/memory/preference.py`
 - `src/agent_core/memory/manager.py`
 - `src/agent_core/memory/policy.py`
@@ -20,11 +21,11 @@ Memory 不是简单把所有聊天历史塞进 Prompt，而是按用途分层。
 
 FastAPI 生产路径额外使用：
 
-- `redis_store.py`：Session/Task Hash、消息 List、租户 LRU ZSet、TTL、版本 CAS 和消息裁剪；
-- `production_manager.py`：组合 Redis 与 PostgreSQL，并追加加密消息/Task 恢复快照；
+- `redis_store.py`：Session Hash、消息 List、租户 LRU ZSet、TTL、版本 CAS 和消息裁剪；
+- `production_manager.py`：组合 Redis Session 与 PostgreSQL Preference，并追加 `short_term_messages` 加密审计；
 - `postgres_business_store.py`：KYC 事实、Case、Event、Analysis 和 Output 的事务化 Store；
 - `privacy.py`：Consent、导出、删除与跨存储清理；
-- `migrations/001..005`：通用表、业务表、RLS、旧数据升级和历史运行时审批表删除。
+- `migrations/`：通用表、业务表、RLS、旧数据升级，以及遗留 Task/会话消息表清理；最新编号文件为权威结构。
 
 保险客户画像、孩子、决策权和资产类型属于 Business Memory，不写进通用 Preference，也不直接写进
 Redis active-intent 信封。详细设计见 [memory-system.md](memory-system.md)。

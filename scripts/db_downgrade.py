@@ -23,7 +23,6 @@ DROP TABLE IF EXISTS rag_documents CASCADE;
 DROP TABLE IF EXISTS memory_recall_results CASCADE;
 DROP TABLE IF EXISTS memory_recall_decisions CASCADE;
 DROP TABLE IF EXISTS long_term_memory_items CASCADE;
-DROP TABLE IF EXISTS task_memory CASCADE;
 DROP TABLE IF EXISTS short_term_messages CASCADE;
 DROP TABLE IF EXISTS state_transitions CASCADE;
 DROP TABLE IF EXISTS agent_trace_events CASCADE;

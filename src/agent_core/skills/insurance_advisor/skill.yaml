@@ -6,7 +6,7 @@
 name: insurance_advisor
 version: 0.1.0
 description: 面向保险/金融从业者的高价值客户沟通教练 Skill。
-entry_handler: agent_core.graph.builder.AgentGraph._run_insurance_conversation
+entry_handler: agent_core.agents.advisor_coach.agent.AdvisorCoachAgent
 uses:
   - sales_intelligence
   - guardrails

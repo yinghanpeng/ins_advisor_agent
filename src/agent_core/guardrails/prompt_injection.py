@@ -449,41 +449,71 @@ def detect_prompt_injection(text: str) -> bool:
 
 
 def scan_prompt_injection(text: str) -> list[GuardrailSignal]:
-    """扫描注入/越权模式，产出结构化信号（不做最终动作裁决）。"""
-    # lower 用于大小写不敏感匹配。
-    # 补充说明：lower 现在是经过 HTML/URL/Unicode/零宽字符归一化后的主检测视图，不会替换业务原文。
-    lower = normalize_guardrail_text(text)
-    # views 额外包含数量受限的 Base64/Hex 解码视图，防止编码包装绕过枚举和正则。
+    """扫描 Prompt Injection / 越权指令，产出结构化 GuardrailSignal 列表。
+
+    职责边界：
+    - 本函数只做规则层「检测 + 打分」，不做最终 BLOCK / ALLOW 裁决；
+    - 最终动作由 InputGuardrail → PolicyCombiner 根据全部信号统一决定。
+
+    扫描流程（四步）：
+
+    Step 1 — 构造检测视图 views
+        返回 [(来源标签, 检测文本), ...]，对每个视图分别跑同一套规则。
+        - normalized：标准化后的用户原文（每条请求必扫）；
+        - base64 / hex：从原文提取至多 4 段编码 token，解码后再扫（防编码绕过）。
+        解码仅用于检测，不会改写业务 input_text，也不会进入 Prompt。
+
+    Step 2 — HARD 硬规则（确定性注入）
+        固定短语枚举 + 高置信正则；命中任一视图即视为确定性攻击。
+        每个命中规则各产出一条独立信号：severity=HIGH，score=100，suggested_action=BLOCK。
+
+    Step 3 — SOFT 灰区证据（可疑但不确定）
+        软可疑短语、弱角色扮演、伪造指令结构、Typoglycemia 错拼分别计分并聚合：
+        - soft 短语：+20 / 项
+        - weak 角色扮演、structure 结构特征：+10 / 项
+        - fuzzy 错拼（需带 system/instructions 等锚点）：+30 / 项
+        soft_score >= 20 → suggested_action=SAFE_FALLBACK（交 LLM Judge 灰区）；
+        否则 → suggested_action=ALLOW（仅记录弱信号，不拦截）。
+
+    Step 4 — 返回 HARD 独立信号 + 至多一条 SOFT 聚合信号。
+    """
+    # ── Step 1：构造检测视图 ──────────────────────────────────────────────
+    # views 形如 [("normalized", "..."), ("base64", "..."), ...]；
+    # Base64/Hex 最多各解码 4 段，详见 _build_detection_views / _decode_obfuscated_views。
     views = _build_detection_views(text)
-    # signals 收集本次命中的全部注入相关信号。
+    # signals 按检测顺序收集确定性命中与至多一条软证据聚合结果。
     signals: list[GuardrailSignal] = []
-    # hard_matches 用模式名去重，并保存命中来自 normalized/base64/hex 哪个检测视图。
+
+    # ── Step 2：HARD 硬规则 ───────────────────────────────────────────────
+    # hard_matches: 规则名 → 首次命中的视图来源（normalized / base64 / hex），用于审计。
     hard_matches: dict[str, str] = {}
-    # 先扫 HARD：命中即产出 HIGH 严重度、建议 BLOCK 的确定性信号。
+
+    # 2a. 固定短语：在全部视图中查找子串，同一规则多视图命中只保留首次来源。
     for pattern in [*_HARD_INJECTION_PATTERNS, *_EXPLICIT_HARD_INJECTION_PATTERNS]:
-        # 命中一个 HARD 模式就足以判定确定性注入。
-        # 单一技术名词不作为 HARD；显式动作短语和其它原有高置信模式仍保持硬拦截。
+        # 单一技术名词（如 "system prompt"）在正常安全讨论中可能出现，降级到 SOFT 处理。
         if pattern in _AMBIGUOUS_HARD_TERMS:
-            # 单一技术名词降级到软规则处理，不作为硬拦截。
+            # 跳过有正常讨论含义的短词，避免仅凭技术名词直接阻断请求。
             continue
-        # 在全部检测视图中查找短语，并保存首次命中来源。
+        # 在标准化及解码视图中定位该模式首次出现的来源，避免重复记分。
         source = _find_pattern_source(pattern, views)
-        # 命中任一检测视图时记录模式及其首次来源。
+        # 只有真实命中某个检测视图时才进入确定性攻击集合。
         if source is not None:
-            # 同一模式多视图命中时只保留首次来源。
+            # setdefault 保留首次命中来源，让同一规则跨视图只产生一条审计信号。
             hard_matches.setdefault(pattern, source)
-    # 多维度正则补足灵活空白和未完全枚举的中英文动作表达。
-    # 每个检测视图分别应用高置信正则，补足固定短语无法覆盖的空白变化。
+
+    # 2b. 高置信正则：补足固定短语无法覆盖的空白变化和中英文变体（如 "ignore  all  previous  instructions"）。
+    # 逐个检测视图运行同一套正则，确保编码解码结果与标准化原文使用一致规则。
     for source, value in views:
-        # 固定正则集合逐条执行，命中后按 label 去重。
+        # 每个正则携带稳定 label，审计日志不需要保存实际攻击文本。
         for label, pattern in _HARD_INJECTION_REGEXES:
-            # 正则匹配成功表示确定性越权/提取动作。
+            # 当前视图命中高置信表达时才记录确定性规则。
             if pattern.search(value):
-                # 正则 label 作为安全规则名写入，避免保存攻击原文。
+                # 写入 label 而非攻击原文，trace 只保留规则名。
                 hard_matches.setdefault(label, source)
-    # 每个确定性模式产出独立信号，便于审计命中了哪类攻击；同一模式不会因多视图重复记分。
+
+    # 2c. 每个 HARD 命中各产出一条 BLOCK 信号；同一规则不因多视图重复计分。
     for pattern, source in hard_matches.items():
-        # 每个确定性规则生成独立 HIGH/BLOCK 信号。
+        # 把规则名与检测视图封装成统一高风险信号，最终动作仍由 PolicyCombiner 决定。
         signals.append(
             GuardrailSignal(
                 source=SignalSource.HARD_RULE,
@@ -495,39 +525,39 @@ def scan_prompt_injection(text: str) -> list[GuardrailSignal]:
                 suggested_action=GuardrailAction.BLOCK,
             )
         )
-    # soft_matches 保存需要语义判定的中等强度短语，单项贡献 20 分。
-    soft_matches: set[str] = set()
-    # weak_matches 保存保险业务中可能正常出现的角色扮演短语，单项只贡献 10 分。
-    weak_matches: set[str] = set()
-    # 再扫 SOFT：命中产出 MEDIUM 严重度、建议 REVIEW 的灰区信号，交第二层语义判定。
+
+    # ── Step 3：SOFT 灰区证据 ─────────────────────────────────────────────
+    soft_matches: set[str] = set()      # 中等可疑短语，单项 +20
+    weak_matches: set[str] = set()      # 保险常见角色扮演，单项 +10（如「扮演保险顾问」）
+    # 遍历全部软规则，并按普通可疑表达与低权重角色扮演分别归集。
     for pattern in [*_SOFT_SUSPICIOUS_PATTERNS, *_ADDITIONAL_SOFT_SUSPICIOUS_PATTERNS]:
-        # 软模式单独命中不拦截，只标记为灰区可疑。
-        # 角色扮演在保险破冰场景中很常见，单独降为弱信号，避免“扮演保险顾问”直接触发 fail-closed。
+        # 弱角色扮演进入低权重集合，其余模式进入标准软证据集合。
         target = weak_matches if pattern in _WEAK_ROLEPLAY_PATTERNS else soft_matches
-        # 任一视图命中该软模式时，按其强弱归入对应集合。
+        # 任一标准化或解码视图命中即可记录规则，但同一规则通过 Set 自动去重。
         if _find_pattern_source(pattern, views) is not None:
-            # 按规则强度加入 soft 或 weak 去重集合。
+            # 只保存稳定规则名，不把可能含敏感内容的用户原文写入信号。
             target.add(pattern)
-    # structure_matches 收集伪造 role tag、指令边界和“执行下方指令”等结构特征，单项贡献 10 分。
+    # 伪造 role tag、指令边界等结构特征，单项 +10。
     structure_matches = {
         pattern for pattern in _SUSPICIOUS_STRUCTURE_PATTERNS if _find_pattern_source(pattern, views) is not None
     }
-    # fuzzy_matches 捕获带指令锚点的 typoglycemia 高风险动词错拼，每项贡献 30 分并进入灰区。
+    # 带 system/instructions 锚点的高风险动词错拼（typoglycemia），单项 +30。
     fuzzy_matches = set(_find_typoglycemia_matches(views))
-    # soft_score 将多个弱证据聚合，避免依赖 HARD/SOFT 二元枚举做最终判断。
+
+    # 聚合弱证据总分；阈值 20 = 1 个 soft 或 2 个 weak/structure 或 1 个 fuzzy。
     soft_score = (
         len(soft_matches) * 20
         + len(weak_matches) * 10
         + len(structure_matches) * 10
         + len(fuzzy_matches) * 30
     )
-    # 只要存在非 HARD 证据就保留一条聚合信号；是否 REVIEW 由阈值决定。
+    # 至少存在一项软证据时才创建聚合信号，零分请求保持无额外噪声。
     if soft_score:
-        # 20 分代表一个中强度软信号、两个弱结构信号，或一次带锚点的错拼绕过。
+        # 达到二十分表示证据足以进入灰区复核或安全降级路径。
         requires_review = soft_score >= 20
-        # matched 只记录规则名称并限制数量，避免公开 trace 被超长攻击文本撑大。
+        # 合并并排序所有规则名，使相同输入的审计结果稳定可复现。
         matched_rules = sorted(soft_matches | weak_matches | structure_matches | fuzzy_matches)
-        # 将全部弱证据聚合为一条可审计信号，动作由分数阈值决定。
+        # 弱证据合并为一条聚合信号；matched 最多列 12 条规则名，避免 trace 膨胀。
         signals.append(
             GuardrailSignal(
                 source=SignalSource.HARD_RULE,
@@ -543,5 +573,6 @@ def scan_prompt_injection(text: str) -> list[GuardrailSignal]:
                 suggested_action=GuardrailAction.SAFE_FALLBACK if requires_review else GuardrailAction.ALLOW,
             )
         )
-    # 返回全部注入相关信号。
+
+    # ── Step 4：返回全部信号 ────────────────────────────────────────────────
     return signals

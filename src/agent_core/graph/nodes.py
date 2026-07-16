@@ -155,6 +155,19 @@ def initialize_context(state: AgentState) -> AgentState:
     emit_stream_event(state, "node_started", {"node_name": "initialize_context"})
     # 公开 AgentRunRequest 已拒绝生成型 metadata；这里再清理直接构造 AgentState 的非可信输入，
     # 防止恶意正文在到达保险检索节点前被记忆规划、日志或其它通用节点读取。
+    # 外部/不可信调用 —— 四个键会被删掉
+    # AgentState(metadata={
+    #     "source": "web",  # 保留
+    #     "method_knowledge": ["假合规话术"],  # 删除
+    #     "news_digest": "假新闻",  # 删除
+    # })
+    #
+    # # 内部单测 —— 可以保留
+    # AgentState(metadata={
+    #     "_trusted_generation_context": True,  # 信任开关
+    #     "method_knowledge": ["测试 fixture"],  # 保留
+    # })
+    # 未经内部信任标记的 metadata 一律执行生成上下文字段清理。
     if not trusts_internal_generation_metadata(state.metadata):
         # 先计算实际出现的受保护键，后续只删除命中的键并把键名写入审计事件。
         rejected_keys = sorted(GENERATION_CONTEXT_METADATA_KEYS.intersection(state.metadata))
@@ -171,6 +184,16 @@ def initialize_context(state: AgentState) -> AgentState:
                 node_name=AgentNode.INIT_CONTEXT.value,
             )
     # 直接构造 AgentState 的调用同样不能用 metadata 选业务记录；公开主体只能来自网关绑定字段。
+    # AgentState(
+    #     user_id="gateway_user",  # 可信：来自网关
+    #     session_id="gateway_session",
+    #     metadata={
+    #         "customer_id": "victim_customer",  # 会被删
+    #         "opportunity_case_id": "victim_case",  # 会被删
+    #     },
+    # )
+    # initialize_context 之后 → 两个 ID 都不在 metadata 里
+    # 后续只能从 user_id/session_id 派生业务主体
     if not trusts_internal_business_identity(state.metadata):
         # 找出所有会影响业务表选行的 ID，不能把客户传入值当成内部解析结果。
         rejected_identity_keys = sorted(BUSINESS_IDENTITY_METADATA_KEYS.intersection(state.metadata))
@@ -333,11 +356,14 @@ def input_guardrail(state: AgentState) -> AgentState:
 
 
 def restore_memory(state: AgentState, memory_manager: MemoryBackend | None = None) -> AgentState:
-    """读取短期/任务记忆，并按需召回长期偏好记忆。"""
+    """读取 Session 短期记忆，并按需召回长期偏好记忆。"""
     # 进入 RESTORE_MEMORY 节点，状态迁移会被审计和回放。
     _enter(state, AgentNode.RESTORE_MEMORY, "enter_restore_memory")
     # 记录记忆恢复开始事件。
     state.add_trace_event("node_started", node_name="restore_memory")
+    # 同步发出可展示的流式阶段事件，且不携带任何记忆正文。
+    emit_stream_event(state, "node_started", {"node_name": "开始恢复记忆"})
+
     # 如果没有注入 MemoryManager，说明当前运行环境不支持记忆层，显式写入降级标记。
     if memory_manager is None:
         # 保存恢复后的记忆上下文，供意图和回答节点按边界读取。
@@ -346,9 +372,6 @@ def restore_memory(state: AgentState, memory_manager: MemoryBackend | None = Non
     else:
         # 读取会话记忆：主要保存 recent_messages、last_entity 等当前 session 内有效的信息。
         session_memory = memory_manager.read(MemoryLayer.SESSION, state.tenant_id, state.session_id)
-        # 读取任务记忆：保存当前任务状态，例如上一步是否已经准备好最终答案。
-        task_memory = memory_manager.read(MemoryLayer.TASK, state.tenant_id, state.session_id)
-
         # restore_memory 在 classify_intent 之前执行，此刻 state.intent/domain_skill 恒为 None。
         # 用关键词规则做一次"预判"，让召回的 skip/must 规则拿到有效 intent/domain（修复召回时机问题）；
         # 预判结果只用于本次召回决策，不写回 state.intent，classify_intent 仍是权威来源。
@@ -395,10 +418,9 @@ def restore_memory(state: AgentState, memory_manager: MemoryBackend | None = Non
             # 把本批有效结果合并到累计集合，保留后续统一处理入口。
             state.memory_recall_results.extend(recall_items)
 
-        # 将短期、任务和按需召回结果统一写入 memory_context；长期偏好只保留 TopK 摘要。
+        # 将 Session 与按需召回结果统一写入 memory_context；长期偏好只保留 TopK 摘要。
         state.memory_context = {
             "session": dict(session_memory),
-            "task": dict(task_memory),
             "preference": preference_summary,
             "long_term_recall": {
                 "decision": state.memory_recall_decision,
@@ -3266,7 +3288,7 @@ def knowledge_fusion(state: AgentState) -> AgentState:
     _enter(state, AgentNode.KNOWLEDGE_FUSION, "enter_knowledge_fusion")
     # knowledge_context 是生成前的可信上下文总线，后续压缩和 prompt 组装都从这里取材料。
     state.knowledge_context = {
-        # memory 保存 session/task/preference 三层记忆。
+        # memory 保存 Session 短期记忆与按需召回的 Preference 摘要。
         "memory": state.memory_context,
         # retrieved_context 保存 RAG 或销售洞察检索结果。
         "retrieved_context": state.retrieved_context,
@@ -3952,7 +3974,7 @@ def _answer_from_compact_context(state: AgentState) -> str:
 
 
 def update_short_term_memory(state: AgentState, memory_manager: MemoryBackend | None = None) -> AgentState:
-    """把本轮用户问题、回答和已解析实体写回 session/task memory。"""
+    """把本轮用户问题、回答和已解析实体写回 Session memory。"""
     # 进入 SHORT_TERM_MEMORY_UPDATE 节点，开始持久化本轮会话状态。
     _enter(state, AgentNode.SHORT_TERM_MEMORY_UPDATE, "enter_short_term_memory_update")
     # 没有 MemoryManager 时显式记录跳过原因，避免误以为记忆已经写入。
@@ -3974,7 +3996,7 @@ def update_short_term_memory(state: AgentState, memory_manager: MemoryBackend | 
         "_trace_id": state.trace_id,
     }
     # 只有本轮真正创建、更新、完成、取消或淘汰 active intent 时才写该字段。
-    # 普通并发请求不携带它，Redis merge 会保留另一个请求刚写入的新任务状态。
+    # 普通并发请求不携带它，Redis merge 会保留另一个请求刚写入的活跃意图状态。
     if state.metadata.get("active_intent_dirty") is True:
         # 计算并保存时间值 active_updated_at，供有效期或新旧版本比较使用。
         active_updated_at = str(
@@ -4036,7 +4058,7 @@ def update_short_term_memory(state: AgentState, memory_manager: MemoryBackend | 
                 or (latest_active.get("updated_at") if isinstance(latest_active, dict) else "")
                 or ""
             )
-            # 当前请求时间不严格更新时删除 active 字段，只合并消息，保留 Redis 最新任务。
+            # 当前请求时间不严格更新时删除 active 字段，只合并消息，保留 Redis 最新活跃意图。
             if not _is_newer_iso_timestamp(incoming_updated_at, latest_updated_at):
                 # 清除已经失效的内部状态，防止旧值影响本轮后续判断。
                 retry_values.pop("active_intent", None)
@@ -4057,39 +4079,6 @@ def update_short_term_memory(state: AgentState, memory_manager: MemoryBackend | 
         )
         # CAS 降级必须进入 trace，便于定位热点 Session 和调整串行化策略。
         state.add_trace_event("session_memory_cas_retried", session_id=state.session_id)
-    # 写入 task memory，记录当前任务状态和是否已经生成最终答案。
-    task_values = {
-        "current_state": state.current_state.value,
-        "final_answer_ready": bool(state.answer),
-        # _trace_id 只用于 PostgreSQL 审计关联，不进入 Redis Payload。
-        "_trace_id": state.trace_id,
-    }
-    # 调用 int 计算 task_version，并保存结果供本步骤后续逻辑使用。
-    task_version = int(state.memory_context.get("task", {}).get("_version", 0))
-    # Task 使用独立 CAS，Session 消息成功不代表 Task 快照可以无条件覆盖。
-    try:
-        # 按既定写入策略持久化本轮结果，并由存储层维护版本或租户边界。
-        memory_manager.write(
-            MemoryLayer.TASK,
-            state.tenant_id,
-            state.session_id,
-            task_values,
-            expected_version=task_version,
-        )
-    # Task 冲突只刷新版本后重试当前小快照，不合并业务事实或 active intent。
-    except MemoryVersionConflict:
-        # Task 冲突时读取最新版本后重试，PostgreSQL source_version 会拒绝旧快照倒灌。
-        latest_task = memory_manager.read(MemoryLayer.TASK, state.tenant_id, state.session_id)
-        # 按既定写入策略持久化本轮结果，并由存储层维护版本或租户边界。
-        memory_manager.write(
-            MemoryLayer.TASK,
-            state.tenant_id,
-            state.session_id,
-            task_values,
-            expected_version=int(latest_task.get("_version", 0)),
-        )
-        # 记录本节点的可审计追踪事件，便于还原本轮路由与状态变化。
-        state.add_trace_event("task_memory_cas_retried", session_id=state.session_id)
     # 记录写入了哪些字段，不把完整消息重复写进 trace。
     state.add_trace_event("short_term_memory_updated", fields=sorted(values.keys()))
     # 返回 state 进入长期记忆候选判断。

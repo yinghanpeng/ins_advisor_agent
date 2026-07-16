@@ -83,6 +83,19 @@ LangSmith 用于：
 
 保险多轮也不是全局 Slot Manager。通用工具只使用自己的 `ToolSpec.input_schema`；只有保险领域维护 `InsuranceKycDelta`，用于解释“两个”“他自己拍板”这类上一问的短回答，并把明确事实写入业务记忆。
 
+## 记忆架构怎么讲
+
+当前同步客户链路只保留 Session Memory 和 Preference Memory，不设计独立任务层或断点恢复：
+
+- Redis Session Hash 保存上次意图、实体和 active-intent 控制信封，独立 Messages List 保存最近对话，LRU
+  ZSet 控制租户容量；
+- PostgreSQL `short_term_messages` 保存本轮用户/助手消息的加密审计副本，但在线恢复不读取它；
+- PostgreSQL `agent_session_states` 按轮保存保险工作快照，`kyc_questions` 保存已展示焦点，避免重复追问；
+- PostgreSQL Preference 只保存经过策略允许的稳定偏好，不保存完整 KYC 原句。
+
+这样设计是因为客户请求是同步、短链路：多轮续接需要的是最近消息和 active intent，而不是恢复到某个图节点。
+如果未来出现耗时较长的异步任务，再单独引入有幂等副作用边界的 Checkpoint，不能把它混入当前客户链路。
+
 ## 如何证明不是 Demo
 
 可以展示：

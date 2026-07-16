@@ -249,26 +249,6 @@ class Conversation(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict, description="会话扩展信息。")
 
 
-class ConversationMessage(BaseModel):
-    """会话消息证据，保存完整多轮交互。"""
-
-    # 每条消息拥有独立 ID，同时使用会话内 seq_no 保证稳定顺序和幂等写入。
-    id: str = Field(default_factory=lambda: new_id("message"), description="消息唯一 ID。")
-    # tenant/conversation 共同限制消息归属，防止相同会话 ID 跨租户串读。
-    tenant_id: str = Field(..., description="消息所属租户 ID。")
-    conversation_id: str = Field(..., description="消息所属会话 ID。")
-    seq_no: int = Field(..., ge=1, description="消息在会话内的顺序号。")
-    # speaker_role 采用固定枚举，以便回放时正确区分用户、模型、工具和系统消息。
-    speaker_role: Literal["user", "assistant", "tool", "system"] = Field(..., description="消息说话方角色。")
-    # content 是受控证据正文，content_redacted 是允许进入抽取或评测的脱敏副本。
-    content: str = Field(..., description="原始消息内容，仅作为证据归档，不默认进入 Prompt。")
-    content_redacted: str = Field(default="", description="脱敏后的消息内容，可用于抽取或评测。")
-    # message_ts 表示消息业务发生时间，不等同于数据库写入时间。
-    message_ts: str = Field(default_factory=utc_now_iso, description="消息发生时间。")
-    # metadata 仅保存消息级低敏扩展属性。
-    metadata: dict[str, Any] = Field(default_factory=dict, description="消息扩展信息。")
-
-
 class AgentSessionState(BaseModel):
     """每一轮 KYC 分析后的工作记忆快照。"""
 
@@ -318,9 +298,8 @@ class KYCQuestion(BaseModel):
     focus_key: str = Field(..., description="问题焦点，例如 available_long_term_funds。")
     # question_text 只在问题已经实际呈现给用户后持久化。
     question_text: str = Field(..., description="实际向从业者提出的问题文本。")
-    # 状态和 answer_message_id 表达问题从已问到已回答/跳过的生命周期。
+    # question_status 表达问题从已问到已回答或跳过的生命周期。
     question_status: Literal["asked", "answered", "skipped"] = Field(default="asked", description="问题状态。")
-    answer_message_id: str | None = Field(default=None, description="回答该问题的消息 ID。")
     # extracted_fact_ids 将回答产生的长期事实与问题证据链连接起来。
     extracted_fact_ids: list[str] = Field(default_factory=list, description="从回答中抽取出的事实 ID。")
     # asked_at 必填生成，answered_at 仅在收到有效回答时设置。
@@ -443,9 +422,8 @@ class MemoryEvent(BaseModel):
     # event_type 使用受限枚举，event_payload 承载经过脱敏的结构化细节。
     event_type: MemoryEventType = Field(..., description="事件类型，例如异议、正向信号、关系变化、结果更新。")
     event_payload: dict[str, Any] = Field(default_factory=dict, description="事件结构化内容，敏感值应先脱敏或只保存引用。")
-    # evidence_text 与 source_message_id 提供从事件回溯到原始证据的路径。
+    # evidence_text 保存支持事件的最小证据，不依赖重复的业务消息归档表。
     evidence_text: str = Field(default="", description="支持该事件的证据摘录；没有证据时只可作为低可信运行事件。")
-    source_message_id: str | None = Field(default=None, description="事件来源消息 ID。")
     # created_at 固定事件入库时间，列表读取可据此解释顺序。
     created_at: str = Field(default_factory=utc_now_iso, description="事件记录创建时间。")
 
@@ -461,8 +439,7 @@ class CaseOutcome(BaseModel):
     # outcome_type 使用有限枚举支持聚合分析，detail 保存必要补充说明。
     outcome_type: CaseOutcomeType = Field(..., description="结果类型，例如已回复、已约电话、成交、长期维护。")
     outcome_detail: str = Field(default="", description="结果补充说明，避免只保存粗粒度标签。")
-    # 来源会话/消息允许将结果回链到客户明确反馈。
+    # 来源会话允许将结果回链到对应客户沟通任务。
     source_conversation_id: str | None = Field(default=None, description="结果来源会话 ID。")
-    source_message_id: str | None = Field(default=None, description="结果来源消息 ID。")
     # created_at 用于计算从策略生成到业务结果发生的时延。
     created_at: str = Field(default_factory=utc_now_iso, description="结果记录创建时间。")

@@ -1,7 +1,7 @@
 """偏好记忆容器。"""
 
 # 文件说明：
-# - 本文件属于 Memory 层，负责 session/task/preference 分层记忆和策略。
+# - 本文件只定义跨 Session 的 Preference 长期记忆容器。
 # - 生产环境通过 MemoryManager 或 PostgreSQL repository 统一做租户隔离。
 from dataclasses import dataclass, field
 

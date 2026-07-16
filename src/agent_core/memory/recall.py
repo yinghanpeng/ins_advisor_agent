@@ -386,7 +386,7 @@ def plan_long_term_memory_recall(
 ) -> MemoryRecallDecision:
     """规则优先判断本轮是否需要召回长期记忆。
 
-    短期 session/task 记忆是工作流恢复和指代消解的一部分，可以每轮读取；
+    短期 Session 记忆是对话延续和指代消解的一部分，可以每轮读取；
     本函数只决定跨会话长期记忆，例如 preference、客户画像、从业者画像和 case 事件。
 
     该函数保留给现有调用方使用。生产链路应优先调用 decide_long_term_memory_recall，

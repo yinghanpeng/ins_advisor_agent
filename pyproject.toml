@@ -25,8 +25,10 @@ dependencies = [
   "SQLAlchemy>=2.0",
   # psycopg 是 PostgreSQL 生产连接驱动，配合 SQLAlchemy 使用。
   "psycopg[binary]>=3.2",
-  # redis 用于限流、活跃意图、Session/Task 和分布式 runtime 状态。
+  # redis 用于限流、活跃意图、Session 消息窗口和分布式 runtime 状态。
   "redis>=5.0",
+  # LangGraph Graph API 用于以显式 State、Node、Edge 和 Conditional Edge 编排现有同步工作流。
+  "langgraph>=1.2.9,<2.0",
 ]
 
 [project.optional-dependencies]

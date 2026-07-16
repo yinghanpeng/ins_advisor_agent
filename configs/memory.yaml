@@ -16,15 +16,13 @@ memory:
   max_recall_items: 8
   # session_ttl_seconds 是 Redis 会话短期记忆的过期时间，默认 7 天。
   session_ttl_seconds: 604800
-  # task_ttl_seconds 是 Redis 任务状态的过期时间，默认 1 天。
-  task_ttl_seconds: 86400
   # preference_ttl_days 是 PostgreSQL 用户偏好的默认保留周期。
   preference_ttl_days: 365
   # max_session_messages 限制每个 Session 进入短期记忆的最近消息数量。
   max_session_messages: 12
   # max_payload_bytes 限制单个 Redis Memory Payload，防止异常大对象挤占内存。
   max_payload_bytes: 262144
-  # max_entries_per_tenant 限制每个租户、每个短期层的最大 Redis Key 数量。
+  # max_entries_per_tenant 限制每个租户最多保留的 Redis Session 主 Key 数量。
   max_entries_per_tenant: 100000
   # cas_max_retries 限制 WATCH 冲突后的指数退避重试次数。
   cas_max_retries: 8

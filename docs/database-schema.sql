@@ -135,19 +135,25 @@ CREATE TABLE conversations (
 
 CREATE INDEX idx_conversations_tenant_case ON conversations (tenant_id, opportunity_case_id);
 
-CREATE TABLE conversation_messages (
+-- 通用短期消息只作为加密审计副本；在线会话窗口由 Redis Messages List 提供。
+CREATE TABLE short_term_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    seq_no INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    message_key TEXT NOT NULL,
+    trace_id TEXT,
     speaker_role TEXT NOT NULL,
-    content TEXT NOT NULL,
+    content_ciphertext BYTEA NOT NULL,
     content_redacted TEXT NOT NULL DEFAULT '',
-    message_ts TIMESTAMPTZ NOT NULL DEFAULT now(),
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    content_hash TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, session_id, message_key)
 );
 
-CREATE UNIQUE INDEX idx_conversation_messages_seq ON conversation_messages (tenant_id, conversation_id, seq_no);
+CREATE INDEX idx_short_term_messages_session_created
+    ON short_term_messages (tenant_id, session_id, created_at DESC);
 
 CREATE TABLE agent_session_states (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -184,7 +190,7 @@ CREATE TABLE kyc_questions (
     focus_key TEXT NOT NULL,
     question_text TEXT NOT NULL,
     question_status TEXT NOT NULL DEFAULT 'asked',
-    answer_message_id TEXT,
+    -- 回答证据由 short_term_messages 的会话审计记录承载，不再维护旧消息表外键。
     extracted_fact_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
     asked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     answered_at TIMESTAMPTZ
@@ -247,7 +253,7 @@ CREATE TABLE memory_events (
     event_type TEXT NOT NULL,
     event_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     evidence_text TEXT NOT NULL DEFAULT '',
-    source_message_id TEXT,
+    -- 事件保留脱敏证据文本；不再引用已删除的旧会话消息表。
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -260,7 +266,7 @@ CREATE TABLE case_outcomes (
     outcome_type TEXT NOT NULL,
     outcome_detail TEXT NOT NULL DEFAULT '',
     source_conversation_id TEXT,
-    source_message_id TEXT,
+    -- 结果通过会话标识关联上下文，不再依赖旧会话消息主键。
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

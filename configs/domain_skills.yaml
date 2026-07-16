@@ -2,18 +2,28 @@
 # - 本配置文件用于描述运行时参数，避免把环境差异硬编码在 Python 代码中。
 # - 修改配置后建议运行 python3 main.py 和 python3 -m pytest 做回归验证。
 
-# domain_skills 是领域能力注册表，控制各业务 Skill 是否可被路由。
+# domain_skills 是便于部署和人工检查的领域能力清单；在线路由以 Python DomainAgentRegistry 为准。
 domain_skills:
   # insurance_advisor 是当前已实现的保险顾问领域 Skill。
   insurance_advisor:
     # enabled=true 表示意图命中后允许进入保险顾问链路。
     enabled: true
-    # handler 指向代码化保险会话处理器；不再依赖 Dify 或独立 Workflow 配置。
-    handler: agent_core.graph.builder.AgentGraph._run_insurance_conversation
+    # handler 指向迁移后的独立保险顾问 Agent；AgentGraph 只保留总控和兼容薄代理。
+    handler: agent_core.agents.advisor_coach.agent.AdvisorCoachAgent
     # uses_sales_intelligence 表示该 Skill 会读取已通过静态生成准入的销售智能资料。
     uses_sales_intelligence: true
     # prompt_directory 保存生成类 Prompt；事实合并、评分和路由必须留在 Python 代码中。
     prompt_directory: src/agent_core/skills/insurance_advisor/prompts
+  # insurance_proposal 是未来负责产品方案和 PDF/DOCX 计划书的专业 Agent。
+  insurance_proposal:
+    # enabled=false 与 Python Descriptor 保持一致，真实 Agent 未接入前绝不参与在线路由。
+    enabled: false
+    # handler 指向安全占位对象；其 healthcheck 返回 true，但业务 available 固定为 false。
+    handler: agent_core.agents.insurance_proposal.placeholder.InsuranceProposalAgentPlaceholder
+    # execution_mode=placeholder 提醒部署方当前没有发生远程 Agent 调用。
+    execution_mode: placeholder
+    # produces_artifacts=true 预声明真实实现未来会产生 JSON、PDF 或 DOCX 文件。
+    produces_artifacts: true
   # research_assistant 预留多来源研究与证据综合领域 Skill。
   research_assistant:
     # enabled=false 表示当前不允许路由到尚未实现的研究助手。

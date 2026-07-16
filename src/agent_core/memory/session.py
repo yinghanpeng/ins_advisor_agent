@@ -1,7 +1,7 @@
 """Session memory."""
 
 # 文件说明：
-# - 本文件属于 Memory 层，负责 session/task/preference 分层记忆和策略。
+# - 本文件属于 Memory 层，只负责 Session 会话级短期记忆容器。
 # - 生产环境需要替换为带租户隔离的持久化存储。
 from __future__ import annotations
 

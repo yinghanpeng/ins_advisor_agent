@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from agent_core.agents.insurance_proposal.port import ProposalAgentPort
+from agent_core.agents.registry import DomainAgentRegistry
 from agent_core.config.runtime import RuntimeSettings, load_runtime_settings
 from agent_core.graph.builder import build_agent_graph
 from agent_core.graph.state import AgentNode, AgentState
@@ -54,6 +56,14 @@ TRACE_LOG_SAFE_FIELDS = frozenset(
         "fields",
         "keys",
         "step_index",
+        # agent_id 只记录稳定能力标识，不包含用户输入或业务事实，可以安全进入控制面日志。
+        "agent_id",
+        # agent_version 用于灰度和回放，同样属于无业务正文的控制面字段。
+        "agent_version",
+        # execution_mode 只说明 in_process/remote/placeholder，便于排查调用边界。
+        "execution_mode",
+        # available 用于区分占位对象健康与真实业务能力是否已经接入。
+        "available",
     }
 )
 
@@ -133,6 +143,8 @@ class WorkflowEngine:
         kyc_extractor: InsuranceKycExtractor | None = None,
         insurance_knowledge_provider: InsuranceKnowledgeProvider | None = None,
         insurance_news_enabled: bool | None = None,
+        domain_agent_registry: DomainAgentRegistry | None = None,
+        proposal_agent: ProposalAgentPort | None = None,
         settings: RuntimeSettings | None = None,
     ) -> None:
         """初始化日志、LangSmith adapter 和本地兼容 graph。"""
@@ -146,7 +158,7 @@ class WorkflowEngine:
         self.langsmith = langsmith or LangSmithAdapter.from_env(self.log)
         # 创建共享 MemoryManager；同一个 WorkflowEngine 实例内的多轮对话会复用这份内存存储。
         self.memory_manager = memory_manager or MemoryManager()
-        # 业务记忆 store 独立于 session/task/preference 记忆；默认内存实现保证本地 demo 和测试无需数据库。
+        # 业务记忆 Store 独立于通用 Session/Preference；默认内存实现让本地演示和测试无需数据库。
         self.business_store = business_store or InMemoryBusinessMemoryStore()
         # 双层意图 Router 在 Engine 生命周期内复用，避免每个请求重复读取意图目录和创建模型客户端。
         self.intent_router = intent_router or build_intent_router(settings=self.settings)
@@ -164,13 +176,25 @@ class WorkflowEngine:
         )
         # 构建统一代码执行器；保险请求由意图自动进入 Handler，不再按 workflow_name 分叉。
         self.graph = build_agent_graph(
+            # Session/Preference 记忆仍由总控和保险顾问 Agent 共享同一实例。
             self.memory_manager,
+            # 业务记忆 Store 继续保持单一资源所有者和事务边界。
             self.business_store,
+            # 意图 Router 在 Registry 之前完成候选裁定和置信度分发。
             self.intent_router,
+            # KYC Extractor 注入默认保险顾问 Agent，不由计划书占位对象使用。
             self.kyc_extractor,
+            # 保险知识 Provider 注入默认保险顾问 Agent。
             self.insurance_knowledge_provider,
+            # 新闻权限开关保持由 Runtime 控制。
             self.insurance_news_enabled,
+            # 显式 Registry 适合高级调用方完全控制专业 Agent 集合。
+            domain_agent_registry,
+            # 未来只需把真实计划书 Agent 传入这里，即可替换默认禁用占位实现。
+            proposal_agent,
         )
+        # 暴露只读式注册表引用，API readiness、测试和未来控制面无需穿透 graph 内部实现。
+        self.domain_agent_registry = self.graph.domain_agent_registry
 
     def _langsmith_state_snapshot(self, state: AgentState) -> dict[str, Any]:
         """构造完整 AgentState 快照，排除会递归复制全部历史事件的字段。"""

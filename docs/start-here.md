@@ -17,9 +17,12 @@ pytest -q
 2. `src/agent_core/graph/builder.py`：真实代码执行顺序；
 3. `src/agent_core/intents/router.py`：向量 + LLM 双层意图路由；
 4. `src/agent_core/graph/nodes.py`：状态节点；
-5. `src/agent_core/skills/insurance_advisor/kyc.py`：保险领域槽位；
-6. `src/agent_core/skills/insurance_advisor/knowledge.py`：双知识库；
-7. `tests/test_intent_routing.py`：阈值、活跃意图和换题最小示例。
+5. `src/agent_core/agents/registry.py`：专业 Agent 如何被发现和选择；
+6. `src/agent_core/agents/advisor_coach/agent.py`：现有保险顾问 Agent 的完整业务顺序；
+7. `src/agent_core/agents/insurance_proposal/`：计划书契约和默认禁用占位；
+8. `src/agent_core/skills/insurance_advisor/kyc.py`：保险领域槽位；
+9. `src/agent_core/skills/insurance_advisor/knowledge.py`：双知识库；
+10. `tests/test_intent_routing.py`：阈值、活跃意图和换题最小示例。
 
 一句话架构：
 
@@ -29,7 +32,8 @@ pytest -q
 → 向量意图库
 → 必要时 LLM 裁定
 → 置信度分发
-→ 通用工具路径 / 保险代码处理器 / 主动澄清
+→ DomainAgentRegistry
+→ 通用工具路径 / AdvisorCoachAgent / 主动澄清
 → Grounding、PII、合规和记忆
 ```
 
@@ -42,6 +46,6 @@ pytest -q
 - 新增保险字段：修改 `InsuranceKycDelta`、意图字段优先级、问题模板和业务记忆测试；
 - 接真实知识库：修改 `configs/insurance_handler.yaml` 和 Provider 配置；
 - 新增工具：定义 ToolSpec、Schema、权限、Runner 和失败测试；
-- 修改流程：在 `builder.py`/`nodes.py` 修改代码，并同步状态、文档和测试。
+- 修改公共总控：修改 `builder.py`/`nodes.py`；修改保险领域顺序：修改 `agents/advisor_coach/agent.py`。
 
 完整流程见 [request-lifecycle-flowchart.md](request-lifecycle-flowchart.md)。

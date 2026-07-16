@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
@@ -107,7 +107,7 @@ class AgentNode(StrEnum):
     # 需求采集状态：当信息不足时，向用户补问必要信息，例如客户 KYC、场景、沟通目标。
     COLLECT_REQUIREMENTS = "COLLECT_REQUIREMENTS"
 
-    # 状态更新状态：把用户补充的信息写入 session、profile、task memory 等运行时状态。
+    # 状态更新状态：把用户补充的信息写入 Session 与业务画像等实际运行时状态。
     UPDATE_STATE = "UPDATE_STATE"
 
     # 保险 KYC 槽位抽取状态：LLM 只抽取本轮明确事实，代码负责后续合并和校验。
@@ -1023,3 +1023,19 @@ class AgentState(BaseModel):
 
         # 返回当前实例，支持链式校验或构造流程。
         return self
+
+
+class AgentGraphState(TypedDict):
+    """LangGraph Graph API 使用的最小显式共享状态。
+
+    现有 ``AgentState`` 已用 Pydantic 明确定义全部字段、类型、默认值与可选语义；Graph
+    迁移只增加这一层类型化信封，避免复制字段后出现双份状态契约。图内没有并行写入或
+    fan-in，所有节点仍按原顺序更新同一个请求专属对象，因此这里不配置 reducer：若对
+    messages、trace_events 等列表再次做追加 reducer，会把现有节点已经原地追加的内容重复
+    合并，从而改变改造前的状态更新语义。
+    """
+
+    # 本字段来自 WorkflowEngine 构造的请求级 AgentState；所有业务节点按原职责读取和更新。
+    # 其中可能包含客户输入、保险 KYC、保单沟通上下文及内部审计信息，属于敏感业务状态；
+    # 仅在进程内节点之间传递，Graph 路由函数不得记录、复制或对外输出完整对象。
+    agent_state: AgentState

@@ -476,78 +476,6 @@ class PostgresAgentRepository:
         # SQL 为高效取最近记录采用倒序，API 返回前反转为自然时间正序。
         return list(reversed(rows))
 
-    def upsert_task_snapshot(
-        self,
-        *,
-        tenant_id: str,
-        session_id: str,
-        task_id: str,
-        state_snapshot: dict[str, Any],
-        source_version: int,
-        expected_version: int | None = None,
-        expires_at: str | None = None,
-    ) -> int | None:
-        """使用版本条件写入任务快照，避免并发请求覆盖较新的状态。"""
-        # source_version 必须单调增加；可选 expected_version 进一步提供数据库版本 CAS。
-        rows = self._fetch_all(
-            """
-            INSERT INTO task_memory (
-                tenant_id, session_id, task_id, state_snapshot, version, source_version, expires_at
-            ) VALUES (
-                :tenant_id, :session_id, :task_id, CAST(:state_snapshot AS jsonb), 1,
-                :source_version, :expires_at
-            )
-            ON CONFLICT (tenant_id, session_id, task_id) DO UPDATE SET
-                state_snapshot = EXCLUDED.state_snapshot,
-                version = task_memory.version + 1,
-                source_version = EXCLUDED.source_version,
-                expires_at = EXCLUDED.expires_at,
-                updated_at = now()
-            WHERE (
-                CAST(:expected_version AS integer) IS NULL
-                OR task_memory.version = CAST(:expected_version AS integer)
-            )
-              AND task_memory.source_version < EXCLUDED.source_version
-            RETURNING version
-            """,
-            tenant_id=tenant_id,
-            session_id=session_id,
-            task_id=task_id,
-            state_snapshot=_json(state_snapshot),
-            source_version=source_version,
-            expected_version=expected_version,
-            expires_at=expires_at,
-        )
-        # 空结果表示该快照比数据库中的 source_version 更旧，按幂等成功处理但不覆盖。
-        # 有 RETURNING 表示写入成功并返回新版本；空结果是旧快照被安全忽略。
-        return int(rows[0]["version"]) if rows else None
-
-    def get_task_snapshot(
-        self,
-        *,
-        tenant_id: str,
-        session_id: str,
-        task_id: str = "active",
-    ) -> dict[str, Any] | None:
-        """读取未过期任务快照及其版本。"""
-        # 只查询精确 tenant/session/task 且尚未过期的一条快照。
-        rows = self._fetch_all(
-            """
-            SELECT state_snapshot, version, expires_at, updated_at
-            FROM task_memory
-            WHERE tenant_id = :tenant_id
-              AND session_id = :session_id
-              AND task_id = :task_id
-              AND (expires_at IS NULL OR expires_at > now())
-            LIMIT 1
-            """,
-            tenant_id=tenant_id,
-            session_id=session_id,
-            task_id=task_id,
-        )
-        # 未命中时返回 None，由上层从 Redis 或全新任务状态继续。
-        return rows[0] if rows else None
-
     def read_preference_memory(self, *, tenant_id: str, user_id: str) -> dict[str, Any]:
         """读取用户已授权且未过期的 Preference，并恢复兼容 memory_candidates 结构。"""
         # 查询同时要求条目自身 consent_status 与权威 Consent 表均为 granted。
@@ -783,15 +711,12 @@ class PostgresAgentRepository:
         return int(row["count"])
 
     def delete_subject_memory(self, *, tenant_id: str, subject_id: str) -> int:
-        """物理删除通用主体的消息、任务和长期记忆，并依赖外键清理向量。"""
-        # 单条 SQL 原子删除 Session 消息、Task 快照和用户长期记忆并汇总计数。
+        """物理删除通用主体的消息和长期记忆，并依赖外键清理向量。"""
+        # 单条 SQL 原子删除 Session 消息和用户长期记忆并汇总计数。
         row = self._fetch_one(
             """
             WITH deleted_messages AS (
                 DELETE FROM short_term_messages
-                WHERE tenant_id=:tenant_id AND session_id=:subject_id RETURNING 1
-            ), deleted_tasks AS (
-                DELETE FROM task_memory
                 WHERE tenant_id=:tenant_id AND session_id=:subject_id RETURNING 1
             ), deleted_items AS (
                 DELETE FROM memory_items
@@ -799,13 +724,12 @@ class PostgresAgentRepository:
             )
             SELECT
                 (SELECT count(*) FROM deleted_messages)
-              + (SELECT count(*) FROM deleted_tasks)
               + (SELECT count(*) FROM deleted_items) AS count
             """,
             tenant_id=tenant_id,
             subject_id=subject_id,
         )
-        # 返回三类记录实际删除总数。
+        # 返回消息和长期条目两类记录实际删除总数。
         return int(row["count"])
 
     def insert_privacy_audit(
@@ -842,7 +766,7 @@ class PostgresAgentRepository:
         )
 
     def purge_expired_memory(self, *, tenant_id: str, batch_size: int = 1000) -> int:
-        """分批清理过期长期记忆和任务快照，避免大事务锁表。"""
+        """分批清理过期长期记忆和加密审计，避免大事务锁表。"""
         # 第一批按 expires_at 选择长期记忆牺牲行并物理删除，Embedding 随外键级联。
         memory_row = self._fetch_one(
             """
@@ -858,22 +782,7 @@ class PostgresAgentRepository:
             tenant_id=tenant_id,
             batch_size=batch_size,
         )
-        # 第二批清理过期 Task Snapshot，并将 batch_size 夹在 1-10000 范围。
-        task_row = self._fetch_one(
-            """
-            WITH victims AS (
-                SELECT id FROM task_memory
-                WHERE tenant_id=:tenant_id AND expires_at IS NOT NULL AND expires_at<=now()
-                LIMIT :batch_size
-            ), deleted AS (
-                DELETE FROM task_memory task USING victims
-                WHERE task.id=victims.id RETURNING 1
-            ) SELECT count(*) AS count FROM deleted
-            """,
-            tenant_id=tenant_id,
-            batch_size=max(1, min(batch_size, 10000)),
-        )
-        # 第三批清理过期短期消息审计密文。
+        # 第二批清理过期短期消息审计密文。
         message_row = self._fetch_one(
             """
             WITH victims AS (
@@ -888,7 +797,7 @@ class PostgresAgentRepository:
             tenant_id=tenant_id,
             batch_size=max(1, min(batch_size, 10000)),
         )
-        # 第四批清理过期通用生成输出密文和脱敏审计副本。
+        # 第三批清理过期通用生成输出密文和脱敏审计副本。
         output_row = self._fetch_one(
             """
             WITH victims AS (
@@ -903,10 +812,10 @@ class PostgresAgentRepository:
             tenant_id=tenant_id,
             batch_size=max(1, min(batch_size, 10000)),
         )
-        # 汇总四张表本批实际删除数量。
+        # 汇总三张表本批实际删除数量。
         return sum(
             int(row["count"])
-            for row in [memory_row, task_row, message_row, output_row]
+            for row in [memory_row, message_row, output_row]
         )
 
     def insert_rag_document(

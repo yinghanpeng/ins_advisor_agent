@@ -1,12 +1,12 @@
 """Layered memory manager.
 
-The manager gives Agent Core one boundary for session, task, and preference
+The manager gives Agent Core one boundary for session and preference
 memory. Production storage can replace these in-memory maps without changing
 workflow nodes.
 """
 
 # 文件说明：
-# - 本文件属于 Memory 层，负责 session/task/preference 分层记忆和策略。
+# - 本文件属于 Memory 层，负责 session/preference 分层记忆和策略。
 # - 生产环境需要替换为带租户隔离的持久化存储。
 from __future__ import annotations
 
@@ -16,17 +16,14 @@ from typing import Any, Protocol
 
 from agent_core.memory.preference import PreferenceMemory
 from agent_core.memory.session import SessionMemory
-from agent_core.memory.task import TaskMemory
 from agent_core.utils.time import utc_now_iso
 
 
 class MemoryLayer(StrEnum):
-    """统一标识短期 Session、任务状态和长期 Preference 三层记忆。"""
+    """统一标识短期 Session 和长期 Preference 两层记忆。"""
 
-    # SESSION 只在当前会话内有效，保存 recent_messages、last_entity、last_intent 等短期上下文。
+    # SESSION 同时承载当前会话上下文和轻量执行状态，避免为两个同生命周期对象维护重复存储层。
     SESSION = "session"
-    # TASK 保存当前任务进度，例如是否已经生成答案、当前状态机节点是什么。
-    TASK = "task"
     # PREFERENCE 保存跨会话可复用的长期偏好或画像候选，需要比 session 更谨慎写入。
     PREFERENCE = "preference"
 
@@ -57,12 +54,10 @@ class MemoryBackend(Protocol):
 
 @dataclass
 class MemoryManager:
-    """统一管理 session、task、preference 三层记忆，并记录访问审计。"""
+    """统一管理 session、preference 两层记忆，并记录访问审计。"""
 
     # session 记忆存储同一 session 内的短期对话上下文。
     session: SessionMemory = field(default_factory=SessionMemory)
-    # task 记忆存储当前任务级状态，适合恢复未完成 workflow。
-    task: TaskMemory = field(default_factory=TaskMemory)
     # preference 记忆存储跨 session 的稳定偏好或画像候选。
     preference: PreferenceMemory = field(default_factory=PreferenceMemory)
     # audit_log 记录每次 read/write 的层级、key 和字段，便于本地审计。
@@ -81,14 +76,14 @@ class MemoryManager:
         if layer == MemoryLayer.SESSION:
             # 读取或初始化会话层状态。
             value = self.session.get(key)
-        # TASK 层用 setdefault 保证首次读取时自动创建空任务状态。
-        elif layer == MemoryLayer.TASK:
-            # 读取或初始化任务层状态。
-            value = self.task.tasks.setdefault(key, {})
-        # PREFERENCE 层同样首次读取自动创建空偏好对象，方便后续 update。
-        else:
+        # PREFERENCE 层首次读取自动创建空偏好对象，方便后续显式 update。
+        elif layer == MemoryLayer.PREFERENCE:
             # 读取或初始化长期偏好层状态。
             value = self.preference.preferences.setdefault(key, {})
+        # 未知层不能默认落入 Preference，避免废弃调用把执行状态写成长期偏好。
+        else:
+            # 显式拒绝已经删除或尚未实现的记忆层。
+            raise ValueError(f"unsupported memory layer: {layer}")
         # 每次读取都写审计日志，生产替换持久化存储时也应保留这类访问记录。
         self.audit_log.append({"ts": utc_now_iso(), "action": "read", "layer": layer.value, "key": key})
         # 返回可变 dict；workflow 节点可以读取，也可以通过 write 显式更新。
@@ -137,7 +132,7 @@ class MemoryManager:
         return current_version + 1
 
     def export_subject(self, tenant_id: str, subject_id: str) -> dict[str, Any]:
-        """导出测试 Store 中指定主体的三层记忆。"""
+        """导出测试 Store 中指定主体的会话与偏好记忆。"""
         # 每层都使用同一个租户隔离 key；不存在时返回空对象。
         return {
             layer.value: dict(self.read(layer, tenant_id, subject_id))
@@ -150,8 +145,8 @@ class MemoryManager:
         key = self._key(tenant_id, subject_id)
         # deleted 累计实际存在并删除的记忆层数量。
         deleted = 0
-        # 依次处理三个独立内存映射，累计真实存在并删除的层数。
-        for mapping in [self.session.data, self.task.tasks, self.preference.preferences]:
+        # 依次处理两个独立内存映射，累计真实存在并删除的层数。
+        for mapping in [self.session.data, self.preference.preferences]:
             # 当前层包含精确租户主体 Key 时才执行删除并增加计数。
             if key in mapping:
                 # 从当前层映射删除精确复合 Key。
@@ -162,5 +157,5 @@ class MemoryManager:
         self.audit_log.append(
             {"ts": utc_now_iso(), "action": "delete", "key": key, "deleted": deleted}
         )
-        # 返回三个层级实际删除的映射数量。
+        # 返回两个层级实际删除的映射数量。
         return deleted

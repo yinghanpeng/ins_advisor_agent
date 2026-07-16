@@ -24,7 +24,6 @@ from agent_core.memory.business_schemas import (
     AgentSessionState,
     AnalysisRun,
     CustomerProfileFact,
-    ConversationMessage,
     GeneratedOutput,
     KYCQuestion,
     MemoryEvent,
@@ -54,9 +53,6 @@ class BusinessMemoryStore(Protocol):
 
     def insert_memory_event(self, event: MemoryEvent) -> MemoryEvent:
         """写入一条事件记忆。"""
-
-    def insert_conversation_message(self, message: ConversationMessage) -> ConversationMessage:
-        """写入加密原始消息及脱敏副本。"""
 
     def insert_analysis_run(self, run: AnalysisRun) -> AnalysisRun:
         """写入一次 KYC 分析运行记录。"""
@@ -131,10 +127,8 @@ class InMemoryBusinessMemoryStore:
         self.customer_facts: list[CustomerProfileFact] = []
         # Opportunity Case 保存当前任务聚合状态。
         self.opportunity_cases: list[OpportunityCase] = []
-        # 事件、原始消息和分析运行均以追加方式保存，便于测试回放完整时间线。
+        # 事件采用追加方式保存，便于测试回放完整业务时间线。
         self.memory_events: list[MemoryEvent] = []
-        # 会话原始消息作为证据时间线单独保存。
-        self.conversation_messages: list[ConversationMessage] = []
         # 分析运行与业务事实分离，避免模型判断冒充客户事实。
         self.analysis_runs: list[AnalysisRun] = []
         # Session 快照、补问和生成结果同样保留历史版本，不在写入时覆盖旧值。
@@ -186,26 +180,6 @@ class InMemoryBusinessMemoryStore:
         )
         # 新事实写入路径返回传入对象。
         return fact
-
-    def insert_conversation_message(self, message: ConversationMessage) -> ConversationMessage:
-        """内存测试 Store 按 tenant + conversation + seq_no 幂等保存消息。"""
-        # 以租户、会话和消息序号组成幂等键，查找本轮消息是否已经归档。
-        existing = next(
-            (
-                item
-                for item in self.conversation_messages
-                if item.tenant_id == message.tenant_id
-                and item.conversation_id == message.conversation_id
-                and item.seq_no == message.seq_no
-            ),
-            None,
-        )
-        # 仅首次出现的消息才追加；重试请求不会产生重复的会话证据。
-        if existing is None:
-            # 将首次消息追加到会话证据时间线。
-            self.conversation_messages.append(message)
-        # 重复时返回已有对象，首次写入时返回刚追加的对象。
-        return existing or message
 
     def upsert_customer_fact(self, fact: CustomerProfileFact) -> CustomerProfileFact:
         """写入客户事实；不确定事实仍保留 uncertain，不能混入 confirmed。"""
