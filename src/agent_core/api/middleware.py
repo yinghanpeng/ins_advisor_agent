@@ -30,9 +30,9 @@ def is_public_gateway_request(request: Any) -> bool:
     if path in {"/health", "/ready"}:
         # 探针允许任意 HTTP 方法进入现有 FastAPI 路由的标准处理与响应。
         return True
-    # 根路径只提供静态本地调试台；仅允许安全读取方法，不能借此放行任何写接口。
-    if path == "/" and method in {"GET", "HEAD"}:
-        # 页面不携带密钥、不读取业务数据，执行 Agent 仍需后续 POST 的独立鉴权。
+    # 两个本地控制台只提供静态 HTML；仅允许安全读取方法，不能借此放行任何管理 API。
+    if path in {"/", "/registry"} and method in {"GET", "HEAD"}:
+        # 页面不携带密钥、不读取业务数据，实际 API 请求仍需独立的租户和管理凭据。
         return True
     # 其它请求都必须继续经过租户身份、API Key 与限流校验。
     return False

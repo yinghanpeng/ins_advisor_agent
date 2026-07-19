@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from agent_core.memory.preference import PreferenceMemory
+from agent_core.memory.preference_extractor import merge_preference_candidates
 from agent_core.memory.session import SessionMemory
 from agent_core.memory.task import TaskMemory
 from agent_core.utils.time import utc_now_iso
@@ -118,6 +119,16 @@ class MemoryManager:
             )
         # _trace_id 是审计关联字段，不属于业务记忆；测试 Store 与生产 Store 都不持久化它。
         persisted_values = {key: value for key, value in values.items() if key != "_trace_id"}
+        # 本地 Preference 与生产 PostgreSQL 使用同一“增量候选”写入契约；节点无需先整包读取历史。
+        if layer == MemoryLayer.PREFERENCE and isinstance(
+            persisted_values.get("memory_candidates"),
+            list,
+        ):
+            # 在存储边界合并 type/value，避免调用方 read-modify-write 造成并发覆盖和无关长期读取。
+            persisted_values["memory_candidates"] = merge_preference_candidates(
+                target.get("memory_candidates", []),
+                persisted_values["memory_candidates"],
+            )
         # 合并写入字段而不是整体覆盖，避免一个节点写入时抹掉其他节点的记忆。
         target.update(persisted_values)
         # 新版本写回测试 Store；读取节点可以忽略该内部字段。

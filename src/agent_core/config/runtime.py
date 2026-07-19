@@ -304,6 +304,13 @@ class MemoryConfig(_StrictConfigModel):
     session_ttl_seconds: int = Field(default=604800, ge=60, description="Redis Session 记忆 TTL，默认 7 天。")
     # task_ttl_seconds 控制当前任务执行状态和活跃意图的短期保留时间。
     task_ttl_seconds: int = Field(default=86400, ge=60, description="Redis Task 记忆 TTL，默认 1 天。")
+    # entity_anchor_ttl_seconds 单独限制代词指代锚点寿命，不能跟随七天 Session 无限保留。
+    entity_anchor_ttl_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=86400,
+        description="Session 最近实体锚点 TTL，默认 30 分钟。",
+    )
     # preference_ttl_days 定义 PostgreSQL 稳定偏好事实的默认生命周期。
     preference_ttl_days: int = Field(default=365, ge=1, description="PostgreSQL Preference 默认保留天数。")
     # max_session_messages 限制每个 Session 保存的最近消息数量，避免上下文无限增长。
@@ -409,6 +416,22 @@ class ApiRuntimeConfig(_StrictConfigModel):
         return self
 
 
+class ArtifactRegistryRuntimeConfig(_StrictConfigModel):
+    """Unified Artifact Registry and layered loading configuration."""
+
+    enabled: bool = Field(default=True, description="是否在 Agent Run 开始时创建固定版本快照。")
+    bootstrap_repository_artifacts: bool = Field(
+        default=True,
+        description="是否注册仓库内签名/受信示例 Artifact；不会扫描或执行上传代码。",
+    )
+    catalog_top_k: int = Field(default=5, ge=1, le=20, description="Tool/Skill 轻量目录候选 TopK。")
+    schema_token_budget: int = Field(default=2500, ge=100, description="候选 Tool Schema Token 预算。")
+    skill_context_budget: int = Field(default=6000, ge=100, description="选中 Skill 全文上下文预算。")
+    cache_ttl_seconds: int = Field(default=300, ge=1, description="不可变版本本地缓存 TTL。")
+    negative_cache_ttl_seconds: int = Field(default=15, ge=1, description="加载失败负缓存 TTL。")
+    maximum_cache_entries: int = Field(default=256, ge=1, description="单进程不可变版本 LRU 上限。")
+
+
 class RuntimeSettings(_StrictConfigModel):
     """Agent Runtime 的集中配置。"""
 
@@ -434,6 +457,11 @@ class RuntimeSettings(_StrictConfigModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig, description="长期记忆配置。")
     # api 保存网关鉴权、限流、CORS、请求大小和生命周期约束。
     api: ApiRuntimeConfig = Field(default_factory=ApiRuntimeConfig, description="FastAPI 中间件与生命周期配置。")
+    # artifact_registry controls repository bootstrap and layered runtime loading without changing Agent APIs.
+    artifact_registry: "ArtifactRegistryRuntimeConfig" = Field(
+        default_factory=lambda: ArtifactRegistryRuntimeConfig(),
+        description="统一 Tool/Skill/Prompt Registry 运行时配置。",
+    )
 
     def require_model(self, name: str) -> ModelEndpointConfig:
         """读取必需模型配置；缺失时直接报错，避免业务节点静默降级。"""
@@ -472,16 +500,21 @@ def load_runtime_settings(config_dir: str | Path = "configs") -> RuntimeSettings
     memory = _load_yaml_section(base / "memory.yaml", "memory")
     # 加载 API 鉴权、限流、CORS 和请求大小配置。
     api = _load_yaml_section(base / "api.yaml", "api")
+    # 加载统一 Artifact Registry、候选预算和缓存策略。
+    artifact_registry = _load_yaml_section(base / "artifact_registry.yaml", "artifact_registry")
     # 交给严格 Pydantic 模型统一类型转换、未知字段拒绝和跨字段校验。
-    return RuntimeSettings(
-        app_env=os.getenv("APP_ENV", "local"),
-        models=models,
-        database=database,
-        retrieval=retrieval,
-        intent_routing=intent_routing,
-        insurance_knowledge=insurance_knowledge,
-        memory=memory,
-        api=api,
+    return RuntimeSettings.model_validate(
+        {
+            "app_env": os.getenv("APP_ENV", "local"),
+            "models": models,
+            "database": database,
+            "retrieval": retrieval,
+            "intent_routing": intent_routing,
+            "insurance_knowledge": insurance_knowledge,
+            "memory": memory,
+            "api": api,
+            "artifact_registry": artifact_registry,
+        }
     )
 
 

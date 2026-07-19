@@ -21,7 +21,7 @@ Memory 不是简单把所有聊天历史塞进 Prompt，而是按用途分层。
 FastAPI 生产路径额外使用：
 
 - `redis_store.py`：Session/Task Hash、消息 List、租户 LRU ZSet、TTL、版本 CAS 和消息裁剪；
-- `production_manager.py`：组合 Redis 与 PostgreSQL，并追加加密消息/Task 恢复快照；
+- `production_manager.py`：组合 Redis 与 PostgreSQL；Session/Task 在线快照留在 Redis，PostgreSQL 只追加加密消息审计和长期偏好；
 - `postgres_business_store.py`：KYC 事实、Case、Event、Analysis 和 Output 的事务化 Store；
 - `privacy.py`：Consent、导出、删除与跨存储清理；
 - `migrations/001..005`：通用表、业务表、RLS、旧数据升级和历史运行时审批表删除。

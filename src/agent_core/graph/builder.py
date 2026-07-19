@@ -11,14 +11,19 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from agent_core.config.runtime import load_runtime_settings
+from agent_core.config.runtime import MemoryConfig, load_runtime_settings
 from agent_core.graph import nodes
 from agent_core.graph.state import AgentNode, AgentState
 from agent_core.intents.router import INSURANCE_INTENTS, IntentRouter, build_intent_router
 from agent_core.memory.business_store import BusinessMemoryStore
 from agent_core.memory.manager import MemoryBackend
+from agent_core.memory.recall import ProductionMemoryRetriever
+from agent_core.models.client import OpenAICompatibleChatClient
+from agent_core.registry.models import ArtifactKind, ToolManifest
+from agent_core.registry.runtime import ArtifactResolver, RuntimeRequest, RuntimeSnapshot
 from agent_core.skills.insurance_advisor.kyc import InsuranceKycExtractor
 from agent_core.skills.insurance_advisor.knowledge import (
     InsuranceKnowledgeProvider,
@@ -37,12 +42,20 @@ class AgentGraph:
         kyc_extractor: InsuranceKycExtractor | None = None,
         insurance_knowledge_provider: InsuranceKnowledgeProvider | None = None,
         insurance_news_enabled: bool | None = None,
+        memory_retriever: ProductionMemoryRetriever | None = None,
+        memory_decision_client: OpenAICompatibleChatClient | None = None,
+        memory_config: MemoryConfig | None = None,
+        artifact_resolver: ArtifactResolver | None = None,
     ) -> None:
         """注入记忆、业务事实、双层意图路由和保险 KYC 抽取依赖。"""
         # 短期/任务/偏好记忆管理器；同一个 WorkflowEngine 实例内多轮对话复用同一份。
         self.memory_manager = memory_manager
         # KYC 业务记忆 store；保存客户事实、机会 case、生成输出等。
         self.business_store = business_store
+        # 生产长期记忆 Retriever 使用真实 embedding + PostgreSQL pgvector；本地未注入时走内存检索。
+        self.memory_retriever = memory_retriever
+        # 规则无法确定时只由专用小模型判断“是否召回”，不能直接返回记忆正文。
+        self.memory_decision_client = memory_decision_client
         # Router 在 Engine 生命周期内复用意图目录和模型客户端，避免每个请求重复加载配置。
         self.intent_router = intent_router or build_intent_router()
         # KYC Extractor 同样复用低延迟模型客户端；本地未配置模型时自动走规则降级。
@@ -51,12 +64,20 @@ class AgentGraph:
         self.insurance_knowledge_provider = (
             insurance_knowledge_provider or LocalInsuranceKnowledgeProvider()
         )
+        # AgentGraph 只在构造阶段读取一次运行配置；节点执行期间不重复访问 YAML。
+        runtime_settings = load_runtime_settings(os.getenv("CONFIG_DIR", "configs"))
+        # 显式注入优先；否则复用当前 CONFIG_DIR 的记忆策略配置。
+        self.memory_config = memory_config or runtime_settings.memory
         # 新闻工具是否可用由 insurance_handler.yaml 注入；即使开启也只在代码判断需要时调用。
         self.insurance_news_enabled = (
-            load_runtime_settings(os.getenv("CONFIG_DIR", "configs")).insurance_knowledge.news_enabled
+            runtime_settings.insurance_knowledge.news_enabled
             if insurance_news_enabled is None
             else insurance_news_enabled
         )
+        # 实体锚点使用独立短 TTL，不能因为 Session 保留七天而让旧公司长期劫持代词解析。
+        self.entity_anchor_ttl_seconds = runtime_settings.memory.entity_anchor_ttl_seconds
+        # Resolver is optional for legacy tests; enabled runtimes use it for compact discovery and lazy schema load.
+        self.artifact_resolver = artifact_resolver
 
     def invoke(self, state: AgentState | dict[str, Any]) -> AgentState:
         """执行一次完整请求：公共安全入口 → 统一意图路由 → 通用或保险代码路径。"""
@@ -105,8 +126,7 @@ class AgentGraph:
         #       "session": {                          // 短期会话原始记忆（第 1 轮写入）
         #         "recent_messages": [ {user:"帮我看看 Anthropic…"}, {assistant:"Anthropic 是…"} ],
         #         "last_intent": "general_chat",
-        #         "last_entity": "Anthropic",         // 指代锚点："它" = Anthropic 靠它
-        #         "last_entity": "Anthropic"
+        #         "last_entity": "Anthropic"          // 兼容字段；新逻辑实际读取带 TTL 的实体锚点
         #       },
         #       "task": { "current_state": "FINAL", "final_answer_ready": true },
         #       "preference": {},                     // 长期偏好召回结果（本轮判定不召回 → 空）
@@ -116,7 +136,13 @@ class AgentGraph:
         #       }
         #     }
         # 执行 restore_memory 节点并接回更新后的 Agent 状态，保持主链路数据连续。
-        state = nodes.restore_memory(state, self.memory_manager)
+        state = nodes.restore_memory(
+            state,
+            self.memory_manager,
+            memory_retriever=self.memory_retriever,
+            memory_decision_client=self.memory_decision_client,
+            memory_config=self.memory_config,
+        )
         # 合并历史消息与本轮输入为标准消息结构。
         #   产出 state.normalized_messages（历史 2 条 + 追加本轮 1 条）：
         #     [
@@ -133,6 +159,8 @@ class AgentGraph:
         #     domain_skill     = None
         # 执行 classify_intent 节点并接回更新后的 Agent 状态，保持主链路数据连续。
         state = nodes.classify_intent(state, self.intent_router)
+        # 意图识别之后、任务执行之前做 Artifact 目录召回；本阶段只加载紧凑元数据，不注入完整 schema / Skill 正文。
+        state = self._discover_artifact_candidates(state)
         # 低置信度或活跃意图变化不明确时，在工具、RAG、业务记忆读取之前主动澄清。
         if state.context_needs.get("clarify"):
             # 执行 generate_clarification_response 节点并接回更新后的 Agent 状态，保持主链路数据连续。
@@ -140,11 +168,30 @@ class AgentGraph:
             # 执行 response_packaging 节点并接回更新后的 Agent 状态，保持主链路数据连续。
             state = nodes.response_packaging(state)
             # 执行 update_short_term_memory 节点并接回更新后的 Agent 状态，保持主链路数据连续。
-            state = nodes.update_short_term_memory(state, self.memory_manager)
+            if not state.metadata.get("_defer_memory_writes"):
+                # 多意图子步骤只生成局部结果，父请求会在合并完整回答后统一写一次会话记忆。
+                state = nodes.update_short_term_memory(state, self.memory_manager)
             # 执行 trace_finalize 节点并接回更新后的 Agent 状态，保持主链路数据连续。
             state = nodes.trace_finalize(state)
             # 返回更新后的 Agent 状态，交由主流程继续调度下一节点。
             return state
+        # 多任务父请求严格消费 Orchestrator 批次；控制动作或 pause 批次即使只有一个业务任务也要聚合处理。
+        has_orchestrated_control_flow = bool(
+            state.task_schedule
+            and (
+                len(state.intent_execution_plan) > 1
+                or state.task_schedule.get("control_actions")
+                or any(
+                    batch.get("mode") == "pause"
+                    for batch in state.task_schedule.get("batches", [])
+                    if isinstance(batch, dict)
+                )
+            )
+        )
+        # 子步骤携带内部强制任务，不再次进入父级编排，避免递归创建相同批次。
+        if has_orchestrated_control_flow and not state.metadata.get("_is_multi_intent_child"):
+            # 返回合并后的父状态；短期/长期记忆只在全部步骤完成后写入一次。
+            return self._run_multi_intent(state)
         # 语义风险分级，供工具权限与输出策略复用。
         #   产出：
         #     risk_level = "medium"   // 命中"融资 / 英文报道"等中风险词（取值 low / medium / high）
@@ -164,6 +211,9 @@ class AgentGraph:
         #       "filters": { "language": "en", "source_type": "news", "date_range": {…} }
         #     }
         # 执行 query_understanding 节点并接回更新后的 Agent 状态，保持主链路数据连续。
+        # 请求级注入已经校验的配置值，节点不自行读取配置文件或硬编码 TTL。
+        state.metadata["entity_anchor_ttl_seconds"] = self.entity_anchor_ttl_seconds
+        # 使用带 TTL 的 Session 实体锚点执行指代消解，并标记实体是原文明示还是历史推断。
         state = nodes.query_understanding(state)
         # 规划本轮需要 memory/RAG/tool 中的哪些能力。
         #   产出 state.context_needs：
@@ -203,6 +253,8 @@ class AgentGraph:
             #     ]
             # 执行 general_tool_routing 节点并接回更新后的 Agent 状态，保持主链路数据连续。
             state = nodes.general_tool_routing(state)
+            # The selected legacy Tool is mapped back to its pinned Artifact and only then is its full Schema loaded.
+            state = self._load_selected_tool_manifests(state)
             # Tool Schema 发现必填参数缺失时，routing 会设置 clarify；必须在执行器前短路。
             if state.context_needs.get("clarify"):
                 # 执行 generate_clarification_response 节点并接回更新后的 Agent 状态，保持主链路数据连续。
@@ -342,11 +394,13 @@ class AgentGraph:
         #                 "last_entity": "Anthropic" }
         #     task    = { "current_state": "…", "final_answer_ready": true }
         # 执行 update_short_term_memory 节点并接回更新后的 Agent 状态，保持主链路数据连续。
-        state = nodes.update_short_term_memory(state, self.memory_manager)
-        # 判断并写入长期偏好记忆候选。
-        #   产出：
-        #     memory_write_candidates = []   // 本轮无值得跨会话长存的偏好 / 画像
-        state = nodes.long_term_memory_candidate(state, self.memory_manager)
+        if not state.metadata.get("_defer_memory_writes"):
+            # 多意图子步骤不单独改写 Session；否则分段文本会伪装成多轮用户消息。
+            state = nodes.update_short_term_memory(state, self.memory_manager)
+            # 判断并写入长期偏好记忆候选。
+            #   产出：
+            #     memory_write_candidates = []   // 本轮无值得跨会话长存的偏好 / 画像
+            state = nodes.long_term_memory_candidate(state, self.memory_manager)
         # trace 与成本收尾，推进到 FINAL。
         #   产出：
         #     final_state = "FINAL"
@@ -355,6 +409,396 @@ class AgentGraph:
         state = nodes.trace_finalize(state)
         # 返回更新后的 Agent 状态，交由主流程继续调度下一节点。
         return state
+
+    def _discover_artifact_candidates(self, state: AgentState) -> AgentState:
+        """从注册表召回紧凑的 Tool/Skill 候选，不注入完整 schema 或 Skill 正文。"""
+
+        # 未注入 ArtifactResolver 时跳过目录召回，保持本地/无注册表场景可运行。
+        if not self.artifact_resolver:
+            # 返回原状态，后续仍走既有工具路由与领域处理器。
+            return state
+        # 从本轮 metadata 读取 WorkflowEngine 预先解析的运行时请求契约。
+        raw_request = state.metadata.get("_artifact_runtime_request")
+        # 从本轮 metadata 读取已钉住的 RuntimeSnapshot；本方法只会追加候选，不会改别名解析。
+        raw_snapshot = state.metadata.get("_artifact_runtime_snapshot")
+        # 缺少请求或快照时无法做租户/ACL 过滤，直接跳过，避免半初始化状态误召回。
+        if not isinstance(raw_request, dict) or not isinstance(raw_snapshot, dict):
+            # 返回原状态，等待上层在正确装配 Runtime 后再发现候选。
+            return state
+        # 反序列化为强类型 RuntimeRequest，供注册表硬过滤与目录检索使用。
+        request = RuntimeRequest.model_validate(raw_request)
+        # 反序列化为强类型 RuntimeSnapshot，后续 pin_candidates 会在其上钉住版本与依赖。
+        snapshot = RuntimeSnapshot.model_validate(raw_snapshot)
+        # 多意图计划优先；无计划时回退到当前单意图，保证检索 query 带上意图语义。
+        intents = [
+            # 只保留非空 intent 字符串，过滤脏计划项。
+            str(item.get("intent"))
+            for item in state.intent_execution_plan
+            if isinstance(item, dict) and item.get("intent")
+        ] or ([state.intent] if state.intent else [])
+        # 硬过滤后按关键词打分召回 TopK；只返回 compact 元数据，不加载 input_schema / Skill 正文。
+        candidates = self.artifact_resolver.search_catalog(
+            request,
+            # 用户原文作为主检索 query。
+            query=state.input_text,
+            # 意图标签参与打分，提升与当前任务相关的 Tool/Skill 排序。
+            intents=intents,
+            # 本阶段只发现可执行 Tool 与可加载 Skill，不包含 Prompt。
+            kinds=(ArtifactKind.TOOL, ArtifactKind.SKILL),
+            # 限制候选数量，避免把过多元数据塞进后续上下文。
+            top_k=5,
+            # 限制候选元数据总 token，符合“目录检索紧凑暴露”的上下文预算。
+            token_budget=2500,
+        )
+        # 将命中候选及其依赖版本钉进本轮快照，后续执行不再重新解析 alias。
+        snapshot = self.artifact_resolver.pin_candidates(request, snapshot, candidates)
+        # 写回更新后的快照 JSON，供后续 load_manifest / 审计使用。
+        state.metadata["_artifact_runtime_snapshot"] = snapshot.model_dump(mode="json")
+        # 保存候选列表；真正选中工具后由 _load_selected_tool_manifests 再加载完整 schema。
+        state.metadata["_artifact_candidates"] = [item.model_dump(mode="json") for item in candidates]
+        # 记录可审计的候选选择事件，只含 ID/版本/分数/原因码，不含 schema 或 Skill 正文。
+        state.add_trace_event(
+            "artifact_candidates_selected",
+            candidates=[
+                {
+                    # Artifact 稳定标识，供后续按 ID 加载。
+                    "artifact_id": item.artifact_id,
+                    # 钉住的不可变版本 ID。
+                    "version_id": item.version_id,
+                    # tool 或 skill。
+                    "kind": item.kind,
+                    # 目录检索相关度分数。
+                    "score": item.score,
+                    # 短原因码，供离线分析，不包含模型思维链。
+                    "reason_code": item.selection_reason,
+                }
+                for item in candidates
+            ],
+            # 明确标记本阶段未加载完整 Tool schema。
+            schema_loaded=False,
+            # 明确标记本阶段未加载完整 Skill 内容。
+            skill_content_loaded=False,
+        )
+        # 返回携带候选与更新快照的状态，进入澄清判断或后续执行。
+        return state
+
+    def _load_selected_tool_manifests(self, state: AgentState) -> AgentState:
+        """Load full Tool schemas only for tools actually selected by the legacy router."""
+
+        if not self.artifact_resolver or not state.tool_plan:
+            return state
+        raw_request = state.metadata.get("_artifact_runtime_request")
+        raw_snapshot = state.metadata.get("_artifact_runtime_snapshot")
+        raw_candidates = state.metadata.get("_artifact_candidates", [])
+        if not isinstance(raw_request, dict) or not isinstance(raw_snapshot, dict):
+            return state
+        request = RuntimeRequest.model_validate(raw_request)
+        snapshot = RuntimeSnapshot.model_validate(raw_snapshot)
+        selected_names = {
+            str(item.get("tool_name") or item.get("name"))
+            for item in state.tool_plan
+            if isinstance(item, dict)
+        }
+        forced_step = state.metadata.get("_forced_intent_step")
+        task_id = str(forced_step.get("task_id")) if isinstance(forced_step, dict) else None
+        loaded: list[dict[str, Any]] = []
+        for candidate in raw_candidates if isinstance(raw_candidates, list) else []:
+            if not isinstance(candidate, dict) or candidate.get("name") not in selected_names:
+                continue
+            manifest = self.artifact_resolver.load_manifest(
+                request,
+                snapshot,
+                str(candidate["artifact_id"]),
+                task_id=task_id,
+                selected_reason="legacy_tool_router_selected",
+            )
+            if isinstance(manifest, ToolManifest):
+                loaded.append(
+                    {
+                        "artifact_id": manifest.artifact_id,
+                        "name": manifest.name,
+                        "version": manifest.version,
+                        "content_hash": manifest.content_hash,
+                        "input_schema": manifest.input_schema,
+                    }
+                )
+        state.metadata["_selected_tool_artifacts"] = loaded
+        if loaded:
+            state.add_trace_event(
+                "selected_tool_manifests_loaded",
+                tools=[
+                    {
+                        "artifact_id": item["artifact_id"],
+                        "name": item["name"],
+                        "version": item["version"],
+                        "content_hash": item["content_hash"],
+                    }
+                    for item in loaded
+                ],
+            )
+        return state
+
+    def _run_multi_intent(self, state: AgentState) -> AgentState:
+        """严格消费调度批次，安全并发独立读取，并聚合一次用户响应。"""
+
+        original_input = state.input_text
+        sections: dict[int, str] = {}
+        query_summaries: list[dict[str, Any]] = []
+        plan_by_id = {
+            str(step["task_id"]): step
+            for step in state.intent_execution_plan
+            if isinstance(step, dict) and step.get("task_id")
+        }
+        schedule = state.task_schedule or {}
+        task_policy = {
+            str(task.get("task_id")): task
+            for task in schedule.get("tasks", [])
+            if isinstance(task, dict) and task.get("task_id")
+        }
+        batches = [item for item in schedule.get("batches", []) if isinstance(item, dict)]
+        if not batches:
+            batches = [
+                {
+                    "batch_id": f"legacy-{index}",
+                    "mode": "sequential",
+                    "task_ids": [step["task_id"]],
+                    "reason_code": "legacy_schedule_fallback",
+                }
+                for index, step in enumerate(state.intent_execution_plan, start=1)
+            ]
+        failed_or_paused: set[str] = set()
+
+        def build_child(step_payload: dict[str, Any]) -> AgentState:
+            child_metadata = {
+                **state.metadata,
+                "_forced_intent_step": dict(step_payload),
+                "_is_multi_intent_child": True,
+                "_defer_memory_writes": True,
+                "_parent_trace_id": state.trace_id,
+            }
+            return AgentState(
+                session_id=state.session_id,
+                user_id=state.user_id,
+                tenant_id=state.tenant_id,
+                input_text=str(step_payload["text_span"]),
+                workflow_name=state.workflow_name,
+                domain_skill=step_payload.get("domain_skill"),
+                metadata=child_metadata,
+            )
+
+        for batch in batches:
+            batch_id = str(batch.get("batch_id", "batch"))
+            mode = str(batch.get("mode", "sequential"))
+            task_ids = [str(value) for value in batch.get("task_ids", [])]
+            state.add_trace_event(
+                "multi_intent_batch_started",
+                batch_id=batch_id,
+                mode=mode,
+                task_ids=task_ids,
+                reason_code=batch.get("reason_code", ""),
+            )
+            runnable: list[tuple[str, dict[str, Any], AgentState]] = []
+            for task_id in task_ids:
+                step_payload = plan_by_id.get(task_id)
+                if not step_payload:
+                    state.errors.append(f"multi_intent_schedule_unknown_task:{task_id}")
+                    failed_or_paused.add(task_id)
+                    continue
+                sequence = int(step_payload["sequence"])
+                policy = task_policy.get(task_id, {})
+                dependencies = [str(value) for value in policy.get("dependencies", [])]
+                blocked_by = sorted(set(dependencies).intersection(failed_or_paused))
+                if blocked_by:
+                    sections[sequence] = (
+                        f"{sequence}. {step_payload['intent']}\n"
+                        f"前置任务未成功（{', '.join(blocked_by)}），因此未执行；当前证据不足。"
+                    )
+                    failed_or_paused.add(task_id)
+                    state.add_trace_event(
+                        "multi_intent_step_blocked",
+                        sequence=sequence,
+                        intent=step_payload["intent"],
+                        reason_code="runtime_failed_dependency",
+                        dependencies=blocked_by,
+                    )
+                    continue
+                if mode == "pause":
+                    reason = str(policy.get("blocking_reason") or "policy_pause")
+                    sections[sequence] = (
+                        f"{sequence}. {step_payload['intent']}\n尚未执行，等待澄清或确认（{reason}）。"
+                    )
+                    failed_or_paused.add(task_id)
+                    state.add_trace_event(
+                        "multi_intent_step_paused",
+                        sequence=sequence,
+                        intent=step_payload["intent"],
+                        reason_code=reason,
+                    )
+                    continue
+                child = build_child(step_payload)
+                runnable.append((task_id, step_payload, child))
+                state.add_trace_event(
+                    "multi_intent_step_started",
+                    sequence=sequence,
+                    execution_priority=step_payload.get("execution_priority"),
+                    intent=step_payload["intent"],
+                    child_trace_id=child.trace_id,
+                    batch_id=batch_id,
+                )
+
+            outcomes: dict[str, AgentState | Exception] = {}
+            if mode == "parallel" and len(runnable) > 1:
+                with ThreadPoolExecutor(max_workers=min(4, len(runnable))) as executor:
+                    futures = {
+                        executor.submit(self.invoke, child): task_id
+                        for task_id, _step_payload, child in runnable
+                    }
+                    for future in as_completed(futures):
+                        task_id = futures[future]
+                        try:
+                            outcomes[task_id] = future.result()
+                        except Exception as exc:  # noqa: PERF203 - each task is an isolation boundary.
+                            outcomes[task_id] = exc
+            else:
+                for task_id, _step_payload, child in runnable:
+                    try:
+                        outcomes[task_id] = self.invoke(child)
+                    except Exception as exc:
+                        outcomes[task_id] = exc
+
+            for task_id, step_payload, child in sorted(
+                runnable,
+                key=lambda item: (int(item[1]["sequence"]), item[0]),
+            ):
+                sequence = int(step_payload["sequence"])
+                outcome = outcomes[task_id]
+                if isinstance(outcome, Exception):
+                    failed_or_paused.add(task_id)
+                    state.errors.append(
+                        f"multi_intent_step_failed:{sequence}:{step_payload['intent']}:{type(outcome).__name__}"
+                    )
+                    sections[sequence] = (
+                        f"{sequence}. {step_payload['intent']}\n该子任务执行失败，未生成或编造结果。"
+                    )
+                    state.add_trace_event(
+                        "multi_intent_step_failed",
+                        sequence=sequence,
+                        intent=step_payload["intent"],
+                        exception_type=type(outcome).__name__,
+                        batch_id=batch_id,
+                    )
+                    continue
+                child_result = outcome
+                sections[sequence] = (
+                    f"{sequence}. {step_payload['intent']}\n"
+                    f"{child_result.answer or '该子任务没有产生可用结果。'}"
+                )
+                state.tool_calls.extend(child_result.tool_calls)
+                state.tool_results.extend(child_result.tool_results)
+                state.retrieved_context.extend(child_result.retrieved_context)
+                state.guardrail_results.extend(child_result.guardrail_results)
+                state.errors.extend(child_result.errors)
+                if child_result.query_understanding:
+                    query_summaries.append(
+                        {
+                            "sequence": sequence,
+                            "intent": step_payload["intent"],
+                            **child_result.query_understanding,
+                        }
+                    )
+                if child_result.domain_skill == "insurance_advisor":
+                    self._merge_insurance_child_state(state, child_result)
+                state.add_trace_event(
+                    "multi_intent_step_finished",
+                    sequence=sequence,
+                    intent=step_payload["intent"],
+                    child_trace_id=child_result.trace_id or child.trace_id,
+                    final_state=child_result.final_state.value if child_result.final_state else None,
+                    answer_ready=bool(child_result.answer),
+                    batch_id=batch_id,
+                )
+            state.add_trace_event(
+                "multi_intent_batch_checkpoint",
+                batch_id=batch_id,
+                failed_or_paused_task_ids=sorted(failed_or_paused),
+                completed_task_ids=sorted(outcomes),
+                replan_required=bool(failed_or_paused),
+            )
+
+        if self.artifact_resolver:
+            load_events = self.artifact_resolver.registry.runtime_load_events(
+                tenant_id=state.tenant_id,
+                run_id=state.trace_id,
+            )
+            state.add_trace_event(
+                "multi_intent_artifact_usage",
+                artifact_versions=[
+                    {
+                        "task_id": event.task_id,
+                        "artifact_id": event.artifact_id,
+                        "version_id": event.artifact_version_id,
+                        "version": event.version,
+                        "content_hash": event.content_hash,
+                        "selected_reason": event.selected_reason,
+                    }
+                    for event in load_events
+                ],
+            )
+        state.input_text = original_input
+        primary = state.intent_execution_plan[0]
+        state.intent = str(primary["intent"])
+        state.capability_route = str(primary["capability_route"])
+        state.domain_skill = primary.get("domain_skill")
+        ordered_sections = [sections[key] for key in sorted(sections)]
+        clarification = schedule.get("clarification_question")
+        if clarification:
+            ordered_sections.append(f"下一步：{clarification}")
+        state.answer = "\n\n".join(ordered_sections) if ordered_sections else "所有子任务均未产生可用结果。"
+        state.query_understanding = {
+            "multi_intent": True,
+            "steps": sorted(query_summaries, key=lambda item: int(item["sequence"])),
+        }
+        state = nodes.output_pii_scan(state)
+        state = nodes.compliance_review(state)
+        state = nodes.response_packaging(state)
+        state = nodes.update_short_term_memory(state, self.memory_manager)
+        state = nodes.long_term_memory_candidate(state, self.memory_manager)
+        return nodes.trace_finalize(state)
+
+    @staticmethod
+    def _merge_insurance_child_state(parent: AgentState, child: AgentState) -> None:
+        """把保险子步骤的业务控制结果合并回多意图父状态。"""
+        # 这些字段是响应和下一轮 active intent 所需的最小业务控制面；客户原始证据仍留在业务 Store。
+        fields = [
+            "active_intent_state",
+            "profile_state",
+            "practitioner_state",
+            "information_status",
+            "subject_type",
+            "target_persona",
+            "advisor_stage",
+            "missing_fields",
+            "asked_focuses",
+            "kyc_question_round_count",
+            "kyc_completeness_score",
+            "opportunity_score",
+            "external_grade",
+            "trigger_module",
+            "current_stage",
+            "objective_material_need",
+            "support_note",
+        ]
+        # 逐字段深拷贝 Pydantic 值，避免父子状态共享可变 list/dict 引用。
+        for field_name in fields:
+            # model_copy(deep=True) 不能只复制单字段，因此对容器使用标准序列化往返是不必要的；
+            # Pydantic 子状态已不再继续修改，赋值后父状态成为唯一后续写入者。
+            setattr(parent, field_name, getattr(child, field_name))
+        # active intent 的 CAS 保护依赖 dirty/transition_at 元数据，必须随领域状态一起合并。
+        for metadata_key in ["active_intent_dirty", "active_intent_transition_at", "active_intent_cancelled"]:
+            # 只复制子图真实产生的键；缺失键不能清除其它已完成步骤的更新。
+            if metadata_key in child.metadata:
+                # 保存最新领域步骤的 active-intent 版本控制信息。
+                parent.metadata[metadata_key] = child.metadata[metadata_key]
 
     def _run_insurance_conversation(self, state: AgentState) -> AgentState:
         """代码化保险对话处理器：KYC 增量 → 确定性路由 → 追问或策略。
@@ -382,7 +826,12 @@ class AgentGraph:
         #       }
         #     }
         # 执行 load_business_memory 节点并接回更新后的 Agent 状态，保持主链路数据连续。
-        state = nodes.load_business_memory(state, self.business_store)
+        state = nodes.load_business_memory(
+            state,
+            self.business_store,
+            memory_decision_client=self.memory_decision_client,
+            memory_config=self.memory_config,
+        )
         # LLM 只抽取本轮明确 KYC 增量；Pydantic 校验后与业务事实合并，模型不做评分和路由。
         state = nodes.extract_insurance_kyc_slots(state, self.kyc_extractor)
         # 代码计算 KYC 字段缺口、完整度、机会分和 information_status（最大轮次由配置控制）。
@@ -463,7 +912,11 @@ class AgentGraph:
         # information_status=insufficient 时创建/续接 Redis 活跃意图；完成、取消或转策略后清空。
         state = nodes.sync_active_intent_state(state)
         # 统一更新最近消息和 active_intent 信封，下一轮先做意图变化判断而不是重新全量分类。
-        state = nodes.update_short_term_memory(state, self.memory_manager)
+        if not state.metadata.get("_defer_memory_writes"):
+            # 多意图子图的 active state 会先合并回父状态，再由父请求执行一次原子 Session 写入。
+            state = nodes.update_short_term_memory(state, self.memory_manager)
+            # 通用交互偏好与保险业务事实属于不同存储；保险输入中明确的语言/格式偏好仍应进入 Preference。
+            state = nodes.long_term_memory_candidate(state, self.memory_manager)
         # trace 收尾，推进到 FINAL。
         #   产出：final_state = "FINAL"
         state = nodes.trace_finalize(state)
@@ -478,6 +931,10 @@ def build_agent_graph(
     kyc_extractor: InsuranceKycExtractor | None = None,
     insurance_knowledge_provider: InsuranceKnowledgeProvider | None = None,
     insurance_news_enabled: bool | None = None,
+    memory_retriever: ProductionMemoryRetriever | None = None,
+    memory_decision_client: OpenAICompatibleChatClient | None = None,
+    memory_config: MemoryConfig | None = None,
+    artifact_resolver: ArtifactResolver | None = None,
 ) -> AgentGraph:
     """构建 Agent 执行器。保留该函数名，调用方（WorkflowEngine）无需改动。"""
     # 直接返回线性执行器；不再有 LocalGraph / LangGraph 双图与 topology 声明层。
@@ -488,4 +945,8 @@ def build_agent_graph(
         kyc_extractor,
         insurance_knowledge_provider,
         insurance_news_enabled,
+        memory_retriever,
+        memory_decision_client,
+        memory_config,
+        artifact_resolver,
     )

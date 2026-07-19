@@ -24,6 +24,7 @@ from agent_core.agentic_loop.schemas import (
 )
 from agent_core.context.builder import ContextBuilder
 from agent_core.context.compression import truncate_context
+from agent_core.config.runtime import MemoryConfig
 from agent_core.cost.model_router import choose_model
 from agent_core.graph.state import AgentNode, AgentState
 from agent_core.guardrails.input import InputGuardrail
@@ -54,23 +55,28 @@ from agent_core.memory.compact_context import build_compact_context
 from agent_core.memory.manager import MemoryBackend, MemoryLayer
 from agent_core.memory.preference_extractor import (
     extract_stable_preferences,
-    merge_preference_candidates,
 )
 from agent_core.memory.redis_store import MemoryVersionConflict
 from agent_core.memory.recall import (
-    MemoryRecallDecision,
+    ProductionMemoryRetriever,
     business_memory_to_documents,
+    decide_long_term_memory_recall,
     hybrid_recall_memory,
     plan_long_term_memory_recall,
     preference_memory_to_documents,
 )
+from agent_core.models.client import OpenAICompatibleChatClient
 from agent_core.memory.write_policy import (
     MemoryWriteProposal,
     filter_allowed_facts,
     validate_memory_write_proposal,
 )
 from agent_core.intents.router import INSURANCE_INTENTS, IntentRouter, build_intent_router
-from agent_core.intents.schemas import ActiveIntentState
+from agent_core.intents.schemas import (
+    ActiveIntentState,
+    IntentExecutionStep,
+    IntentRoutingResult,
+)
 from agent_core.rag.query_rewrite import rewrite_sales_queries
 from agent_core.recovery.fallback import fallback_answer
 from agent_core.sales_intelligence.retriever import (
@@ -332,7 +338,14 @@ def input_guardrail(state: AgentState) -> AgentState:
     return state
 
 
-def restore_memory(state: AgentState, memory_manager: MemoryBackend | None = None) -> AgentState:
+def restore_memory(
+    state: AgentState,
+    memory_manager: MemoryBackend | None = None,
+    *,
+    memory_retriever: ProductionMemoryRetriever | None = None,
+    memory_decision_client: OpenAICompatibleChatClient | None = None,
+    memory_config: MemoryConfig | None = None,
+) -> AgentState:
     """读取短期/任务记忆，并按需召回长期偏好记忆。"""
     # 进入 RESTORE_MEMORY 节点，状态迁移会被审计和回放。
     _enter(state, AgentNode.RESTORE_MEMORY, "enter_restore_memory")
@@ -353,18 +366,47 @@ def restore_memory(state: AgentState, memory_manager: MemoryBackend | None = Non
         # 用关键词规则做一次"预判"，让召回的 skip/must 规则拿到有效 intent/domain（修复召回时机问题）；
         # 预判结果只用于本次召回决策，不写回 state.intent，classify_intent 仍是权威来源。
         preliminary_intent, _preliminary_route, preliminary_domain = _rule_intent_hint(state.input_text)
-        # 长期偏好不是每轮都召回。先由 recall planner 判断当前请求是否需要长期记忆。
-        decision = plan_long_term_memory_recall(
-            input_text=state.input_text,
-            workflow_name=state.workflow_name,
-            intent=state.intent or preliminary_intent,
-            domain_skill=state.domain_skill or preliminary_domain,
-            risk_level=state.risk_level,
-            session_memory=dict(session_memory),
-            metadata=state.metadata,
-        )
+        # 生产注入 Retriever/决策模型时走完整“规则→模型→PostgreSQL pgvector”链；
+        # 本地测试未注入外部依赖时保留确定性 plan，避免单元测试产生网络调用。
+        if memory_retriever is not None or memory_decision_client is not None:
+            # 生产决策显式绑定 tenant/user/session；缺 user_id 时按策略安全跳过跨会话读取。
+            decision = decide_long_term_memory_recall(
+                input_text=state.input_text,
+                workflow_name=state.workflow_name,
+                intent=state.intent or preliminary_intent,
+                domain_skill=state.domain_skill or preliminary_domain,
+                tenant_id=state.tenant_id,
+                user_id=state.user_id,
+                session_id=state.session_id,
+                session_memory=dict(session_memory),
+                metadata=state.metadata,
+                memory_config=memory_config,
+                model_client=memory_decision_client,
+            )
+        # 本地 MemoryManager 使用无网络规则规划器，保持测试可复现。
+        else:
+            # risk_level 参数保留旧接口兼容，规则层当前不直接读取该值。
+            decision = plan_long_term_memory_recall(
+                input_text=state.input_text,
+                workflow_name=state.workflow_name,
+                intent=state.intent or preliminary_intent,
+                domain_skill=state.domain_skill or preliminary_domain,
+                risk_level=state.risk_level,
+                session_memory=dict(session_memory),
+                metadata=state.metadata,
+            )
         # 记录结构化记忆召回决策，供审计为什么读取这些记忆。
         state.memory_recall_decision = decision.model_dump()
+        # 分域字典是完整审计入口；兼容字段仍指向最近一次决策。
+        state.memory_recall_decisions["preference"] = decision.model_dump()
+        # 生产路径对“召回”和“不召回”都写决策审计，才能评估长期记忆是否过度或不足。
+        if memory_retriever is not None:
+            # PostgreSQL 审计只保存结构化决策，不保存完整 Prompt 或隐藏推理。
+            memory_retriever.repository.insert_memory_recall_decision(
+                tenant_id=state.tenant_id,
+                trace_id=state.trace_id,
+                decision=decision.model_dump(mode="json"),
+            )
 
         # 初始化空偏好摘要；只有召回策略明确允许时才会用长期记忆结果覆盖。
         preference_summary: dict[str, Any] = {}
@@ -374,20 +416,40 @@ def restore_memory(state: AgentState, memory_manager: MemoryBackend | None = Non
         if decision.should_recall and "preference" in decision.recall_layers:
             # 偏好记忆优先按 user_id 读取；匿名用户退回 session_id，避免完全失去个性化上下文。
             preference_subject = state.user_id or state.session_id
-            # 只有决策需要时才读 PREFERENCE，避免计算、天气等请求被长期偏好污染。
-            preference_memory = memory_manager.read(MemoryLayer.PREFERENCE, state.tenant_id, preference_subject)
-            # 整理候选集合 documents，供后续过滤、排序或聚合使用。
-            documents = preference_memory_to_documents(
-                tenant_id=state.tenant_id,
-                subject_id=preference_subject,
-                preference_memory=dict(preference_memory),
-            )
-            # 保存本步骤处理结果 recall_result，供校验、追踪或响应组装继续使用。
-            recall_result = hybrid_recall_memory(
-                decision=decision,
-                documents=documents,
-                tenant_id=state.tenant_id,
-            )
+            # 生产路径必须使用真实 embedding + PostgreSQL 检索器，不能先整包读取再本地模拟向量搜索。
+            if memory_retriever is not None and state.user_id:
+                # Retriever 内部执行多 Query、pgvector/全文融合、reranker 和 TopK 压缩。
+                recall_result = memory_retriever.recall(
+                    decision=decision,
+                    tenant_id=state.tenant_id,
+                    user_id=state.user_id,
+                )
+                # 只保存结构化命中摘要，不保存 Prompt 或用户完整输入。
+                memory_retriever.repository.insert_memory_recall_result(
+                    tenant_id=state.tenant_id,
+                    trace_id=state.trace_id,
+                    result={"items": [item.model_dump(mode="json") for item in recall_result.items]},
+                )
+            # 本地路径读取内存 Preference 后转换为文档，继续使用确定性 HybridRetriever。
+            else:
+                # 只有决策需要时才读 PREFERENCE，避免计算、天气等请求被长期偏好污染。
+                preference_memory = memory_manager.read(
+                    MemoryLayer.PREFERENCE,
+                    state.tenant_id,
+                    preference_subject,
+                )
+                # 整理候选集合 documents，供后续过滤、排序或聚合使用。
+                documents = preference_memory_to_documents(
+                    tenant_id=state.tenant_id,
+                    subject_id=preference_subject,
+                    preference_memory=dict(preference_memory),
+                )
+                # 保存本步骤处理结果 recall_result，供校验、追踪或响应组装继续使用。
+                recall_result = hybrid_recall_memory(
+                    decision=decision,
+                    documents=documents,
+                    tenant_id=state.tenant_id,
+                )
             # 调用 recall_result.compact_summary.get 计算 preference_summary，并保存结果供本步骤后续逻辑使用。
             preference_summary = recall_result.compact_summary.get("preference", {})
             # 整理候选集合 recall_items，供后续过滤、排序或聚合使用。
@@ -411,7 +473,13 @@ def restore_memory(state: AgentState, memory_manager: MemoryBackend | None = Non
     return state
 
 
-def load_business_memory(state: AgentState, business_store: BusinessMemoryStore | None = None) -> AgentState:
+def load_business_memory(
+    state: AgentState,
+    business_store: BusinessMemoryStore | None = None,
+    *,
+    memory_decision_client: OpenAICompatibleChatClient | None = None,
+    memory_config: MemoryConfig | None = None,
+) -> AgentState:
     """读取工作流状态，并按需召回长期业务事实。"""
     # 切换到 LOAD_BUSINESS_MEMORY，让状态路径能区分通用记忆与保险业务记忆。
     _enter(state, AgentNode.LOAD_BUSINESS_MEMORY, "enter_load_business_memory")
@@ -576,18 +644,39 @@ def load_business_memory(state: AgentState, business_store: BusinessMemoryStore 
     preliminary_intent, _preliminary_route, preliminary_domain = _rule_intent_hint(state.input_text)
     # KYC 使用显式 missing_fields 业务状态，不复用通用工具参数或旧槽位容器。
     recall_metadata = {**state.metadata, "missing_fields": state.missing_fields}
-    # 保存结构化决策 decision，供紧随其后的路由分支读取。
-    decision = plan_long_term_memory_recall(
-        input_text=state.input_text,
-        workflow_name=state.workflow_name,
-        intent=state.intent or preliminary_intent,
-        domain_skill=state.domain_skill or preliminary_domain,
-        risk_level=state.risk_level,
-        session_memory=state.memory_context.get("session", {}),
-        metadata=recall_metadata,
-    )
+    # 生产注入专用决策模型时使用带 tenant/user 强制过滤的两阶段决策；
+    # 本地测试继续使用无网络规则 planner，保证结果稳定。
+    if memory_decision_client is not None:
+        # 业务长期记忆仍按登录用户做读取授权；匿名会话缺 user_id 时安全跳过跨会话召回。
+        decision = decide_long_term_memory_recall(
+            input_text=state.input_text,
+            workflow_name=state.workflow_name,
+            intent=state.intent or preliminary_intent,
+            domain_skill=state.domain_skill or preliminary_domain,
+            tenant_id=state.tenant_id,
+            user_id=state.user_id,
+            session_id=state.session_id,
+            session_memory=state.memory_context.get("session", {}),
+            metadata=recall_metadata,
+            memory_config=memory_config,
+            model_client=memory_decision_client,
+        )
+    # 本地 Business Store 不依赖外部模型或 PostgreSQL Retriever。
+    else:
+        # 保存结构化决策 decision，供紧随其后的路由分支读取。
+        decision = plan_long_term_memory_recall(
+            input_text=state.input_text,
+            workflow_name=state.workflow_name,
+            intent=state.intent or preliminary_intent,
+            domain_skill=state.domain_skill or preliminary_domain,
+            risk_level=state.risk_level,
+            session_memory=state.memory_context.get("session", {}),
+            metadata=recall_metadata,
+        )
     # 记录结构化记忆召回决策，供审计为什么读取这些记忆。
     state.memory_recall_decision = decision.model_dump()
+    # 业务域使用独立键保存，避免覆盖 restore_memory 已记录的 preference 召回决策。
+    state.memory_recall_decisions["business"] = decision.model_dump()
 
     # 整理候选集合 recalled_items，供后续过滤、排序或聚合使用。
     recalled_items: list[dict[str, Any]] = []
@@ -2019,14 +2108,36 @@ def classify_intent(state: AgentState, intent_router: IntentRouter | None = None
                         pending_focus=active_intent.pending_focus,
                         asked_focus_count=len(active_intent.asked_focuses),
                     )
-    # Builder 会注入进程级 Router；直接节点测试未注入时才从配置构建一个本地实例。
-    router = intent_router or build_intent_router()
-    # Router 内部先判断 active intent，再按 0.85/0.60 阈值执行向量和 LLM 双层路由。
-    routing = router.route(
-        tenant_id=state.tenant_id,
-        text=state.input_text,
-        active_intent=active_intent,
-    )
+    # 多意图编排器创建子执行状态时会放入已经由父 Router 校验过的强类型步骤。
+    # 该内部字段无法通过公开 AgentRunRequest.metadata 白名单注入，因此不会形成绕过分类的外部入口。
+    forced_step_payload = state.metadata.get("_forced_intent_step")
+    # 存在内部强制步骤时只恢复该单步，不再次分类整段复合请求，避免递归产生相同多意图计划。
+    if isinstance(forced_step_payload, dict) and forced_step_payload:
+        # Pydantic 再次校验 intent、route、confidence、sequence 和非空 text_span。
+        forced_step = IntentExecutionStep.model_validate(forced_step_payload)
+        # 子步骤的顶层兼容结果严格镜像已经校验的执行步骤。
+        routing = IntentRoutingResult(
+            intent=forced_step.intent,
+            capability_route=forced_step.capability_route,
+            domain_skill=forced_step.domain_skill,
+            source="multi_intent_execution_plan",
+            confidence=forced_step.confidence,
+            dispatch_action=forced_step.dispatch_action,
+            slots=forced_step.slots,
+            active_intent_action="none",
+            reason_code=forced_step.reason_code,
+            execution_plan=[forced_step],
+        )
+    # 普通请求由 Router 先判断 active intent，再按向量/LLM/规则完成单或多意图识别。
+    else:
+        # Builder 会注入进程级 Router；直接节点测试未注入时才从配置构建本地实例。
+        router = intent_router or build_intent_router()
+        # Router 返回的 execution_plan 是后续编排的唯一权威顺序。
+        routing = router.route(
+            tenant_id=state.tenant_id,
+            text=state.input_text,
+            active_intent=active_intent,
+        )
     # 最终意图、能力路由和领域 Skill 都来自白名单目录，不直接采用模型自由文本。
     state.intent = routing.intent
     # 保存能力路由类别，供主图选择工具、领域或直接回答链路。
@@ -2037,6 +2148,10 @@ def classify_intent(state: AgentState, intent_router: IntentRouter | None = None
     state.intent_confidence = routing.confidence
     # 模型联合抽取的槽位单独进入领域增量，Trace 中只记录字段名，不记录值。
     state.insurance_kyc_delta = dict(routing.slots)
+    # 强类型任务在 AgentState 中保存 JSON 结构；真正执行批次只认 task_schedule。
+    state.intent_execution_plan = [step.model_dump() for step in routing.execution_plan]
+    # 保存不含模型推理的确定性调度结果；forced child 没有父级多任务调度时使用空对象。
+    state.task_schedule = routing.task_schedule.model_dump() if routing.task_schedule is not None else {}
     # 对外可观察路由摘要删除 slots 原值和知识库完整文本，只保留分数、来源和候选意图。
     state.intent_routing_result = {
         "intent": routing.intent,
@@ -2053,13 +2168,67 @@ def classify_intent(state: AgentState, intent_router: IntentRouter | None = None
         "extracted_slot_names": sorted(routing.slots.keys()),
         "active_intent_action": routing.active_intent_action,
         "reason_code": routing.reason_code,
+        "execution_plan": [
+            {
+                "sequence": step.sequence,
+                "task_id": step.task_id,
+                "user_order": step.user_order,
+                "user_order_explicit": step.user_order_explicit,
+                "intent": step.intent,
+                "capability_route": step.capability_route,
+                "domain_skill": step.domain_skill,
+                "confidence": step.confidence,
+                "dispatch_action": step.dispatch_action,
+                "operation": step.operation,
+                "risk": step.risk,
+                "required_inputs": list(step.required_inputs),
+                "resource_keys": list(step.resource_keys),
+                "confirmation_required": step.confirmation_required,
+                "dependencies": list(step.dependencies),
+                "is_blocking": step.is_blocking,
+                "policy_tier": step.policy_tier,
+                "status": step.status,
+                "blocking_reason": step.blocking_reason,
+                "batch_id": step.batch_id,
+                "execution_mode": step.execution_mode,
+                # 对外/Trace 摘要只记录子句长度；原文仅保存在请求级内部执行计划中。
+                "text_span_chars": len(step.text_span),
+                "extracted_slot_names": sorted(step.slots.keys()),
+                "reason_code": step.reason_code,
+            }
+            for step in routing.execution_plan
+        ],
+        "task_schedule": (
+            {
+                "status": routing.task_schedule.status,
+                "control_actions": list(routing.task_schedule.control_actions),
+                "batches": [batch.model_dump() for batch in routing.task_schedule.batches],
+                "clarification_question": routing.task_schedule.clarification_question,
+                "conflict_resources": list(routing.task_schedule.conflict_resources),
+            }
+            if routing.task_schedule is not None
+            else {}
+        ),
     }
-    # 低置信度或活跃意图歧义必须在任何工具、RAG 和保险代码执行前主动澄清。
-    if routing.dispatch_action == "clarify":
+    # 全部任务都暂停时必须在任何工具、RAG 和领域代码前澄清；partial 计划由 Builder 先执行独立批次。
+    schedule_requires_clarification = bool(
+        routing.task_schedule is not None
+        and routing.task_schedule.status in {"clarification_required", "confirmation_required"}
+    )
+    # partial 计划的问题由多任务聚合器在已执行结果后追加，不能让这里提前跳过可执行批次。
+    if routing.task_schedule is not None and routing.task_schedule.clarification_question:
+        # 保存最小问题供 Builder 聚合，不复制任何任务 text_span。
+        state.metadata["task_schedule_clarification_question"] = routing.task_schedule.clarification_question
+    # 低置信、活跃意图歧义或全暂停计划都进入同步澄清分支。
+    if routing.dispatch_action == "clarify" or schedule_requires_clarification:
         # active 歧义或低置信换题应询问“继续还是换题”，并保留旧任务等待确认。
         if routing.active_intent_action in {"ambiguous", "switch_pending"} and active_intent is not None:
             # 生成并保存澄清问题 question，用于向用户补齐当前缺失信息。
             question = f"您是想继续补充刚才的 {active_intent.intent}，还是要换一个问题？"
+        # 普通低置信输入询问目标类型，不猜测并且不执行任何工具。
+        elif routing.task_schedule is not None and routing.task_schedule.clarification_question:
+            # 硬规则问题由 Orchestrator 生成，优先使用缺参、写冲突或确认的最小问题。
+            question = routing.task_schedule.clarification_question
         # 普通低置信输入询问目标类型，不猜测并且不执行任何工具。
         else:
             # 生成并保存澄清问题 question，用于向用户补齐当前缺失信息。
@@ -2242,6 +2411,72 @@ def semantic_risk_classification(state: AgentState) -> AgentState:
     return state
 
 
+def _extract_explicit_entities(text: str) -> list[str]:
+    """从本轮原文提取明确出现的公司/机构实体，不读取历史记忆。"""
+    # 高频英文公司使用受控词表，匹配结果保留规范名称，避免用户大小写造成同实体多版本。
+    known_entities = ["Anthropic", "OpenAI", "Microsoft", "Google", "Apple", "Meta", "NVIDIA"]
+    # entities 保持用户原文出现顺序并去重；多实体请求不会再被单个 re.search 截断。
+    positioned: list[tuple[int, str]] = []
+    # 对每个受控英文实体执行边界匹配，防止 Apple 命中较长单词的一部分。
+    for canonical in known_entities:
+        # IGNORECASE 只影响匹配，最终保存 canonical 统一写法。
+        match = re.search(rf"\b{re.escape(canonical)}\b", text, re.I)
+        # 命中后记录原文位置，稍后统一按位置排序。
+        if match:
+            # 同一规范实体只追加一次，避免重复提及导致重复锚点。
+            positioned.append((match.start(), canonical))
+    # 中文机构以明确后缀收口；不把任意两字名词猜成公司。
+    organization_pattern = re.compile(
+        r"(?P<entity>[\u4e00-\u9fffA-Za-z0-9·&]{2,30}(?:公司|集团|银行|保险))"
+    )
+    # finditer 支持同一轮明确提及多个中文机构。
+    for match in organization_pattern.finditer(text):
+        # 保存完整机构名及其原文位置。
+        positioned.append((match.start(), match.group("entity")))
+    # 按原文位置排序后使用 dict 去重，保持用户实际提及顺序。
+    return list(dict.fromkeys(entity for _position, entity in sorted(positioned)))
+
+
+def _load_session_entity_anchor(session_memory: dict[str, Any]) -> tuple[str | None, bool]:
+    """读取未过期实体锚点，并返回“值、是否已过期”。"""
+    # 新结构同时包含值、来源和过期时间；只有完整合法对象才参与跨轮指代。
+    raw_anchor = session_memory.get("last_entity_anchor")
+    # 新结构存在时优先使用，避免 legacy last_entity 绕过 TTL。
+    if isinstance(raw_anchor, dict) and raw_anchor:
+        # value 为空说明锚点已被显式清除。
+        value = str(raw_anchor.get("value") or "").strip()
+        # expires_at 必须是可解析 ISO 时间；脏值按过期处理，不能永久保留。
+        expires_at_text = str(raw_anchor.get("expires_at") or "")
+        # 尝试解析实体业务 TTL；非法值统一按过期处理并交给写入节点清理。
+        try:
+            # 解析独立业务过期时间，不依赖 Redis Key 的 Session TTL。
+            expires_at = datetime.fromisoformat(expires_at_text)
+            # 兼容旧无时区值时统一按 UTC 解释。
+            if expires_at.tzinfo is None:
+                # 显式补 UTC，避免服务器本地时区改变指代有效期。
+                expires_at = expires_at.replace(tzinfo=UTC)
+        # 空值或非法时间均视为过期，并通知写入节点清理脏锚点。
+        except ValueError:
+            # 第二个返回值 True 要求本轮 Session 更新显式清空旧结构。
+            return None, True
+        # 已过期锚点不能用于“它/该公司”解析。
+        if not value or expires_at <= datetime.now(UTC):
+            # 返回过期标记，由短期记忆节点执行带版本的清理写入。
+            return None, True
+        # 结构有效且仍在 TTL 内时返回可用锚点。
+        return value, False
+    # 兼容升级前只保存 last_entity 的 Session；仅当实体仍出现在短期消息窗口时临时接受。
+    legacy_value = str(session_memory.get("last_entity") or "").strip()
+    # 扫描最近消息防止七天前的 legacy 单值在没有 TTL 的情况下继续劫持新话题。
+    legacy_in_window = any(
+        legacy_value in str(message.get("content") or "")
+        for message in session_memory.get("recent_messages") or []
+        if legacy_value and isinstance(message, dict)
+    )
+    # legacy 值只在当前有界短期窗口内出现时可用；下一次明确实体会自动升级为新结构。
+    return (legacy_value if legacy_in_window else None), False
+
+
 def query_understanding(state: AgentState) -> AgentState:
     """完成指代消解、实体/时间解析和 query rewrite，不承担工具参数校验。"""
     # 进入 QUERY_UNDERSTANDING 节点，将用户问题转成可检索、可调用工具的结构。
@@ -2250,16 +2485,30 @@ def query_understanding(state: AgentState) -> AgentState:
     text = state.input_text
     # 使用当前日期解析“过去三个月”等相对时间表达。
     today = date.today()
-    # 实体抽取和指代消解属于 Query Understanding，不再经过通用槽位容器。
-    company_match = re.search(r"\b(Anthropic|OpenAI|Microsoft|Google|Apple|Meta|NVIDIA)\b", text, re.I)
-    # 调用 get 计算 previous_entity，并保存结果供本步骤后续逻辑使用。
-    previous_entity = state.memory_context.get("session", {}).get("last_entity")
-    # 优先从本轮明确公司名称中提取实体；没有命中时暂时保持为空。
-    entity = company_match.group(1) if company_match else None
-    # 本轮只有代词且未识别新实体时，使用 Session 中最近实体完成指代消解。
-    if entity is None and _text_has_any(text, ["它", "这家公司", "该公司"]):
-        # 本轮只出现代词时回退会话最近实体，完成受限的跨轮指代消解。
+    # 实体抽取只读取本轮原文，明确实体与历史指代必须保留不同 provenance。
+    explicit_entities = _extract_explicit_entities(text)
+    # Session 锚点读取会校验独立 expires_at；过期值不能继续参与代词解析。
+    previous_entity, entity_anchor_expired = _load_session_entity_anchor(
+        state.memory_context.get("session", {})
+    )
+    # 本轮明确实体优先；多个实体完整保存在 explicit_entities，兼容单值 entity 取第一个。
+    if explicit_entities:
+        # 明确原文实体可以在短期记忆更新时刷新锚点。
+        entity = explicit_entities[0]
+        # source 明确标记为 explicit，写入节点只信任这一来源。
+        entity_source = "explicit_user_text"
+    # 只有本轮包含受控代词且锚点仍有效时，才允许使用 Session 完成指代消解。
+    elif _text_has_any(text, ["它", "这家公司", "该公司"]) and previous_entity:
+        # 历史推断实体只服务本轮理解，不允许反向刷新锚点 TTL。
         entity = previous_entity
+        # provenance 让短期记忆节点能够区分明确事实和推断结果。
+        entity_source = "session_reference"
+    # 既无明确实体也无可用指代锚点时保持空值，不猜测任意名词。
+    else:
+        # None 明确表示本轮没有可信实体。
+        entity = None
+        # source=none 便于排查为什么没有更新 last_entity。
+        entity_source = "none"
     # 只有用户明确要求“英文”时设置语言过滤，未说明则不擅自限制来源语言。
     language = "en" if "英文" in text else None
     # 明确出现融资关键词时标记 funding 主题，供后续构造新闻检索 Query。
@@ -2330,6 +2579,12 @@ def query_understanding(state: AgentState) -> AgentState:
         "resolved_query": state.input_text.replace("它", str(entity)) if entity else state.input_text,
         # 保存最终识别实体，后续短期记忆会把它写成 last_entity。
         "entity": entity,
+        # 全部本轮明确实体保留在列表中，解决只取第一个公司导致的信息丢失。
+        "explicit_entities": explicit_entities,
+        # 明确/指代/无实体三态决定短期记忆是否允许刷新锚点。
+        "entity_source": entity_source,
+        # 过期标记要求更新节点清理 Redis 中的旧锚点，防止每轮重复解析失败。
+        "entity_anchor_expired": entity_anchor_expired,
         # 保存解析出的绝对时间范围，避免“最近”这种相对表达在回放时失真。
         "date_range": date_range,
         # 保存真正用于检索/工具调用的改写 query。
@@ -2914,8 +3169,32 @@ def general_tool_routing(state: AgentState) -> AgentState:
     """选择通用工具，并以该工具自己的 input_schema 校验参数。"""
     # 进入 GENERAL_TOOL_ROUTING 节点；这里只规划工具，不真正执行工具。
     _enter(state, AgentNode.GENERAL_TOOL_ROUTING, "enter_general_tool_routing")
-    # ToolRouter 根据用户输入和本地注册表选择最合适的工具规格。
-    spec = ToolRouter().route(state.input_text)
+    # 多意图子步骤已经有受信 intent，此时必须按意图选择工具，不能再让同一复合原句中的
+    # 其它关键词抢走路由；普通单意图请求在没有映射时仍回退 ToolRouter 文本选择。
+    intent_tool_map = {
+        "weather_query": "weather_query",
+        "calculator_query": "calculator",
+    }
+    # 搜索意图根据自己的最小 text_span 区分新闻与普通网页搜索。
+    if state.intent == "web_or_news_search":
+        # 新闻/报道/融资属于时效性检索，优先选择 news_search；其它公开查询使用 web_search。
+        intended_tool_name = (
+            "news_search"
+            if _text_has_any(state.input_text, ["新闻", "报道", "融资", "news"])
+            else "web_search"
+        )
+    # 天气和计算使用固定白名单映射。
+    else:
+        # get 未命中时返回 None，后面使用原有文本 Router 兼容其它通用能力。
+        intended_tool_name = intent_tool_map.get(state.intent)
+    # 复用一个 Router/Registry 实例，确保意图映射得到的工具仍必须存在于受控注册表。
+    tool_router = ToolRouter()
+    # 有明确意图映射时从注册表精确取工具；否则执行原有文本路由。
+    spec = (
+        tool_router.registry.get(intended_tool_name)
+        if intended_tool_name
+        else tool_router.route(state.input_text)
+    )
     # 没有匹配工具时写入空计划，让后续链路可以继续走保守回答。
     if spec is None:
         # 更新本轮结构化工具计划，后续只执行该白名单计划中的调用。
@@ -3323,7 +3602,10 @@ def prompt_assembly(state: AgentState) -> AgentState:
     # assembled_prompt 保留 system/memory/context/user 分区，方便接入真实 LLM 时直接映射消息。
     state.assembled_prompt = {
         # system 约束保险顾问回答必须合规、低压、证据优先。
-        "system": "你是合规、低压、证据优先的保险顾问沟通助手。",
+        "system": state.metadata.get(
+            "_resolved_system_prompt",
+            "你是合规、低压、证据优先的保险顾问沟通助手。",
+        ),
         # memory 注入压缩后的记忆，支持多轮对话和用户偏好延续。
         "memory": state.compressed_context.get("memory", {}),
         # context 放 RAG/工具证据以及来源边界，防止外部资料覆盖系统规则。
@@ -3962,13 +4244,35 @@ def update_short_term_memory(state: AgentState, memory_manager: MemoryBackend | 
         # 返回更新后的 Agent 状态，交由主流程继续调度下一节点。
         return state
     # recent_messages 保留最近用户/助手消息，再追加本轮助手回答。
-    recent_messages = state.normalized_messages[-10:] + [{"role": "assistant", "content": state.answer or ""}]
-    # entity 优先取 Query Understanding 的实体，用于下一轮“它/这家公司”的指代消解。
-    entity = state.query_understanding.get("entity")
+    recent_messages = state.normalized_messages[-12:] + [{"role": "assistant", "content": state.answer or ""}]
+    # 单意图直接读取当前理解；多意图父状态从各步骤中只选择明确原文实体，绝不使用 session_reference 推断值。
+    query_candidates = (
+        state.query_understanding.get("steps", [])
+        if state.query_understanding.get("multi_intent") is True
+        else [state.query_understanding]
+    )
+    # 锚点语义是“原文最后明确提到的实体”，不能使用多意图 priority 重排后的步骤顺序。
+    # 因此直接在父请求原文上执行同一确定性抽取；子步骤的 session_reference 永远不会进入该列表。
+    explicit_entity_candidates = _extract_explicit_entities(state.input_text)
+    # 只有原文明确实体才允许刷新；取最后一项与 last_entity 名称一致，多实体时指向最近提及者。
+    entity = explicit_entity_candidates[-1] if explicit_entity_candidates else None
+    # 任一步发现旧锚点已过期时都应清理；明确新实体会在同一载荷中覆盖成新锚点。
+    entity_anchor_expired = any(
+        bool(candidate.get("entity_anchor_expired"))
+        for candidate in query_candidates
+        if isinstance(candidate, dict)
+    )
     # values 是写入 session memory 的核心内容；通用工具参数不作为跨轮业务状态保存。
     values: dict[str, Any] = {
         "recent_messages": recent_messages[-12:],
         "last_intent": state.intent,
+        # 多意图保留完整有序列表；last_intent 继续镜像最高优先级步骤以兼容旧读取方。
+        "last_intents": [
+            str(step.get("intent"))
+            for step in state.intent_execution_plan
+            if isinstance(step, dict) and step.get("intent")
+        ]
+        or ([state.intent] if state.intent else []),
         "last_answer": state.answer,
         # _trace_id 只供生产 MemoryManager 生成幂等审计键，写入 Redis 前会被移除。
         "_trace_id": state.trace_id,
@@ -3986,10 +4290,33 @@ def update_short_term_memory(state: AgentState, memory_manager: MemoryBackend | 
         values["active_intent"] = state.active_intent_state
         # 同步写入活跃意图版本时间，CAS 冲突合并时据此保留更新的一方。
         values["active_intent_updated_at"] = active_updated_at
-    # 如果本轮识别到实体，就把它写成 last_entity，支持下一轮“它最近有没有融资”这种问法。
+    # 如果本轮原文明示实体，就写入带来源、时间和 TTL 的锚点；推断实体绝不刷新有效期。
     if entity:
-        # 保存本轮明确实体作为下一轮代词消解锚点，不写入未确认的猜测实体。
+        # 同一个 now 同时用于字段版本和 expires_at，避免微秒差造成并发比较含义不一致。
+        entity_updated_at = datetime.now(UTC)
+        # TTL 来自 MemoryConfig 的请求级注入；直接节点测试未注入时使用安全的 30 分钟默认值。
+        entity_ttl_seconds = int(state.metadata.get("entity_anchor_ttl_seconds", 1800))
+        # legacy last_entity 暂时保留，兼容旧读取方；新逻辑只信任 last_entity_anchor。
         values["last_entity"] = entity
+        # 新结构明确保存 provenance、更新时间、过期时间和来源 trace，便于审计与冲突合并。
+        values["last_entity_anchor"] = {
+            "value": entity,
+            "entity_type": "organization",
+            "source": "explicit_user_text",
+            "updated_at": entity_updated_at.isoformat(),
+            "expires_at": (entity_updated_at + timedelta(seconds=entity_ttl_seconds)).isoformat(),
+            "source_trace_id": state.trace_id,
+        }
+        # 独立时间戳供 CAS 重试比较，旧请求不得覆盖更新实体。
+        values["last_entity_updated_at"] = entity_updated_at.isoformat()
+    # 没有新实体但旧锚点已过期时显式写空，Redis merge 才能真正删除其指代能力。
+    elif entity_anchor_expired:
+        # legacy 字段写 None，旧读取方也不会继续使用过期实体。
+        values["last_entity"] = None
+        # 空对象表示锚点已经主动清理，而不是暂时没有解析结果。
+        values["last_entity_anchor"] = {}
+        # 清理同样是有版本的状态变化，防止并发旧请求重新写回过期值。
+        values["last_entity_updated_at"] = utc_now_iso()
     # 写入 session memory；同一个 tenant_id/session_id 下的后续请求可以读到这些信息。
     # restore_memory 读到的版本作为 CAS 条件，阻止两个并发请求互相覆盖。
     session_version = int(state.memory_context.get("session", {}).get("_version", 0))
@@ -4047,6 +4374,25 @@ def update_short_term_memory(state: AgentState, memory_manager: MemoryBackend | 
                     "stale_active_intent_write_suppressed",
                     session_id=state.session_id,
                 )
+        # 实体锚点使用与 active intent 相同的逐字段新旧保护；Session 总版本冲突不能退化成“最后完成者获胜”。
+        if "last_entity_anchor" in retry_values:
+            # 当前请求实体版本来自明确提及或过期清理动作。
+            incoming_entity_updated_at = str(retry_values.get("last_entity_updated_at") or "")
+            # Redis 最新锚点可能来自并发中更晚的用户轮次。
+            latest_entity_updated_at = str(latest.get("last_entity_updated_at") or "")
+            # 只有严格更新的实体状态可以覆盖最新值；相同时间也按重复/旧请求抑制。
+            if not _is_newer_iso_timestamp(incoming_entity_updated_at, latest_entity_updated_at):
+                # 同时移除 legacy、新结构和时间戳，保证这次重试完全不触碰最新实体。
+                retry_values.pop("last_entity", None)
+                # 删除新结构防止 Redis merge 覆盖最新 anchor。
+                retry_values.pop("last_entity_anchor", None)
+                # 删除字段版本，避免留下与实体值不匹配的时间戳。
+                retry_values.pop("last_entity_updated_at", None)
+                # 写入不含实体原值的审计事件，便于定位热点 Session。
+                state.add_trace_event(
+                    "stale_entity_anchor_write_suppressed",
+                    session_id=state.session_id,
+                )
         # 按既定写入策略持久化本轮结果，并由存储层维护版本或租户边界。
         memory_manager.write(
             MemoryLayer.SESSION,
@@ -4078,7 +4424,7 @@ def update_short_term_memory(state: AgentState, memory_manager: MemoryBackend | 
         )
     # Task 冲突只刷新版本后重试当前小快照，不合并业务事实或 active intent。
     except MemoryVersionConflict:
-        # Task 冲突时读取最新版本后重试，PostgreSQL source_version 会拒绝旧快照倒灌。
+        # Task 冲突时读取 Redis 最新版本后只重试当前小快照；独立 CAS 防止旧请求无条件覆盖。
         latest_task = memory_manager.read(MemoryLayer.TASK, state.tenant_id, state.session_id)
         # 按既定写入策略持久化本轮结果，并由存储层维护版本或租户边界。
         memory_manager.write(
@@ -4149,23 +4495,13 @@ def long_term_memory_candidate(state: AgentState, memory_manager: MemoryBackend 
     state.memory_write_candidates = candidates
     # 只有存在 user_id 且确有候选时才写长期偏好，避免匿名 session 污染长期画像。
     if memory_manager is not None and state.user_id and candidates:
-        # 先读取历史偏好并按 type + value 合并，避免本轮候选替换旧列表。
-        existing_memory = memory_manager.read(
-            MemoryLayer.PREFERENCE,
-            state.tenant_id,
-            state.user_id,
-        )
-        # 整理候选集合 merged_candidates，供后续过滤、排序或聚合使用。
-        merged_candidates = merge_preference_candidates(
-            existing_memory.get("memory_candidates", []),
-            candidates,
-        )
-        # 调用 memory_manager.write 计算 written_count，并保存结果供本步骤后续逻辑使用。
+        # 节点只提交本轮增量；本地 Store 负责 type/value 合并，PostgreSQL 负责稳定 memory_key Upsert。
+        # 这样写入路径不需要为了合并而提前整包读取长期记忆，也不会刷新无关旧条目的 TTL。
         written_count = memory_manager.write(
             MemoryLayer.PREFERENCE,
             state.tenant_id,
             state.user_id,
-            {"memory_candidates": merged_candidates, "_trace_id": state.trace_id},
+            {"memory_candidates": candidates, "_trace_id": state.trace_id},
         )
         # 生产 Store 在缺少用途级 Consent 时返回 0，不允许静默丢弃长期偏好。
         if written_count == 0:

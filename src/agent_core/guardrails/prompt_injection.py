@@ -450,9 +450,7 @@ def detect_prompt_injection(text: str) -> bool:
 
 def scan_prompt_injection(text: str) -> list[GuardrailSignal]:
     """扫描注入/越权模式，产出结构化信号（不做最终动作裁决）。"""
-    # lower 用于大小写不敏感匹配。
-    # 补充说明：lower 现在是经过 HTML/URL/Unicode/零宽字符归一化后的主检测视图，不会替换业务原文。
-    lower = normalize_guardrail_text(text)
+
     # views 额外包含数量受限的 Base64/Hex 解码视图，防止编码包装绕过枚举和正则。
     views = _build_detection_views(text)
     # signals 收集本次命中的全部注入相关信号。

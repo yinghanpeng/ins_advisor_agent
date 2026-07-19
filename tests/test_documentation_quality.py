@@ -80,6 +80,7 @@ from agent_core.skills.insurance_advisor.knowledge import (
 from agent_core.skills.insurance_advisor.kyc import InsuranceKycDelta, InsuranceKycEvidence
 from agent_core.tools.schemas import ToolCall, ToolPermissionSpec, ToolResult, ToolSpec
 from agent_core.workflow.contracts import (
+    AgentRunExecutionContext,
     AgentRunRequest,
     AgentRunResponse,
     EvalCase,
@@ -210,6 +211,7 @@ PYDANTIC_MODELS = [
     StepRetryPolicy,
     WorkflowStepContract,
     WorkflowContract,
+    AgentRunExecutionContext,
     AgentRunRequest,
     AgentRunResponse,
     PublicAgentRunResponse,

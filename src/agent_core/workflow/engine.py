@@ -14,15 +14,22 @@ from agent_core.graph.state import AgentNode, AgentState
 from agent_core.intents.router import IntentRouter, build_intent_router
 from agent_core.memory.business_store import BusinessMemoryStore, InMemoryBusinessMemoryStore
 from agent_core.memory.manager import MemoryBackend, MemoryManager
+from agent_core.memory.recall import ProductionMemoryRetriever
+from agent_core.models.client import OpenAICompatibleChatClient
 from agent_core.models.client import bind_model_trace_sink
 from agent_core.observability.langsmith_client import LangSmithAdapter
 from agent_core.observability.logger import StructuredLogger, configure_logging
+from agent_core.registry.builtins import bootstrap_repository_artifacts
+from agent_core.registry.models import ArtifactKind, RiskLevel
+from agent_core.registry.prompts import PromptRenderer
+from agent_core.registry.runtime import ArtifactResolver, RuntimeRequest
+from agent_core.registry.service import ArtifactRegistry
 from agent_core.skills.insurance_advisor.kyc import InsuranceKycExtractor
 from agent_core.skills.insurance_advisor.knowledge import (
     InsuranceKnowledgeProvider,
     LocalInsuranceKnowledgeProvider,
 )
-from agent_core.workflow.contracts import AgentRunRequest, AgentRunResponse
+from agent_core.workflow.contracts import AgentRunExecutionContext, AgentRunRequest, AgentRunResponse
 
 
 # TRACE_LOG_SAFE_FIELDS 只允许控制面与计数字段进入实时日志，避免记录客户原文、KYC 值或模型正文。
@@ -133,6 +140,10 @@ class WorkflowEngine:
         kyc_extractor: InsuranceKycExtractor | None = None,
         insurance_knowledge_provider: InsuranceKnowledgeProvider | None = None,
         insurance_news_enabled: bool | None = None,
+        memory_retriever: ProductionMemoryRetriever | None = None,
+        memory_decision_client: OpenAICompatibleChatClient | None = None,
+        artifact_registry: ArtifactRegistry | None = None,
+        artifact_resolver: ArtifactResolver | None = None,
         settings: RuntimeSettings | None = None,
     ) -> None:
         """初始化日志、LangSmith adapter 和本地兼容 graph。"""
@@ -162,6 +173,17 @@ class WorkflowEngine:
             if insurance_news_enabled is None
             else insurance_news_enabled
         )
+        # Tool、Skill 和 Prompt 在一个 Engine 内共享 Registry，Artifact 身份不会被拆成无类型配置。
+        self.artifact_registry = artifact_registry or ArtifactRegistry()
+        # Registry 缓存参数来自强类型运行时配置，不接受单次请求动态覆盖。
+        registry_settings = self.settings.artifact_registry
+        # Resolver 与 Registry 同生命周期；具体 Alias 仍在每次 Run 开始时解析并固定快照。
+        self.artifact_resolver = artifact_resolver or ArtifactResolver(
+            self.artifact_registry,
+            cache_ttl_seconds=registry_settings.cache_ttl_seconds,
+            negative_ttl_seconds=registry_settings.negative_cache_ttl_seconds,
+            maximum_cache_entries=registry_settings.maximum_cache_entries,
+        )
         # 构建统一代码执行器；保险请求由意图自动进入 Handler，不再按 workflow_name 分叉。
         self.graph = build_agent_graph(
             self.memory_manager,
@@ -170,6 +192,10 @@ class WorkflowEngine:
             self.kyc_extractor,
             self.insurance_knowledge_provider,
             self.insurance_news_enabled,
+            memory_retriever,
+            memory_decision_client,
+            self.settings.memory,
+            self.artifact_resolver,
         )
 
     def _langsmith_state_snapshot(self, state: AgentState) -> dict[str, Any]:
@@ -239,8 +265,15 @@ class WorkflowEngine:
             flow=" → ".join(step_names),
         )
 
-    def run(self, request: AgentRunRequest) -> AgentRunResponse:
+    def run(
+        self,
+        request: AgentRunRequest,
+        *,
+        execution_context: AgentRunExecutionContext | None = None,
+    ) -> AgentRunResponse:
         """执行一次 Agent 请求，并返回包含状态链路和 trace 的结构化响应。"""
+        # execution_context 只来自代码侧受信调用者；公开 API 仍只能构造受 default-deny 保护的请求 DTO。
+        trusted_context = execution_context or AgentRunExecutionContext()
         # 把 API/CLI/Dify 传入的请求契约转换成 AgentState；后续所有节点都只读写这个显式状态对象。
         state = AgentState(
             # 会话 ID 用于读取和更新短期记忆，也是多轮对话能接上的关键索引。
@@ -257,7 +290,20 @@ class WorkflowEngine:
             domain_skill=request.domain_skill,
             # metadata 只保存契约允许的调用端、渠道和实验观测标签，不参与知识注入或业务选行。
             metadata=request.metadata,
+            # cost 只接受建模后的请求预算；其它内部状态不能通过 execution_context 任意覆盖。
+            cost=(
+                {"request_token_budget": trusted_context.request_token_budget}
+                if trusted_context.request_token_budget is not None
+                else {}
+            ),
         )
+        # 仓库内置 Artifact 已经过代码评审，可按租户幂等初始化，不接受请求 Metadata 动态创建实现。
+        if (
+            self.settings.artifact_registry.enabled
+            and self.settings.artifact_registry.bootstrap_repository_artifacts
+        ):
+            # 初始化只写入仓库签名/允许的内置定义，并由 Registry 服务保证租户内幂等。
+            bootstrap_repository_artifacts(self.artifact_registry, tenant_id=state.tenant_id)
         # 记录请求开始事件；trace_id 从这里开始贯穿状态迁移、工具调用、检索和最终响应。
         self.log.event(
             "agent_run_started",
@@ -294,6 +340,58 @@ class WorkflowEngine:
         try:
             # 模型 Trace 上下文只覆盖本次图执行，退出后自动恢复，保证并发请求隔离。
             with bind_model_trace_sink(model_trace_sink):
+                # 图执行前只解析一次 Alias/Binding；序列化快照随后随子任务传递，运行中不会重新漂移版本。
+                if self.settings.artifact_registry.enabled:
+                    # RuntimeRequest 固定本次运行的租户、环境、风险和权限解析边界。
+                    runtime_request = RuntimeRequest(
+                        run_id=state.trace_id,
+                        tenant_id=state.tenant_id,
+                        agent_id=state.domain_skill or state.workflow_name,
+                        environment=self.settings.app_env,
+                        scenario=state.workflow_name,
+                        # 网关认证租户级服务 Agent；终端用户的资源权限仍由 ToolGuardrail 做确定性校验。
+                        roles=["operator"],
+                        scopes=["*"],
+                        maximum_risk=RiskLevel.MEDIUM,
+                    )
+                    # Snapshot 在图执行前一次性解析，后续节点只消费精确版本与 Hash。
+                    snapshot = self.artifact_resolver.create_snapshot(runtime_request)
+                    # 保存受信解析请求供子任务复用，不允许子任务重新拼装更高权限请求。
+                    state.metadata["_artifact_runtime_request"] = runtime_request.model_dump(mode="json")
+                    # 保存不可变运行快照，确保同一 Agent Run 内 Alias 变更不会影响已经开始的任务。
+                    state.metadata["_artifact_runtime_snapshot"] = snapshot.model_dump(mode="json")
+                    # 系统 Prompt 只从当前快照按 Artifact 身份查找，不执行第二次 Registry 解析。
+                    system_ref = snapshot.by_name(
+                        ArtifactKind.PROMPT,
+                        "agent_core",
+                        "agent_system_prompt",
+                    )
+                    # 只有快照明确包含系统 Prompt 时才渲染；请求不能通过名称临时解析另一个版本。
+                    if system_ref:
+                        # Renderer 使用同一 Request/Snapshot 渲染，保持依赖版本和变量边界可审计。
+                        state.metadata["_resolved_system_prompt"] = PromptRenderer(
+                            self.artifact_resolver
+                        ).render(
+                            runtime_request,
+                            snapshot,
+                            system_ref.artifact_id,
+                            {},
+                        )
+                    # Trace 只记录 Artifact ID、版本和 Hash，不写入完整 Prompt 或 Skill 正文。
+                    state.add_trace_event(
+                        "artifact_runtime_snapshot_created",
+                        artifact_count=len(snapshot.artifacts),
+                        registry_generation=snapshot.registry_generation,
+                        artifact_versions=[
+                            {
+                                "artifact_id": item.artifact_id,
+                                "version_id": item.version_id,
+                                "version": item.version,
+                                "content_hash": item.content_hash,
+                            }
+                            for item in snapshot.artifacts.values()
+                        ],
+                    )
                 # 执行完整 Agent 图；节点和模型客户端通过 add_trace_event 实时报告完整进度。
                 result = self.graph.invoke(state)
         # 任一未处理异常都必须留下失败节点和异常类型，然后继续抛给 API 统一处理。
@@ -348,6 +446,13 @@ class WorkflowEngine:
 
     def _response_from_state(self, state: AgentState) -> AgentRunResponse:
         """把内部 AgentState 封装成外部响应契约。"""
+        # 多意图父状态的顶层 domain_skill 镜像最高优先级步骤，可能不是保险；
+        # 因此还要检查完整执行计划，确保实际执行过保险步骤时返回 KYC 控制摘要。
+        has_insurance_step = state.domain_skill == "insurance_advisor" or any(
+            step.get("domain_skill") == "insurance_advisor"
+            for step in state.intent_execution_plan
+            if isinstance(step, dict)
+        )
         # 显式逐字段映射，避免 AgentState 后续新增内部字段时被响应自动暴露。
         return AgentRunResponse(
             # 回传贯穿整次运行的追踪 ID，供日志和评估关联。
@@ -382,7 +487,7 @@ class WorkflowEngine:
                     # opportunity_score 供内部评估沟通机会，不进入客户安全 DTO。
                     "opportunity_score": state.opportunity_score,
                 }
-                if state.domain_skill == "insurance_advisor"
+                if has_insurance_step
                 else {}
             ),
             # 汇总输入、工具和输出侧风控结果。

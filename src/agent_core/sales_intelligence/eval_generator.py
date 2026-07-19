@@ -15,6 +15,7 @@ def generate_eval_case(card: SalesInsightCard) -> EvalCase:
     return EvalCase(
         id=f"eval_{card.source_id}_{card.chunk_id}",
         type="sales_intelligence_card",
+        suite="business_quality",
         input=f"客户场景：{card.customer_type}，我遇到的问题是：{card.sales_pain_solved}",
         expected_state="FINAL",
         expected_sales_intelligence_route=card.scene,
@@ -22,5 +23,5 @@ def generate_eval_case(card: SalesInsightCard) -> EvalCase:
         must_not_include=["保证收益", "避债避税", "绝对安全"],
         expected_guardrail="insurance_output_compliance",
         expected_trace_fields=["trace_id", "selected_sales_insights", "sales_insight_digest"],
-        pass_fail_rules=["must_include", "must_not_include", "guardrail_pass"],
+        pass_fail_rules=["answer", "state", "sales_route", "guardrail", "trace"],
     )

@@ -487,40 +487,11 @@ class PostgresAgentRepository:
         expected_version: int | None = None,
         expires_at: str | None = None,
     ) -> int | None:
-        """使用版本条件写入任务快照，避免并发请求覆盖较新的状态。"""
-        # source_version 必须单调增加；可选 expected_version 进一步提供数据库版本 CAS。
-        rows = self._fetch_all(
-            """
-            INSERT INTO task_memory (
-                tenant_id, session_id, task_id, state_snapshot, version, source_version, expires_at
-            ) VALUES (
-                :tenant_id, :session_id, :task_id, CAST(:state_snapshot AS jsonb), 1,
-                :source_version, :expires_at
-            )
-            ON CONFLICT (tenant_id, session_id, task_id) DO UPDATE SET
-                state_snapshot = EXCLUDED.state_snapshot,
-                version = task_memory.version + 1,
-                source_version = EXCLUDED.source_version,
-                expires_at = EXCLUDED.expires_at,
-                updated_at = now()
-            WHERE (
-                CAST(:expected_version AS integer) IS NULL
-                OR task_memory.version = CAST(:expected_version AS integer)
-            )
-              AND task_memory.source_version < EXCLUDED.source_version
-            RETURNING version
-            """,
-            tenant_id=tenant_id,
-            session_id=session_id,
-            task_id=task_id,
-            state_snapshot=_json(state_snapshot),
-            source_version=source_version,
-            expected_version=expected_version,
-            expires_at=expires_at,
-        )
-        # 空结果表示该快照比数据库中的 source_version 更旧，按幂等成功处理但不覆盖。
-        # 有 RETURNING 表示写入成功并返回新版本；空结果是旧快照被安全忽略。
-        return int(rows[0]["version"]) if rows else None
+        """拒绝旧 PostgreSQL Task API；在线任务快照已经统一迁移到 Redis。"""
+        # 保留方法名只为给旧调用方提供明确升级错误，绝不能继续访问迁移 006 已删除的表。
+        del tenant_id, session_id, task_id, state_snapshot, source_version, expected_version, expires_at
+        # 调用方应改用 ProductionMemoryManager.write(MemoryLayer.TASK, ...)，该路径具备独立 TTL/CAS。
+        raise RuntimeError("task_memory 已删除，请通过 Redis MemoryLayer.TASK 读写任务快照")
 
     def get_task_snapshot(
         self,
@@ -529,24 +500,11 @@ class PostgresAgentRepository:
         session_id: str,
         task_id: str = "active",
     ) -> dict[str, Any] | None:
-        """读取未过期任务快照及其版本。"""
-        # 只查询精确 tenant/session/task 且尚未过期的一条快照。
-        rows = self._fetch_all(
-            """
-            SELECT state_snapshot, version, expires_at, updated_at
-            FROM task_memory
-            WHERE tenant_id = :tenant_id
-              AND session_id = :session_id
-              AND task_id = :task_id
-              AND (expires_at IS NULL OR expires_at > now())
-            LIMIT 1
-            """,
-            tenant_id=tenant_id,
-            session_id=session_id,
-            task_id=task_id,
-        )
-        # 未命中时返回 None，由上层从 Redis 或全新任务状态继续。
-        return rows[0] if rows else None
+        """拒绝旧 PostgreSQL Task API；在线任务快照已经统一迁移到 Redis。"""
+        # 参数仅用于保持旧签名兼容；不允许它们形成对已删除表的 SQL。
+        del tenant_id, session_id, task_id
+        # 显式失败可以在升级期快速定位旧调用方，避免模糊的 PostgreSQL UndefinedTable。
+        raise RuntimeError("task_memory 已删除，请通过 Redis MemoryLayer.TASK 读取任务快照")
 
     def read_preference_memory(self, *, tenant_id: str, user_id: str) -> dict[str, Any]:
         """读取用户已授权且未过期的 Preference，并恢复兼容 memory_candidates 结构。"""
@@ -599,6 +557,8 @@ class PostgresAgentRepository:
         tenant_id: str,
         user_id: str,
         candidates: list[dict[str, Any]],
+        embeddings: list[Sequence[float]] | None = None,
+        embedding_model: str = "configured-runtime",
         ttl_days: int,
     ) -> int:
         """按 preference_type 去重合并偏好；不会用整句用户输入覆盖历史列表。"""
@@ -612,12 +572,16 @@ class PostgresAgentRepository:
         ):
             # 缺少有效授权时返回零写入并保持数据库不变。
             return 0
+        # 提供向量时必须与候选一一对应；错位会把一个偏好的向量绑定到另一条长期记忆。
+        if embeddings is not None and len(embeddings) != len(candidates):
+            # 在任何数据库写入前拒绝整批错位，避免形成难以离线修复的索引污染。
+            raise ValueError("preference embeddings 数量必须与 candidates 一致")
         # 本批候选共用根据配置计算的 UTC 过期时间。
         expires_at = (datetime.now(UTC) + timedelta(days=ttl_days)).isoformat()
         # written 统计实际写入的非空候选数量。
         written = 0
         # 每个候选按 preference_type 独立 Upsert，避免整句输入覆盖历史列表。
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             # 缺省类型使用明确占位符；value 仍需通过下一步非空判断。
             preference_type = str(candidate.get("type") or "unknown_preference")
             # 读取候选值并在下一步过滤空标量/容器。
@@ -637,7 +601,8 @@ class PostgresAgentRepository:
                 memory_key=preference_type,
                 content=normalized,
                 normalized_content=normalized,
-                embedding=None,
+                # 生产写入提供真实向量；测试或离线修复调用未提供时仍允许只写词法索引内容。
+                embedding=embeddings[index] if embeddings is not None else None,
                 source_type=str(candidate.get("source_type") or "user_message"),
                 source_id=str(candidate.get("source_id") or f"preference:{user_id}:{preference_type}"),
                 evidence_text=str(candidate.get("evidence_text") or "用户明确表达稳定偏好"),
@@ -646,6 +611,7 @@ class PostgresAgentRepository:
                 consent_status="granted",
                 expires_at=expires_at,
                 metadata={"preference_type": preference_type, "value": value},
+                embedding_model=embedding_model,
             )
             # 只有完整执行 Upsert 后才增加成功数量。
             written += 1
@@ -783,15 +749,12 @@ class PostgresAgentRepository:
         return int(row["count"])
 
     def delete_subject_memory(self, *, tenant_id: str, subject_id: str) -> int:
-        """物理删除通用主体的消息、任务和长期记忆，并依赖外键清理向量。"""
-        # 单条 SQL 原子删除 Session 消息、Task 快照和用户长期记忆并汇总计数。
+        """物理删除通用主体的消息审计和长期记忆，并依赖外键清理向量。"""
+        # Task 在线快照由调用方先从 Redis 删除；PostgreSQL 只处理迁移 006 后仍存在的两类表。
         row = self._fetch_one(
             """
             WITH deleted_messages AS (
                 DELETE FROM short_term_messages
-                WHERE tenant_id=:tenant_id AND session_id=:subject_id RETURNING 1
-            ), deleted_tasks AS (
-                DELETE FROM task_memory
                 WHERE tenant_id=:tenant_id AND session_id=:subject_id RETURNING 1
             ), deleted_items AS (
                 DELETE FROM memory_items
@@ -799,7 +762,6 @@ class PostgresAgentRepository:
             )
             SELECT
                 (SELECT count(*) FROM deleted_messages)
-              + (SELECT count(*) FROM deleted_tasks)
               + (SELECT count(*) FROM deleted_items) AS count
             """,
             tenant_id=tenant_id,
@@ -842,7 +804,7 @@ class PostgresAgentRepository:
         )
 
     def purge_expired_memory(self, *, tenant_id: str, batch_size: int = 1000) -> int:
-        """分批清理过期长期记忆和任务快照，避免大事务锁表。"""
+        """分批清理过期长期记忆、消息审计和生成输出，避免大事务锁表。"""
         # 第一批按 expires_at 选择长期记忆牺牲行并物理删除，Embedding 随外键级联。
         memory_row = self._fetch_one(
             """
@@ -858,22 +820,7 @@ class PostgresAgentRepository:
             tenant_id=tenant_id,
             batch_size=batch_size,
         )
-        # 第二批清理过期 Task Snapshot，并将 batch_size 夹在 1-10000 范围。
-        task_row = self._fetch_one(
-            """
-            WITH victims AS (
-                SELECT id FROM task_memory
-                WHERE tenant_id=:tenant_id AND expires_at IS NOT NULL AND expires_at<=now()
-                LIMIT :batch_size
-            ), deleted AS (
-                DELETE FROM task_memory task USING victims
-                WHERE task.id=victims.id RETURNING 1
-            ) SELECT count(*) AS count FROM deleted
-            """,
-            tenant_id=tenant_id,
-            batch_size=max(1, min(batch_size, 10000)),
-        )
-        # 第三批清理过期短期消息审计密文。
+        # 第二批清理过期短期消息审计密文；Redis Task 由自身 TTL 自动淘汰，不进入此 Job。
         message_row = self._fetch_one(
             """
             WITH victims AS (
@@ -888,7 +835,7 @@ class PostgresAgentRepository:
             tenant_id=tenant_id,
             batch_size=max(1, min(batch_size, 10000)),
         )
-        # 第四批清理过期通用生成输出密文和脱敏审计副本。
+        # 第三批清理过期通用生成输出密文和脱敏审计副本。
         output_row = self._fetch_one(
             """
             WITH victims AS (
@@ -903,10 +850,10 @@ class PostgresAgentRepository:
             tenant_id=tenant_id,
             batch_size=max(1, min(batch_size, 10000)),
         )
-        # 汇总四张表本批实际删除数量。
+        # 汇总迁移 006 后仍由 PostgreSQL 管理的三张表本批实际删除数量。
         return sum(
             int(row["count"])
-            for row in [memory_row, task_row, message_row, output_row]
+            for row in [memory_row, message_row, output_row]
         )
 
     def insert_rag_document(

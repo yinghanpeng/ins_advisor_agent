@@ -2,6 +2,11 @@
 # - 本文件是 Python 项目元数据和工具配置入口。
 # - 依赖、pytest 路径和代码风格配置都在这里维护。
 
+[build-system]
+# setuptools 构建 src-layout wheel，并让 uv 安装项目脚本和包内静态资源。
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 # 项目包名，pip install -e . 时使用。
 name = "ins-advisor-agent"
@@ -29,6 +34,10 @@ dependencies = [
   "redis>=5.0",
 ]
 
+[project.scripts]
+# Registry management utilities never execute uploaded package code.
+artifact = "agent_core.registry.cli:main"
+
 [project.optional-dependencies]
 # api 分组只在需要启动 FastAPI 服务时安装。
 api = [
@@ -43,6 +52,17 @@ dev = [
   "pytest>=7.4",
   # alembic 可用于生产 migration 管理；本仓库同时提供轻量 SQL runner。
   "alembic>=1.13",
+  # ruff、mypy 和 build 是 AGENTS.md 约定的提交前质量门禁。
+  "ruff>=0.15",
+  "mypy>=1.11",
+  "build>=1.2",
+  # 为严格类型检查补齐 PyYAML 的第三方类型声明。
+  "types-PyYAML>=6.0",
+]
+# eval 分组提供 DeepEval 的 G-Eval、pytest 插件和本地结果缓存；默认生产镜像无需安装。
+eval = [
+  # 约束主版本以避免 DeepEval 评测 API 在无人值守升级时改变门禁语义。
+  "deepeval>=4.0,<5.0",
 ]
 # reranker 分组提供本地 CrossEncoder 服务；模型权重仍在首次启动时由 sentence-transformers 下载。
 reranker = [
@@ -53,6 +73,10 @@ reranker = [
 [tool.setuptools.package-data]
 # 将本地调试台随 agent_core.api 包一起发布，非 editable 安装时也能访问根路径页面。
 "agent_core.api" = ["static/*.html"]
+
+[tool.setuptools.packages.find]
+# 生产 wheel 只收集 src 下的 Python 包，避免误打包 tests、docs 和本地配置。
+where = ["src"]
 
 [tool.pytest.ini_options]
 # pythonpath 指向 src，保证测试直接 import agent_core。

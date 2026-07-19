@@ -1,4 +1,4 @@
-.PHONY: db-upgrade db-downgrade db-reset-local memory-retention api-dev api-dev-reload reranker-dev test
+.PHONY: db-upgrade db-downgrade db-reset-local memory-retention api-dev api-dev-reload reranker-dev test eval-deepeval lint typecheck build artifact-schema artifact-scan
 
 # API_HOST/API_PORT 可由 make 调用方覆盖，避免本地已有服务占用默认 8000 端口。
 API_HOST ?= 127.0.0.1
@@ -32,3 +32,22 @@ reranker-dev:
 
 test:
 	python3 -m pytest
+
+# 使用现有 business_quality 黄金集和正式 WorkflowEngine 运行本地 DeepEval G-Eval。
+eval-deepeval:
+	python3 evals/run_evals.py --suite business_quality --max-trials 1 --enable-deepeval
+
+lint:
+	python3 -m ruff check src tests scripts main.py
+
+typecheck:
+	python3 -m mypy src
+
+build:
+	python3 -m build
+
+artifact-schema:
+	PYTHONPATH=src python3 -m agent_core.registry.cli schema prompt
+
+artifact-scan:
+	PYTHONPATH=src python3 -m agent_core.registry.cli scan-legacy .

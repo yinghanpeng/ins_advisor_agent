@@ -356,6 +356,23 @@ class AgentState(BaseModel):
         ),
     )
 
+    intent_execution_plan: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "经确定性 Orchestrator 编排后的结构化任务列表。"
+            "每项包含 task_id、operation、risk、dependencies、status、batch_id 和最小 text_span；"
+            "单意图请求也固定包含一个步骤，避免下游维护两套执行协议。"
+        ),
+    )
+
+    task_schedule: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "多意图任务的权威控制流。包含 P0 control_actions、parallel/sequential/pause 批次、"
+            "整轮状态和最小澄清问题；Builder 只能执行其中非 pause 批次。"
+        ),
+    )
+
     active_intent_state: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -613,6 +630,14 @@ class AgentState(BaseModel):
         description=(
             "长期记忆按需召回决策。记录本轮是否需要召回 preference、客户画像、"
             "从业者画像或 case 记忆，以及触发或跳过的原因。"
+        ),
+    )
+
+    memory_recall_decisions: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "按记忆域保存长期召回决策。preference 与 business 分开记录，避免后执行的业务召回"
+            "覆盖前面已经完成的通用偏好召回审计；memory_recall_decision 仅保留兼容视图。"
         ),
     )
 

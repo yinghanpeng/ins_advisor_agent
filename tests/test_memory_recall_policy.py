@@ -4,6 +4,62 @@ from agent_core.guardrails.metadata import TRUSTED_BUSINESS_IDENTITY_FLAG
 from agent_core.memory.business_schemas import CustomerProfileFact, OpportunityCase
 from agent_core.memory.business_store import InMemoryBusinessMemoryStore
 from agent_core.memory.manager import MemoryLayer, MemoryManager
+from agent_core.memory.recall import MemoryRecallItem, MemoryRecallResult
+
+
+class _ProductionLikeMemoryBackend:
+    """仅提供 Redis Session/Task 读取；若节点误读 Preference，测试立即暴露。"""
+
+    def __init__(self) -> None:
+        self.read_layers: list[MemoryLayer] = []
+
+    def read(self, layer, tenant_id, subject_id):
+        # 身份参数必须存在，但此测试只记录访问层级。
+        assert tenant_id and subject_id
+        self.read_layers.append(layer)
+        if layer == MemoryLayer.PREFERENCE:
+            raise AssertionError("生产召回应走 PostgreSQL Retriever，不能整包读取 Preference")
+        return {"_version": 0}
+
+
+class _RecallAuditRepository:
+    """记录生产长期记忆决策与结果审计，不连接真实 PostgreSQL。"""
+
+    def __init__(self) -> None:
+        self.decisions: list[dict] = []
+        self.results: list[dict] = []
+
+    def insert_memory_recall_decision(self, **kwargs) -> None:
+        self.decisions.append(kwargs)
+
+    def insert_memory_recall_result(self, **kwargs) -> None:
+        self.results.append(kwargs)
+
+
+class _ProductionLikeRetriever:
+    """模拟 PostgreSQL pgvector Retriever，并记录调用身份与决策。"""
+
+    def __init__(self) -> None:
+        self.repository = _RecallAuditRepository()
+        self.calls: list[dict] = []
+
+    def recall(self, *, decision, tenant_id, user_id):
+        self.calls.append(
+            {"decision": decision, "tenant_id": tenant_id, "user_id": user_id}
+        )
+        return MemoryRecallResult(
+            decision=decision,
+            items=[
+                MemoryRecallItem(
+                    layer="preference",
+                    source_id="preference:user_a",
+                    chunk_id="response_language",
+                    content="response_language=中文",
+                    rerank_score=0.95,
+                )
+            ],
+            compact_summary={"preference": {"response_language": "中文"}},
+        )
 
 
 def test_restore_memory_skips_long_term_preference_for_calculator_request() -> None:
@@ -53,6 +109,33 @@ def test_restore_memory_recalls_preference_with_hybrid_search_when_needed() -> N
     assert state.memory_recall_results
     assert "结构化中文" in str(state.memory_context["preference"])
     assert any(entry.get("layer") == "preference" and entry.get("action") == "read" for entry in manager.audit_log)
+
+
+def test_production_restore_uses_postgresql_retriever_and_audits_decision() -> None:
+    """生产长期偏好只在决策允许时走 Retriever，并把决策与命中摘要分别写审计表。"""
+    backend = _ProductionLikeMemoryBackend()
+    retriever = _ProductionLikeRetriever()
+    state = AgentState(
+        tenant_id="tenant_a",
+        user_id="user_a",
+        session_id="session_a",
+        input_text="按我喜欢的风格回答",
+    )
+
+    restore_memory(
+        state,
+        backend,  # type: ignore[arg-type]
+        memory_retriever=retriever,  # type: ignore[arg-type]
+    )
+
+    assert backend.read_layers == [MemoryLayer.SESSION, MemoryLayer.TASK]
+    assert len(retriever.calls) == 1
+    assert retriever.calls[0]["tenant_id"] == "tenant_a"
+    assert retriever.calls[0]["user_id"] == "user_a"
+    assert state.memory_context["preference"] == {"response_language": "中文"}
+    assert state.memory_recall_decisions["preference"]["should_recall"] is True
+    assert len(retriever.repository.decisions) == 1
+    assert len(retriever.repository.results) == 1
 
 
 def test_business_memory_recall_uses_hybrid_rerank_for_relevant_customer_fact() -> None:

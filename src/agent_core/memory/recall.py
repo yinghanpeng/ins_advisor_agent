@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -292,8 +293,8 @@ class MemoryRecallRuleEngine:
         #    - 锚点存在但已滑出短期窗口（长对话被截断 / 来自更早会话）→ 才升级为长期业务事实召回。
         # 分别计算代词命中和实体锚点，避免把普通“他”无条件解释为跨会话引用。
         pronoun_hit = any(term in text for term in self.pronoun_terms)
-        # 优先使用最近实体，缺失时回退 Case ID 作为指代锚点。
-        entity_anchor = session_memory.get("last_entity") or session_memory.get("last_case_id")
+        # 优先使用仍在 TTL 内的新实体锚点，缺失时回退 Case ID；legacy last_entity 仅作兼容。
+        entity_anchor = self._current_entity_anchor(session_memory) or session_memory.get("last_case_id")
         # 仅在有锚点且锚点不在短期消息窗口时，追加需要跨会话读取的三个业务层。
         if pronoun_hit and entity_anchor and not self._entity_in_short_term(entity_anchor, session_memory):
             # 跨窗口指代需要客户画像、Case 和事件共同恢复上下文。
@@ -320,9 +321,11 @@ class MemoryRecallRuleEngine:
             # 原始输入始终是第一条 Query，实体和 Case 信息按存在性追加增强 Query。
             queries = [text]
             # 存在实体锚点时追加实体增强 Query，提高客户画像命中率。
-            if session_memory.get("last_entity"):
+            current_entity = self._current_entity_anchor(session_memory)
+            # 存在有效实体锚点时追加实体增强 Query，提高客户画像命中率。
+            if current_entity:
                 # 将实体与原输入拼接为第二条检索文本。
-                queries.append(f"{session_memory['last_entity']} {text}")
+                queries.append(f"{current_entity} {text}")
             # 存在 Case 标识时追加 Case 增强 Query，提高任务状态命中率。
             if metadata.get("case_id") or metadata.get("opportunity_case_id"):
                 # 将可用 Case ID 与原输入拼接为第三条检索文本。
@@ -372,6 +375,46 @@ class MemoryRecallRuleEngine:
                 return True
         # 扫描完成仍未命中说明实体已经滑出或从未出现在短期窗口。
         return False
+
+    @staticmethod
+    def _current_entity_anchor(session_memory: dict[str, Any]) -> str | None:
+        """读取仍在独立 TTL 内的实体锚点，并兼容尚未升级的 legacy Session。"""
+        # 新结构存在时必须同时校验 value 与 expires_at，不能回退旁路 legacy 值绕过过期规则。
+        raw_anchor = session_memory.get("last_entity_anchor")
+        # 非空对象表示 Session 已升级到新契约。
+        if isinstance(raw_anchor, dict) and raw_anchor:
+            # value 是可用于 Query Rewrite 的短实体名。
+            value = str(raw_anchor.get("value") or "").strip()
+            # 时间统一转成字符串再解析，None 会变成空字符串并安全失败。
+            expires_at_text = str(raw_anchor.get("expires_at") or "")
+            # 尝试解析独立实体 TTL；解析失败统一进入下面的安全失效分支。
+            try:
+                # 解析实体独立过期时间。
+                expires_at = datetime.fromisoformat(expires_at_text)
+                # 兼容旧无时区 ISO 时按 UTC 解释。
+                if expires_at.tzinfo is None:
+                    # 补齐 UTC 后再与当前时间比较。
+                    expires_at = expires_at.replace(tzinfo=UTC)
+            # 非法时间按不可用处理，绝不永久保留脏锚点。
+            except ValueError:
+                # 返回 None 让规则层不触发实体增强长期召回。
+                return None
+            # 值非空且尚未到期时才允许使用。
+            return value if value and expires_at > datetime.now(UTC) else None
+        # 空对象表示新契约已经主动清除实体，不能继续回退 legacy 字段。
+        if isinstance(raw_anchor, dict):
+            # 返回 None 保持显式清除语义。
+            return None
+        # 兼容旧 Session：只有 legacy 实体仍出现在有界 recent_messages 中时临时使用。
+        legacy = str(session_memory.get("last_entity") or "").strip()
+        # 扫描有界消息窗口，防止七天 Session 中的孤立旧值触发长期召回。
+        in_window = any(
+            legacy in str(message.get("content") or "")
+            for message in session_memory.get("recent_messages") or []
+            if legacy and isinstance(message, dict)
+        )
+        # legacy 值会在下一次明确实体写入时升级为带 TTL 的新结构。
+        return legacy if in_window else None
 
 
 def plan_long_term_memory_recall(

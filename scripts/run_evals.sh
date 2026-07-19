@@ -4,5 +4,4 @@
 # - 脚本只封装本地开发动作，生产环境应接 CI/CD 或运维平台。
 
 set -euo pipefail
-python3 evals/run_evals.py
-
+python3 evals/run_evals.py "$@"

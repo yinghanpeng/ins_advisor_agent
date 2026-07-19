@@ -10,9 +10,9 @@ outputs, retries, guardrails, and trace fields explicit.
 # - 模型输出进入下游逻辑前，应先通过这里定义的结构化契约。
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from agent_core.graph.state import AgentNode
 from agent_core.guardrails.metadata import (
@@ -400,18 +400,69 @@ class PublicAgentRunResponse(BaseModel):
         )
 
 
+class AgentRunExecutionContext(BaseModel):
+    """代码侧受信运行参数；公开 API 不接收该对象。"""
+
+    # request_token_budget 只允许受信调用方缩放本次运行预算，不能覆盖身份、权限或 Artifact Snapshot。
+    request_token_budget: int | None = Field(
+        default=None,
+        ge=1,
+        description="代码侧注入的单次请求 Token 预算；公开 AgentRunRequest 不暴露该字段。",
+    )
+
+
+# EVAL_RULE_NAMES 是本地确定性评分器支持的稳定规则 ID；数据集使用未知 ID 时在加载阶段立即失败。
+EVAL_RULE_NAMES = frozenset(
+    {
+        "answer",
+        "schema",
+        "state",
+        "intent",
+        "sales_route",
+        "tools",
+        "guardrail",
+        "trace",
+        "cost",
+        "trajectory",
+        # judge 仅在 Runner 显式开启 --enable-llm-judge 时执行；未开启时声明了 judge 会记为 skip/失败策略见门禁配置。
+        "judge",
+    }
+)
+
+# EVAL_MATURITY_VALUES 区分“当前应过的回归”与“产品尚未齐备的前瞻样本”，避免混为一谈。
+EVAL_MATURITY_VALUES = frozenset({"current", "aspirational"})
+
+
 class EvalCase(BaseModel):
     """离线评估样本契约，声明输入、预期路径和通过/失败规则。"""
     # id 是离线评估样本的稳定主键，便于失败定位和报告关联。
     id: str = Field(..., description="评估样本 ID。用于定位失败 case 和生成评估报告。")
     # type 表示该样本主要验证的能力类别，供 evaluator 选择附加断言。
     type: str = Field(..., description="评估类型，例如 route、guardrail、rag、sales_quality 或 recovery。")
+    # suite 把同类 Case 聚合成独立指标，避免总体通过率掩盖安全或路由子集退化。
+    suite: str = Field(
+        default="regression",
+        description="评估套件名称，例如 safety、routing、tools、rag、memory 或 business_quality。",
+    )
+    # maturity 区分当前回归门禁与前瞻能力样本：aspirational 默认不阻断 Promote，但仍计入报告。
+    maturity: str = Field(
+        default="current",
+        description="current=当前产品应通过的回归；aspirational=能力路线图样本，默认不阻断发布门禁。",
+    )
     # input 是送入完整 Agent 链路的原始测试文本。
     input: str = Field(..., description="喂给 Agent 的用户输入，用于复现完整工作流。")
-    # initial_state 允许测试预置画像、metadata 或预算，但生产请求不会使用该入口。
+    # turns 非空时表示完整多轮用户输入；同一 Trial 内复用隔离 Engine 与 Session，并只评分最后一轮。
+    turns: list[str] = Field(
+        default_factory=list,
+        description="可选多轮用户输入；非空时替代 input 作为按顺序执行的完整对话。",
+    )
+    # initial_state 仅允许映射到正式请求字段或受信执行预算，禁止任意修改 AgentState。
     initial_state: dict[str, Any] = Field(
         default_factory=dict,
-        description="评估开始前预置到 AgentState 的状态字段，例如 profile、metadata 或 cost。",
+        description=(
+            "受控评估夹具，只允许 session_id、user_id、tenant_id、workflow_name、domain_skill、"
+            "source、metadata 和 request_token_budget。"
+        ),
     )
     # expected_state 声明预期终态，None 表示该样本不检查状态名称。
     expected_state: str | None = Field(
@@ -421,7 +472,22 @@ class EvalCase(BaseModel):
     # expected_tools 列出预期实际执行的工具，空列表表示不强制检查工具集合。
     expected_tools: list[str] = Field(
         default_factory=list,
-        description="期望调用的工具名称列表。用于验证工具路由和权限控制。",
+        description="必须出现的工具名称列表；允许实际轨迹包含额外工具。",
+    )
+    # forbidden_tools 明确声明绝不能调用的工具，适合测试越权、过度搜索和无需工具的普通回答。
+    forbidden_tools: list[str] = Field(
+        default_factory=list,
+        description="实际工具轨迹中禁止出现的工具名称列表。",
+    )
+    # expected_intent 直接验证统一意图路由标签，避免仅靠回答关键词掩盖误路由。
+    expected_intent: str | None = Field(
+        default=None,
+        description="期望的统一意图标签，例如 calculator_query 或 insurance_break_ice。",
+    )
+    # expected_domain_skill 验证实际领域处理器；None 表示不检查而不是强制通用链路。
+    expected_domain_skill: str | None = Field(
+        default=None,
+        description="期望命中的领域 Skill；为空表示该 Case 不执行此项断言。",
     )
     # expected_sales_intelligence_route 验证销售智能内部路由标签是否符合预期。
     expected_sales_intelligence_route: str | None = Field(
@@ -433,23 +499,235 @@ class EvalCase(BaseModel):
         default_factory=list,
         description="最终回答中必须包含的关键词或关键表达。",
     )
+    # must_include_any 用“同义组任一命中”降低单一关键词造成的假失败/假通过。
+    must_include_any: list[list[str]] = Field(
+        default_factory=list,
+        description=(
+            "最终回答必须命中的同义表达组列表；每一组内任一关键词出现即算该组通过。"
+            "例如 [[\"资金\",\"资产\",\"理财\"],[\"低压\",\"不逼单\"]]。"
+        ),
+    )
     # must_not_include 保存最终答案绝不能出现的高风险或错误表达。
     must_not_include: list[str] = Field(
         default_factory=list,
         description="最终回答中禁止出现的词语，例如保证收益、避税避债等高风险表达。",
     )
-    # expected_guardrail 指定必须命中的风控规则；None 时不做单规则断言。
+    # judge_rubric 声明主观质量维度；只有启用 LLM Judge 且 pass_fail_rules 含 judge 时才评分。
+    judge_rubric: str = Field(
+        default="",
+        description="LLM-as-Judge 评分量表说明，例如表达自然、策略得体、合规不越权。空表示不启用主观评分。",
+    )
+    # expected_guardrail 指定必须执行并记录的风控规则；None 时不做单规则断言。
     expected_guardrail: str | None = Field(
         default=None,
-        description="期望触发的风控规则名称。为空表示该样本不强制要求触发特定规则。",
+        description="期望执行并记录的风控规则名称；是否触发由 expected_guardrail_triggered 单独声明。",
+    )
+    # expected_guardrail_action 在命中规则后继续验证 pass、safe_fallback 或 block 等执行动作。
+    expected_guardrail_action: str | None = Field(
+        default=None,
+        description="指定 Guardrail 应产生的动作，例如 pass、safe_fallback 或 block。",
+    )
+    # expected_guardrail_triggered 区分应该拦截和应该正常通过的正反安全样本。
+    expected_guardrail_triggered: bool | None = Field(
+        default=None,
+        description="指定目标 Guardrail 的 triggered 值；为空表示只检查规则是否执行。",
     )
     # expected_trace_fields 列出结构化 trace 必须包含的字段名称。
     expected_trace_fields: list[str] = Field(
         default_factory=list,
-        description="trace_events 中必须出现的字段名，用于验证可观测性是否完整。",
+        description="响应或任一 trace event 中必须出现的字段路径，用于验证可观测性完整性。",
     )
-    # pass_fail_rules 保存当前 evaluator 尚未结构化表达的附加离线判定说明。
+    # required_states 使用里程碑子序列约束必要节点，同时允许实现选择额外的合法中间节点。
+    required_states: list[str] = Field(
+        default_factory=list,
+        description="状态轨迹必须按给定顺序经过的节点子序列。",
+    )
+    # forbidden_states 约束安全短路或无需工具的路径绝不能进入某些执行节点。
+    forbidden_states: list[str] = Field(
+        default_factory=list,
+        description="状态轨迹中禁止出现的节点名称。",
+    )
+    # expected_cost 以键值方式检查预算决策，例如 request_token_budget=500 或 budget_pressure=true。
+    expected_cost: dict[str, Any] = Field(
+        default_factory=dict,
+        description="期望在响应 cost 摘要中出现的精确键值。",
+    )
+    # max_tool_calls 为工具总调用数设置硬上限，防止循环或不必要的外部访问。
+    max_tool_calls: int | None = Field(
+        default=None,
+        ge=0,
+        description="允许的最大工具调用次数；为空表示不检查。",
+    )
+    # trials 对非确定性 Case 重复运行，并采用所有 Trial 均通过的稳定性门槛。
+    trials: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="该 Case 的独立运行次数；所有 Trial 均通过时 Case 才通过。",
+    )
+    # pass_fail_rules 列出本 Case 启用的稳定评分器 ID；未知 ID 会在数据加载阶段报错。
     pass_fail_rules: list[str] = Field(
         default_factory=list,
-        description="该样本额外的通过/失败规则说明，供本地 evaluator 或离线质量评估使用。",
+        description="启用的确定性评分器 ID，例如 answer、state、tools、guardrail、trace 或 cost。",
     )
+
+    @field_validator("maturity")
+    @classmethod
+    def validate_maturity(cls, value: str) -> str:
+        """只允许 current / aspirational，防止拼写错误把门禁样本静默降级。"""
+
+        # normalized 去掉首尾空白后做精确匹配，避免 YAML/JSON 粘贴引入不可见空格。
+        normalized = value.strip()
+        # 未知成熟度会让 Promote 阈值语义不确定，必须在加载阶段失败。
+        if normalized not in EVAL_MATURITY_VALUES:
+            # 错误只回显稳定枚举，不回显 Case 输入正文。
+            raise ValueError(
+                f"EvalCase.maturity 必须是 {', '.join(sorted(EVAL_MATURITY_VALUES))}，收到: {normalized}"
+            )
+        # 返回规范化后的成熟度标签。
+        return normalized
+
+    @field_validator("turns")
+    @classmethod
+    def validate_turns(cls, value: list[str]) -> list[str]:
+        """拒绝空白多轮输入，避免 Runner 执行不可复现的空 Turn。"""
+
+        # 任一 Turn 为空都会使会话轨迹和期望轮次含义不明确，因此整条 Case 直接无效。
+        if any(not item.strip() for item in value):
+            # 数据错误应在运行 Agent 前暴露，不能把空输入误记为模型或 Guardrail 失败。
+            raise ValueError("EvalCase.turns 不能包含空白输入")
+        # 返回原顺序副本，确保 Runner 按数据集声明顺序执行多轮输入。
+        return list(value)
+
+    @field_validator("must_include_any")
+    @classmethod
+    def validate_must_include_any(cls, value: list[list[str]]) -> list[list[str]]:
+        """同义组必须非空，且每组至少有一个非空白关键词。"""
+
+        # normalized 保存清洗后的组列表，供 Runner 和 Evaluator 稳定消费。
+        normalized: list[list[str]] = []
+        # 逐组校验，定位错误时保留组下标。
+        for group_index, group in enumerate(value):
+            # 空组无法表达“任一命中”语义。
+            if not group:
+                # 明确指出哪一组为空，方便修 JSONL。
+                raise ValueError(f"EvalCase.must_include_any[{group_index}] 不能为空组")
+            # terms 去掉空白词，避免数据集里混入无意义空串。
+            terms = [term.strip() for term in group if term and term.strip()]
+            # 清洗后若无有效词，同样视为无效组。
+            if not terms:
+                # 与空组使用相同错误级别，阻止脏数据进入执行。
+                raise ValueError(f"EvalCase.must_include_any[{group_index}] 缺少有效关键词")
+            # 保留组内首次出现顺序，便于报告 expected 字段可读。
+            normalized.append(list(dict.fromkeys(terms)))
+        # 返回全部合法同义组。
+        return normalized
+
+    @field_validator("initial_state")
+    @classmethod
+    def validate_initial_state(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """只允许可安全映射到正式入口的受控评估夹具。"""
+
+        # allowed_keys 不包含 profile、工具结果或内部信任标志，防止 Eval 悄悄绕过正式运行链路。
+        allowed_keys = {
+            "session_id",
+            "user_id",
+            "tenant_id",
+            "workflow_name",
+            "domain_skill",
+            "source",
+            "metadata",
+            "request_token_budget",
+        }
+        # unknown_keys 使用稳定排序，让 JSONL 加载错误在本地和 CI 中保持可比较。
+        unknown_keys = sorted(set(value) - allowed_keys)
+        # 任意未知键都意味着 Case 试图注入尚未建模的内部状态，必须先扩展受信契约。
+        if unknown_keys:
+            # 只回显键名，不回显可能包含客户数据的夹具值。
+            raise ValueError(f"EvalCase.initial_state 包含未允许字段: {', '.join(unknown_keys)}")
+        # metadata 必须保持字典形态，后续仍会经过 AgentRunRequest 的 default-deny 校验。
+        if "metadata" in value and not isinstance(value["metadata"], dict):
+            # 非字典 metadata 无法安全合并 eval_id 和 source 标签。
+            raise ValueError("EvalCase.initial_state.metadata 必须是字典")
+        # 返回浅拷贝，避免 Runner 执行期间修改数据集模型持有的原始字典。
+        return dict(value)
+
+    @field_validator("pass_fail_rules")
+    @classmethod
+    def validate_pass_fail_rules(cls, value: list[str]) -> list[str]:
+        """拒绝没有实现的自然语言规则，防止报告把未评分条件当作通过。"""
+
+        # unsupported_rules 收集全部未知规则，一次性报告比逐个修复更适合维护 JSONL 数据集。
+        unsupported_rules = sorted(set(value) - EVAL_RULE_NAMES)
+        # 未知规则没有对应评分逻辑时整条 Case 不可执行，不能静默忽略。
+        if unsupported_rules:
+            # 错误只列稳定规则 ID，不包含用户输入或回答正文。
+            raise ValueError(f"EvalCase.pass_fail_rules 包含未实现规则: {', '.join(unsupported_rules)}")
+        # 去重同时保持首次出现顺序，避免同一评分器重复执行和重复计分。
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def validate_rule_coverage(self) -> "EvalCase":
+        """显式规则列表必须覆盖所有非空结构化期望，禁止静默漏评。"""
+
+        # 空规则列表保留旧调用方的兼容语义：Evaluator 会执行全部适用的确定性断言。
+        if not self.pass_fail_rules:
+            # 返回已完成字段校验的当前模型。
+            return self
+        # required_rules 根据真正声明了期望的字段计算，不要求 Case 启用没有验收目标的维度。
+        required_rules: set[str] = set()
+        # 关键文本非空时必须启用 answer，确保业务与合规文案确实参与通过判定。
+        if self.must_include or self.must_include_any or self.must_not_include:
+            # 将答案评分器加入必要集合。
+            required_rules.add("answer")
+        # 声明了 Judge 量表时必须显式启用 judge，避免主观期望被静默忽略。
+        if self.judge_rubric.strip():
+            # 将 LLM Judge 评分器加入必要集合；是否真正调用模型由 Runner 开关控制。
+            required_rules.add("judge")
+        # 期望终态非空时必须启用 state，避免 ERROR/FINAL 约束被漏掉。
+        if self.expected_state is not None:
+            # 将终态评分器加入必要集合。
+            required_rules.add("state")
+        # 统一意图或领域 Skill 任一非空都由 intent 评分器负责。
+        if self.expected_intent is not None or self.expected_domain_skill is not None:
+            # 将统一路由评分器加入必要集合。
+            required_rules.add("intent")
+        # 旧销售场景期望使用独立兼容评分器，不能由 intent 自动替代。
+        if self.expected_sales_intelligence_route is not None:
+            # 将销售路由评分器加入必要集合。
+            required_rules.add("sales_route")
+        # 必调、禁调或次数上限任一存在时都必须启用工具评分器。
+        if self.expected_tools or self.forbidden_tools or self.max_tool_calls is not None:
+            # 将工具评分器加入必要集合。
+            required_rules.add("tools")
+        # Guardrail 名称、动作或触发状态任一被声明时必须启用安全评分器。
+        if (
+            self.expected_guardrail is not None
+            or self.expected_guardrail_action is not None
+            or self.expected_guardrail_triggered is not None
+        ):
+            # 将安全评分器加入必要集合。
+            required_rules.add("guardrail")
+        # Trace 字段列表非空时必须启用可观测性评分器。
+        if self.expected_trace_fields:
+            # 将 Trace 评分器加入必要集合。
+            required_rules.add("trace")
+        # 必经或禁止状态任一非空时必须启用轨迹评分器。
+        if self.required_states or self.forbidden_states:
+            # 将轨迹评分器加入必要集合。
+            required_rules.add("trajectory")
+        # 成本期望非空时必须启用成本评分器。
+        if self.expected_cost:
+            # 将成本评分器加入必要集合。
+            required_rules.add("cost")
+        # missing_rules 是数据声明了期望却不会参与评分的危险配置。
+        missing_rules = sorted(required_rules - set(self.pass_fail_rules))
+        # 任何漏评都在执行 Agent 前失败，不能生成虚假的绿色报告。
+        if missing_rules:
+            # 错误仅列规则 ID，JSONL Loader 会进一步补充精确文件与行号。
+            raise ValueError(
+                "EvalCase.pass_fail_rules 未覆盖已声明的结构化期望: "
+                + ", ".join(missing_rules)
+            )
+        # 返回规则覆盖完整的模型。
+        return self

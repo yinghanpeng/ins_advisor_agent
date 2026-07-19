@@ -4,6 +4,7 @@
 import pytest
 
 from agent_core.graph.state import AgentNode
+from agent_core.memory.manager import MemoryLayer
 from agent_core.observability.langsmith_client import LangSmithAdapter
 from agent_core.workflow.contracts import AgentRunRequest
 from agent_core.workflow.engine import AGENT_STEP_LABELS, WorkflowEngine
@@ -177,3 +178,107 @@ def test_workflow_engine_resolves_pronoun_from_session_memory():
     assert response.query_understanding["filters"]["source_type"] == "news"
     # 过去三个月应解析成绝对日期范围。
     assert response.query_understanding["filters"]["date_range"]
+
+
+def test_multi_intent_executes_in_priority_order_and_writes_one_conversation_turn() -> None:
+    """复合请求逐步执行，但 Session 只能保存原始整句和一次聚合回答。"""
+    engine = WorkflowEngine()
+    original_input = "帮我计算 12*8，然后查上海天气，同时给客户一版保险破冰话术"
+
+    response = engine.run(
+        AgentRunRequest(
+            input=original_input,
+            tenant_id="tenant_multi",
+            session_id="session_multi",
+        )
+    )
+
+    plan = response.intent_routing_result["execution_plan"]
+    assert [step["intent"] for step in plan] == [
+        "calculator_query",
+        "weather_query",
+        "insurance_break_ice",
+    ]
+    assert [step["execution_priority"] for step in plan] == [20, 30, 70]
+    assert [result["name"] for result in response.tool_results] == [
+        "calculator",
+        "weather_query",
+    ]
+    # 聚合章节顺序与实际执行 sequence 一致，不能按模型输出顺序或工具完成时间重排。
+    assert response.answer.index("1. calculator_query") < response.answer.index("2. weather_query")
+    assert response.answer.index("2. weather_query") < response.answer.index("3. insurance_break_ice")
+    # 顶层主意图是通用计算，但实际执行过保险步骤时仍需暴露 KYC 控制摘要。
+    assert response.insurance_kyc_status["information_status"] == "insufficient"
+
+    session = engine.memory_manager.read(MemoryLayer.SESSION, "tenant_multi", "session_multi")
+    user_messages = [
+        item["content"]
+        for item in session["recent_messages"]
+        if item.get("role") == "user"
+    ]
+    assert user_messages == [original_input]
+    assert len([item for item in session["recent_messages"] if item.get("role") == "assistant"]) == 1
+    assert session["last_intents"] == [
+        "calculator_query",
+        "weather_query",
+        "insurance_break_ice",
+    ]
+
+
+def test_session_reference_does_not_refresh_entity_anchor_ttl() -> None:
+    """代词解析可以读取实体锚点，但不能把推断值伪装成用户再次明确提及并续期。"""
+    engine = WorkflowEngine()
+    engine.run(
+        AgentRunRequest(
+            input="上文讨论的是 Anthropic",
+            tenant_id="tenant_entity",
+            session_id="session_entity",
+        )
+    )
+    first_session = engine.memory_manager.read(
+        MemoryLayer.SESSION,
+        "tenant_entity",
+        "session_entity",
+    )
+    first_anchor = dict(first_session["last_entity_anchor"])
+
+    response = engine.run(
+        AgentRunRequest(
+            input="帮我查一下它最近有没有融资",
+            tenant_id="tenant_entity",
+            session_id="session_entity",
+        )
+    )
+    second_session = engine.memory_manager.read(
+        MemoryLayer.SESSION,
+        "tenant_entity",
+        "session_entity",
+    )
+
+    assert response.query_understanding["entity"] == "Anthropic"
+    assert response.query_understanding["entity_source"] == "session_reference"
+    assert second_session["last_entity_anchor"] == first_anchor
+
+
+def test_last_entity_uses_original_text_order_not_multi_intent_priority_order() -> None:
+    """多意图会按 priority 重排执行，但实体锚点必须指向用户原文最后明确提到的公司。"""
+    engine = WorkflowEngine()
+    original_input = "查 Anthropic 的新闻，然后计算 2+2，同时查 OpenAI 的新闻"
+
+    engine.run(
+        AgentRunRequest(
+            input=original_input,
+            tenant_id="tenant_entity_order",
+            session_id="session_entity_order",
+        )
+    )
+    session = engine.memory_manager.read(
+        MemoryLayer.SESSION,
+        "tenant_entity_order",
+        "session_entity_order",
+    )
+
+    # calculator priority=20 会先于 search priority=40，但不能把锚点选择变成执行顺序副作用。
+    assert session["last_entity"] == "OpenAI"
+    assert session["last_entity_anchor"]["value"] == "OpenAI"
+    assert session["last_entity_anchor"]["source"] == "explicit_user_text"

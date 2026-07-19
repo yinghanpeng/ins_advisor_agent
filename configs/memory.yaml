@@ -18,6 +18,8 @@ memory:
   session_ttl_seconds: 604800
   # task_ttl_seconds 是 Redis 任务状态的过期时间，默认 1 天。
   task_ttl_seconds: 86400
+  # entity_anchor_ttl_seconds 限制“它/这家公司”等代词锚点最多保留 30 分钟，避免跨话题误指。
+  entity_anchor_ttl_seconds: 1800
   # preference_ttl_days 是 PostgreSQL 用户偏好的默认保留周期。
   preference_ttl_days: 365
   # max_session_messages 限制每个 Session 进入短期记忆的最近消息数量。
